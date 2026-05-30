@@ -5339,6 +5339,39 @@ fn build_channel_by_id(
         "signal" => {
             anyhow::bail!("Signal channel requires the `channel-signal` feature");
         }
+        #[cfg(feature = "channel-teams")]
+        "teams" => {
+            let teams = config
+                .channels
+                .teams
+                .get("default")
+                .context("Teams channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("teams", &alias))
+            };
+            let service_url = teams.service_url.clone().unwrap_or_else(|| "https://smba.trafficmanager.net/teams/".to_string());
+            Ok(Arc::new(
+                TeamsChannel::new(
+                    teams.client_id.clone(),
+                    teams.client_secret.clone(),
+                    teams.tenant_id.clone(),
+                    service_url,
+                    teams.port,
+                    alias,
+                    peer_resolver,
+                    teams.mention_only,
+                )
+                .with_streaming(teams.stream_mode, teams.draft_update_interval_ms)
+                .with_approval_timeout_secs(teams.approval_timeout_secs),
+            ))
+        }
+        #[cfg(not(feature = "channel-teams"))]
+        "teams" => {
+            anyhow::bail!("Teams channel requires the `channel-teams` feature");
+        }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
             {
