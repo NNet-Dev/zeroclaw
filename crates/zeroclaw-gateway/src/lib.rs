@@ -3266,7 +3266,9 @@ struct AdminResponse {
 
 /// Reject requests that do not originate from a loopback address.
 fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if peer.ip().is_loopback() {
+    let is_loopback = peer.ip().is_loopback()
+        || matches!(peer.ip(), std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()));
+    if is_loopback {
         Ok(())
     } else {
         Err((
