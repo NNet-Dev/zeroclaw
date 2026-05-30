@@ -64,6 +64,8 @@ pub use crate::reddit::RedditChannel;
 pub use crate::signal::SignalChannel;
 #[cfg(feature = "channel-slack")]
 pub use crate::slack::SlackChannel;
+#[cfg(feature = "channel-teams")]
+pub use crate::teams::TeamsChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
 #[cfg(feature = "channel-twitter")]
@@ -5347,24 +5349,16 @@ fn build_channel_by_id(
                 .get("default")
                 .context("Teams channel is not configured")?;
             let alias = "default".to_string();
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                let cfg_arc = config_arc.clone();
-                let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("teams", &alias))
-            };
-            let service_url = teams.service_url.clone().unwrap_or_else(|| "https://smba.trafficmanager.net/teams/".to_string());
             Ok(Arc::new(
                 TeamsChannel::new(
                     teams.client_id.clone(),
                     teams.client_secret.clone(),
                     teams.tenant_id.clone(),
-                    service_url,
+                    teams.service_url.clone(),
                     teams.port,
                     alias,
-                    peer_resolver,
                     teams.mention_only,
                 )
-                .with_streaming(teams.stream_mode, teams.draft_update_interval_ms)
                 .with_approval_timeout_secs(teams.approval_timeout_secs),
             ))
         }
@@ -6268,6 +6262,43 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "Mattermost channel is configured but this build was compiled without \
              `channel-mattermost`; skipping Mattermost."
+        );
+    }
+
+    #[cfg(feature = "channel-teams")]
+    for (alias, teams) in &config.channels.teams {
+        if !active_channel_aliases.contains(&format!("teams.{alias}")) {
+            continue;
+        }
+        if !teams.enabled {
+            continue;
+        }
+        channels.push(ConfiguredChannel {
+            display_name: "Teams",
+            alias: Some(alias.clone()),
+            channel: Arc::new(
+                TeamsChannel::new(
+                    teams.client_id.clone(),
+                    teams.client_secret.clone(),
+                    teams.tenant_id.clone(),
+                    teams.service_url.clone(),
+                    teams.port,
+                    alias.clone(),
+                    teams.mention_only,
+                )
+                .with_approval_timeout_secs(teams.approval_timeout_secs),
+            ),
+        });
+    }
+
+    #[cfg(not(feature = "channel-teams"))]
+    if !config.channels.teams.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Teams channel is configured but this build was compiled without \
+             `channel-teams`; skipping Teams."
         );
     }
 

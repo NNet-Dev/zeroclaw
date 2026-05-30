@@ -97,6 +97,7 @@ pub enum ChannelKind {
     Reddit,
     Signal,
     Slack,
+    Teams,
     Telegram,
     Twitter,
     VoiceCall,
