@@ -71,6 +71,13 @@ pub trait CompatFamilySpec {
     /// (e.g. Sambanova, Hyperbolic — no public catalog at all without a key).
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = None;
 
+    /// Whether this provider's `/models` endpoint is accessible without an
+    /// API key. When `true`, `list_models()` and `list_models_with_pricing()`
+    /// will query the live endpoint even when no credential is configured.
+    /// Defaults to `false`; set to `true` for providers like Kilo Gateway
+    /// whose model catalog is public.
+    const UNAUTHENTICATED_MODEL_LISTING: bool = false;
+
     /// Build the base compat provider with both catalog consts applied. Use
     /// this from inside `build_compat` overrides so the catalog hooks ride
     /// along with any family-specific modifiers.
@@ -92,6 +99,9 @@ pub trait CompatFamilySpec {
         }
         if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
             p = p.with_openrouter_vendor_prefix(prefix);
+        }
+        if Self::UNAUTHENTICATED_MODEL_LISTING {
+            p = p.with_unauthenticated_model_listing();
         }
         p
     }
@@ -1065,6 +1075,7 @@ impl CompatFamilySpec for KiloModelProviderConfig {
     const DISPLAY: &'static str = "Kilo";
     const DEFAULT_URL: &'static str = "https://app.kilo.ai/api/gateway";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const UNAUTHENTICATED_MODEL_LISTING: bool = true;
 }
 
 impl FamilyProviderFactory for LmstudioModelProviderConfig {

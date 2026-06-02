@@ -23,6 +23,9 @@ import {
   createMapKey,
   deleteMapKey,
   getMapKeys,
+  getCatalogModels,
+  patchConfig,
+  type ModelPricing,
 } from '../../lib/api';
 import { configuredResourceIds } from '../../lib/configuredModels';
 import FieldForm from './FieldForm';
@@ -79,6 +82,7 @@ function SingleResourceEditor({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [catalogPricing, setCatalogPricing] = useState<Record<string, ModelPricing> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,16 +98,43 @@ function SingleResourceEditor({
         setExists(false);
         setError(e instanceof ApiError ? e.envelope.message : String(e));
       });
+    // Fetch catalog pricing in parallel — silent fail, it's a nice-to-have.
+    getCatalogModels(providerType)
+      .then((r) => {
+        if (!cancelled && r.pricing) setCatalogPricing(r.pricing);
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [basePath, fixedResource]);
+  }, [basePath, fixedResource, providerType]);
 
   const addRates = async () => {
     setBusy(true);
     setError(null);
     try {
       await createMapKey(basePath, fixedResource);
+      // If we have pricing for this resource, PATCH the rate values.
+      // Pricing is per-token; rates are per million tokens.
+      const pricing = catalogPricing?.[fixedResource];
+      if (pricing) {
+        const ops: { op: 'replace'; path: string; value: number }[] = [];
+        if (pricing.prompt !== undefined) {
+          const v = parseFloat(pricing.prompt);
+          if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.input_per_mtok`, value: v * 1_000_000 });
+        }
+        if (pricing.completion !== undefined) {
+          const v = parseFloat(pricing.completion);
+          if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.output_per_mtok`, value: v * 1_000_000 });
+        }
+        if (pricing.input_cache_read !== undefined) {
+          const v = parseFloat(pricing.input_cache_read);
+          if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.cached_input_per_mtok`, value: v * 1_000_000 });
+        }
+        if (ops.length > 0) {
+          await patchConfig(ops);
+        }
+      }
       setExists(true);
       setReloadKey((n) => n + 1);
       onSaved?.();
