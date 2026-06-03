@@ -10451,6 +10451,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub voice_wake: HashMap<String, VoiceWakeConfig>,
+    /// Microsoft Teams channel instances (`[channels.teams.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub teams: HashMap<String, TeamsConfig>,
     /// Voice duplex instances (`[channels.voice_duplex.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -10756,6 +10760,7 @@ impl Default for ChannelsConfig {
             discord: HashMap::new(),
             slack: HashMap::new(),
             mattermost: HashMap::new(),
+            teams: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
             matrix: HashMap::new(),
@@ -13185,6 +13190,88 @@ impl ChannelConfig for VoiceWakeConfig {
     }
     fn desc() -> &'static str {
         "voice wake word detection"
+    }
+}
+
+/// Microsoft Teams channel configuration.
+///
+/// Uses the Bot Framework REST API for outbound messages and an HTTP webhook
+/// for inbound activities. Requires an Azure AD app registration with the
+/// Bot Framework channel configured.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.teams"]
+pub struct TeamsConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Azure AD application (client) ID.
+    #[tab(Connection)]
+    pub client_id: String,
+    /// Azure AD application client secret.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub client_secret: String,
+    /// Azure AD tenant ID.
+    #[tab(Connection)]
+    pub tenant_id: String,
+    /// Bot Framework service URL.
+    /// Default: `https://smba.trafficmanager.net/teams/`.
+    #[tab(Advanced)]
+    #[serde(default = "default_teams_service_url")]
+    pub service_url: String,
+    /// Port to listen on for incoming Bot Framework webhook callbacks.
+    #[tab(Connection)]
+    pub port: u16,
+    /// When true, only respond to messages that @-mention the bot.
+    /// Other messages in the channel are silently ignored.
+    /// DM messages are always allowed through.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub mention_only: bool,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+fn default_teams_service_url() -> String {
+    "https://smba.trafficmanager.net/teams/".into()
+}
+
+impl Default for TeamsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: String::new(),
+            client_secret: String::new(),
+            tenant_id: String::new(),
+            service_url: default_teams_service_url(),
+            port: 3000,
+            mention_only: false,
+            approval_timeout_secs: 300,
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+impl ChannelConfig for TeamsConfig {
+    fn name() -> &'static str {
+        "Teams"
+    }
+    fn desc() -> &'static str {
+        "Microsoft Teams"
     }
 }
 
@@ -18871,6 +18958,7 @@ allowed_numbers = ["+1", "+2"]
             discord: HashMap::new(),
             slack: HashMap::new(),
             mattermost: HashMap::new(),
+            teams: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
             matrix: HashMap::new(),

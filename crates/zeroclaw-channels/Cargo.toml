@@ -182,6 +182,7 @@ channels-full = [
   "channel-reddit",
   "channel-signal",
   "channel-slack",
+  "channel-teams",
   "channel-twitter",
   "channel-voice-call",
   "channel-wati",
@@ -209,6 +210,7 @@ whatsapp-web = [
 ]
 # Channels with no optional deps (cfg gate only)
 channel-discord = []
+channel-teams = []
 channel-slack = []
 channel-signal = []
 channel-mattermost = []
