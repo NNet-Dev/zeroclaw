@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Deserialize;
 use tokio::sync::OnceCell;
+use zeroclaw_api::model_provider::ModelPricing;
 
 const CATALOG_URL: &str = "https://openrouter.ai/api/v1/models";
 const FETCH_TIMEOUT_SECS: u64 = 10;
@@ -25,9 +26,21 @@ struct CatalogResponse {
 #[derive(Debug, Deserialize, Clone)]
 struct ModelEntry {
     id: String,
+    #[serde(default)]
+    pricing: Option<ModelPricing>,
 }
 
+/// Flat catalog — model IDs only (used by `list_models`).
 static CACHED_CATALOG: OnceCell<Arc<Vec<String>>> = OnceCell::const_new();
+/// Enriched catalog — model IDs with pricing (used by `list_models_with_pricing`).
+static CACHED_CATALOG_WITH_PRICING: OnceCell<Arc<Vec<ModelEntryWithPricing>>> =
+    OnceCell::const_new();
+
+#[derive(Clone)]
+struct ModelEntryWithPricing {
+    id: String,
+    pricing: Option<ModelPricing>,
+}
 
 async fn fetch_catalog() -> Result<Arc<Vec<String>>> {
     let client = reqwest::Client::builder()
@@ -38,12 +51,34 @@ async fn fetch_catalog() -> Result<Arc<Vec<String>>> {
     Ok(Arc::new(parse_catalog(&bytes)?))
 }
 
+async fn fetch_catalog_with_pricing() -> Result<Arc<Vec<ModelEntryWithPricing>>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .build()?;
+    let response = client.get(CATALOG_URL).send().await?.error_for_status()?;
+    let bytes = response.bytes().await?;
+    Ok(Arc::new(parse_catalog_with_pricing(&bytes)?))
+}
+
 /// Parse the OpenRouter JSON into a flat list of model ids. Pure — unit
 /// tests construct minimal JSON byte slices and assert filter logic
 /// without any network call.
 pub(crate) fn parse_catalog(bytes: &[u8]) -> Result<Vec<String>> {
     let body: CatalogResponse = serde_json::from_slice(bytes)?;
     Ok(body.data.into_iter().map(|m| m.id).collect())
+}
+
+/// Parse the OpenRouter JSON into a list of model entries with pricing.
+fn parse_catalog_with_pricing(bytes: &[u8]) -> Result<Vec<ModelEntryWithPricing>> {
+    let body: CatalogResponse = serde_json::from_slice(bytes)?;
+    Ok(body
+        .data
+        .into_iter()
+        .map(|m| ModelEntryWithPricing {
+            id: m.id,
+            pricing: m.pricing,
+        })
+        .collect())
 }
 
 /// Filter a parsed catalog by vendor prefix, returning the slug portion of
@@ -63,6 +98,31 @@ pub(crate) fn filter_by_vendor(catalog: &[String], vendor_prefix: &str) -> Resul
     Ok(slugs)
 }
 
+/// Filter an enriched catalog by vendor prefix, returning model entries with
+/// pricing. Sorted and deduped by id.
+fn filter_by_vendor_with_pricing(
+    catalog: &[ModelEntryWithPricing],
+    vendor_prefix: &str,
+) -> Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
+    use zeroclaw_api::model_provider::ModelInfo;
+    let needle = format!("{vendor_prefix}/");
+    let mut models: Vec<ModelInfo> = catalog
+        .iter()
+        .filter_map(|e| {
+            e.id.strip_prefix(&needle).map(|slug| ModelInfo {
+                id: slug.to_string(),
+                pricing: e.pricing.clone(),
+            })
+        })
+        .collect();
+    if models.is_empty() {
+        anyhow::bail!("OpenRouter catalog has no entries under vendor prefix {vendor_prefix:?}");
+    }
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    Ok(models)
+}
+
 /// Return the slug portion of every OpenRouter model id whose vendor prefix
 /// matches `vendor_prefix`. The vendor prefix is the segment before `/` in
 /// the id (e.g. `x-ai`, `tencent`, `rekaai`). The returned slugs are sorted
@@ -70,6 +130,17 @@ pub(crate) fn filter_by_vendor(catalog: &[String], vendor_prefix: &str) -> Resul
 pub async fn list_models_for_vendor(vendor_prefix: &str) -> Result<Vec<String>> {
     let catalog = CACHED_CATALOG.get_or_try_init(fetch_catalog).await?;
     filter_by_vendor(catalog, vendor_prefix)
+}
+
+/// Return model entries with pricing for every OpenRouter model id whose
+/// vendor prefix matches `vendor_prefix`. Sorted and deduplicated by id.
+pub async fn list_models_for_vendor_with_pricing(
+    vendor_prefix: &str,
+) -> Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
+    let catalog = CACHED_CATALOG_WITH_PRICING
+        .get_or_try_init(fetch_catalog_with_pricing)
+        .await?;
+    filter_by_vendor_with_pricing(catalog, vendor_prefix)
 }
 
 #[cfg(test)]

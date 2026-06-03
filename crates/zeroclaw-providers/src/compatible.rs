@@ -151,6 +151,12 @@ struct ModelsResponse {
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
+    /// Pricing data from the provider's `/models` endpoint.
+    /// Kilo Gateway: `{"pricing": {"prompt": "0", "completion": "0"}}`
+    /// OpenRouter: `{"pricing": {"prompt": "0.000003", "completion": "0.000015"}}`
+    /// Values are per-token rates (e.g. "0.000005" = $5/1M tokens).
+    #[serde(default)]
+    pricing: Option<zeroclaw_api::model_provider::ModelPricing>,
 }
 
 fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
@@ -162,6 +168,25 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+/// Extract model IDs with pricing from a ModelsResponse.
+/// Returns sorted list of `ModelInfo` with pricing data where available.
+fn normalize_models_with_pricing(
+    body: ModelsResponse,
+) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+    use zeroclaw_api::model_provider::ModelInfo;
+    let mut models: Vec<ModelInfo> = body
+        .data
+        .into_iter()
+        .filter(|e| !e.id.trim().is_empty())
+        .map(|e| ModelInfo {
+            id: e.id.trim().to_string(),
+            pricing: e.pricing,
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
 }
 
 impl OpenAiCompatibleModelProvider {
@@ -2187,6 +2212,85 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         match &self.openrouter_vendor_prefix {
             Some(prefix) => crate::openrouter_catalog::list_models_for_vendor(prefix).await,
             None => anyhow::bail!("live model listing is not supported for this model_provider"),
+        }
+    }
+
+    async fn list_models_with_pricing(
+        &self,
+    ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
+        use zeroclaw_api::model_provider::ModelInfo;
+        // When a credential is present, hit the provider's native /models
+        // endpoint — this returns pricing data that we can capture.
+        let list_credential = self.credential.as_deref();
+        if list_credential.is_some() || self.unauthenticated_model_listing {
+            let url = format!("{}/models", self.base_url);
+            let response = self
+                .apply_auth_header(self.http_client().get(&url), list_credential)
+                .send()
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": &self.name,
+                                "url": &url,
+                                "phase": "model_list_request",
+                                "error": super::format_error_chain(&e),
+                            })),
+                        "compatible: model list request failed"
+                    );
+                    anyhow::Error::msg(format!(
+                        "{} model list request failed: {url}: {e}",
+                        self.name
+                    ))
+                })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+            }
+            let body: ModelsResponse = response.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": &self.name,
+                            "phase": "model_list_parse",
+                            "error": super::format_error_chain(&e),
+                        })),
+                    "compatible: model list returned invalid JSON"
+                );
+                anyhow::Error::msg(format!(
+                    "{} model list returned invalid JSON: {e}",
+                    self.name
+                ))
+            })?;
+            return Ok(normalize_models_with_pricing(body));
+        }
+        // No credential — try models.dev first (no pricing from that source),
+        // then fall back to OpenRouter which does include pricing.
+        if let Some(key) = &self.models_dev_key {
+            match crate::models_dev::list_models_for(key).await {
+                Ok(models) if !models.is_empty() => {
+                    return Ok(models
+                        .into_iter()
+                        .map(|id| ModelInfo { id, pricing: None })
+                        .collect());
+                }
+                Ok(_) => {} // empty → fall through to openrouter
+                Err(_) if self.openrouter_vendor_prefix.is_none() => {
+                    return Ok(Vec::new());
+                }
+                Err(_) => {} // fall through to openrouter
+            }
+        }
+        match &self.openrouter_vendor_prefix {
+            Some(prefix) => {
+                crate::openrouter_catalog::list_models_for_vendor_with_pricing(prefix).await
+            }
+            None => Ok(Vec::new()),
         }
     }
 
