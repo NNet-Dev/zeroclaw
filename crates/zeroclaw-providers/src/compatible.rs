@@ -69,7 +69,8 @@ pub struct OpenAiCompatibleModelProvider {
     /// Some OpenAI-compatible local servers, such as Ollama, expose `/models`
     /// without authentication. Keep the default credential-gated for hosted
     /// providers so missing credentials still fall through to catalog sources.
-    unauthenticated_model_listing: bool,
+    /// When `true`, the `/models` endpoint is treated as publicly accessible.
+    public_model_listing: bool,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -175,6 +176,9 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
 fn normalize_models_with_pricing(
     body: ModelsResponse,
 ) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+fn normalize_models_with_pricing(
+    body: ModelsResponse,
+) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
     use zeroclaw_api::model_provider::ModelInfo;
     let mut models: Vec<ModelInfo> = body
         .data
@@ -187,6 +191,17 @@ fn normalize_models_with_pricing(
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     models
+}
+
+/// Convert models.dev IDs into `ModelInfo` entries without pricing.
+/// The models.dev catalog does not serve pricing data, so this function
+/// documents the intentional data-loss contract: callers should expect
+/// `pricing: None` on every returned entry.
+fn models_dev_to_model_info(ids: Vec<String>) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+    use zeroclaw_api::model_provider::ModelInfo;
+    ids.into_iter()
+        .map(|id| ModelInfo { id, pricing: None })
+        .collect()
 }
 
 impl OpenAiCompatibleModelProvider {
@@ -309,7 +324,7 @@ impl OpenAiCompatibleModelProvider {
             models_dev_key: None,
             openrouter_vendor_prefix: None,
             local_model_tool_sanitize: false,
-            unauthenticated_model_listing: false,
+            public_model_listing: false,
         }
     }
     /// Opt this provider into per-model conservative tool-schema sanitization.
@@ -323,8 +338,8 @@ impl OpenAiCompatibleModelProvider {
         self
     }
 
-    pub fn with_unauthenticated_model_listing(mut self) -> Self {
-        self.unauthenticated_model_listing = true;
+    pub fn with_public_model_listing(mut self) -> Self {
+        self.public_model_listing = true;
         self
     }
 
@@ -2146,10 +2161,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
-        // servers that explicitly allow unauthenticated listing use the same
-        // path without an Authorization header.
+        // servers with a public catalog use the same path without an Authorization header.
         let list_credential = self.credential.as_deref();
-        if list_credential.is_some() || self.unauthenticated_model_listing {
+        if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential)
@@ -2222,7 +2236,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // When a credential is present, hit the provider's native /models
         // endpoint — this returns pricing data that we can capture.
         let list_credential = self.credential.as_deref();
-        if list_credential.is_some() || self.unauthenticated_model_listing {
+        if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential)
@@ -5647,5 +5661,38 @@ mod tests {
         assert!(!compatible_model_omits_temperature("gpt-4o"));
         assert!(!compatible_model_omits_temperature("claude-sonnet-4-6"));
         assert!(!compatible_model_omits_temperature("llama-3.1-70b"));
+    }
+
+    #[test]
+    fn models_dev_to_model_info_returns_no_pricing() {
+        // The models.dev catalog does not serve pricing data; every entry
+        // must have `pricing: None`. This documents the intentional contract.
+        let ids = vec![
+            "openai/gpt-4o".to_string(),
+            "anthropic/claude-sonnet-4-6".to_string(),
+        ];
+        let models = models_dev_to_model_info(ids);
+        assert_eq!(models.len(), 2);
+        // Preserves input order (no sorting — caller decides).
+        assert_eq!(models[0].id, "openai/gpt-4o");
+        assert!(models[0].pricing.is_none());
+        assert_eq!(models[1].id, "anthropic/claude-sonnet-4-6");
+        assert!(models[1].pricing.is_none());
+    }
+
+    #[test]
+    fn public_model_listing_flag_defaults_false() {
+        // Providers without explicit public_model_listing must default to false,
+        // preserving existing behavior for all established providers.
+        let p = make_model_provider("test", "https://example.com", None);
+        assert!(!p.public_model_listing);
+    }
+
+    #[test]
+    fn public_model_listing_flag_can_be_set() {
+        // Verify the builder correctly enables public_model_listing.
+        let p =
+            make_model_provider("test", "https://example.com", None).with_public_model_listing();
+        assert!(p.public_model_listing);
     }
 }
