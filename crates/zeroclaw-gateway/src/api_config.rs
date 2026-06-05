@@ -443,7 +443,7 @@ async fn persist_and_swap(
 /// banner the operator can't act on. Add new entries here when a similar
 /// gateway-managed field lands (e.g. webhook secret rotation).
 fn is_gateway_managed_field(name: &str) -> bool {
-    matches!(name, "gateway.paired-tokens")
+    matches!(name, "gateway.paired_tokens")
 }
 
 /// Compute drift between the in-memory config and what's on disk right now.
