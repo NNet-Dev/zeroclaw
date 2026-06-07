@@ -1566,7 +1566,10 @@ pub async fn run_tool_call_loop(
             .collect();
         let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
 
-        let image_marker_count = multimodal::count_image_markers(history);
+        // Count image markers from user messages only — see
+        // `count_user_image_markers` for why tool-result markers are
+        // excluded from the vision-routing decision.
+        let image_marker_count = count_user_image_markers(history);
 
         // ── Vision model_provider routing ──────────────────────────
         // When the default model_provider lacks vision support but a dedicated
@@ -5121,12 +5124,37 @@ pub async fn process_message(
         .await
 }
 
+/// Count `[IMAGE:…]` markers in user-authored messages only.
+///
+/// Tool output from filesystem operations (grep, find, file_read) often
+/// contains local image paths that `canonicalize_tool_result_media_markers`
+/// wraps as `[IMAGE:…]`. Those are not user-attached images and must not
+/// trigger vision routing for a text-only provider.
+///
+/// `multimodal::count_image_markers` (used on `master`) excludes most
+/// tool-result markers, but still counts the *latest* tool-result message —
+/// i.e. the one injected during the current agent-loop iteration — which is
+/// exactly where a filesystem tool's image path leaks into the routing
+/// decision. Counting user messages only removes that false trigger.
+///
+/// `prepare_messages_for_provider` still normalizes all image markers —
+/// including tool-result ones — for the active provider, so real
+/// tool-generated images (e.g. from the image_gen plugin) continue to work
+/// regardless of which provider is selected.
+fn count_user_image_markers(history: &[ChatMessage]) -> usize {
+    history
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| multimodal::parse_image_markers(&m.content).1.len())
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, emergency_history_trim, estimate_history_tokens,
-        fast_trim_tool_results, load_interactive_session_history, save_interactive_session_history,
-        truncate_tool_result,
+        apply_text_tool_prompt_policy, count_user_image_markers, emergency_history_trim,
+        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
+        save_interactive_session_history, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
@@ -5142,6 +5170,50 @@ mod tests {
         FailingTool,
         NamedMockTool,
     );
+
+    // ── count_user_image_markers tests ────────────────────────────
+    // Regression for the false vision-routing trigger: a filesystem tool's
+    // result carrying local image paths (wrapped as [IMAGE:…]) must not count
+    // toward the vision decision; only user-attached images do. The
+    // `*_latest_*` case is the one that distinguishes this from master's
+    // `count_image_markers`, which counts the latest tool-result message.
+
+    #[test]
+    fn user_image_markers_are_counted() {
+        let history = vec![ChatMessage::user("look at this [IMAGE:/tmp/photo.png]")];
+        assert_eq!(count_user_image_markers(&history), 1);
+    }
+
+    #[test]
+    fn latest_tool_result_image_markers_do_not_count() {
+        // Tool result is the LAST message — exactly the current-iteration
+        // injection that master's counter would (wrongly) include.
+        let history = vec![
+            ChatMessage::user("find my screenshots"),
+            ChatMessage {
+                role: "tool".into(),
+                content: "Found: [IMAGE:/home/u/Pictures/a.png] and [IMAGE:/home/u/Pictures/b.png]"
+                    .into(),
+            },
+        ];
+        assert_eq!(
+            count_user_image_markers(&history),
+            0,
+            "current-iteration tool-result markers must not trigger vision routing"
+        );
+    }
+
+    #[test]
+    fn mixed_history_counts_only_user_markers() {
+        let history = vec![
+            ChatMessage::user("[IMAGE:/tmp/mine.jpg] what is this?"),
+            ChatMessage {
+                role: "tool".into(),
+                content: "[IMAGE:/tmp/tool-output.png]".into(),
+            },
+        ];
+        assert_eq!(count_user_image_markers(&history), 1);
+    }
 
     // ── truncate_tool_result tests ────────────────────────────────
 
