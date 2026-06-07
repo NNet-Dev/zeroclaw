@@ -11347,6 +11347,12 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// When true, register and serve Discord slash commands (e.g. `/ask`)
+    /// over the Gateway WebSocket, in addition to message handling. Default
+    /// false. (Prototype — currently registers a single `/ask <prompt>`.)
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub slash_commands: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -20328,6 +20334,7 @@ default_temperature = 0.7
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            slash_commands: false,
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
@@ -20355,6 +20362,7 @@ default_temperature = 0.7
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            slash_commands: false,
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,

@@ -75,6 +75,9 @@ pub struct DiscordChannel {
     thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
     /// Ephemeral Discord gateway session state for Resume across reconnects.
     gateway_session: Mutex<DiscordGatewaySession>,
+    /// When true, register and serve Discord slash commands (e.g. `/ask`)
+    /// over the existing Gateway WebSocket. Default false. (Prototype.)
+    slash_commands: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -139,7 +142,14 @@ impl DiscordChannel {
             approval_timeout_secs: 300,
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
+            slash_commands: false,
         }
+    }
+
+    /// Enable Discord slash commands (register + serve over the Gateway).
+    pub fn with_slash_commands(mut self, enabled: bool) -> Self {
+        self.slash_commands = enabled;
+        self
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -1182,6 +1192,118 @@ async fn delete_discord_message(
     Ok(())
 }
 
+// ── Slash commands (prototype) ─────────────────────────────────────────────
+//
+// Discord delivers application-command interactions over the same Gateway
+// WebSocket as INTERACTION_CREATE dispatch events. We:
+//   1. register a `/ask <prompt>` global command on READY (idempotent upsert),
+//   2. ack each interaction within the 3s window with a type-5 "deferred" reply,
+//   3. enqueue the prompt as a normal ChannelMessage whose reply_target carries
+//      an `interaction:{app_id}:{token}` sentinel, and
+//   4. answer by editing the deferred message (PATCH @original) from send().
+//
+// All REST here is invoked from spawned tasks, never inline on the listen
+// loop, so it can't starve the gateway heartbeat.
+
+/// Reply-target sentinel prefix marking a ChannelMessage that must be answered
+/// via the interaction followup webhook rather than a normal channel message.
+pub(crate) const DISCORD_INTERACTION_PREFIX: &str = "interaction:";
+
+/// Build the sentinel reply target embedding the application id + token.
+fn discord_interaction_reply_target(app_id: &str, token: &str) -> String {
+    format!("{DISCORD_INTERACTION_PREFIX}{app_id}:{token}")
+}
+
+/// Parse `interaction:{app_id}:{token}` back into `(app_id, token)`.
+pub(crate) fn parse_discord_interaction_target(target: &str) -> Option<(String, String)> {
+    let rest = target.strip_prefix(DISCORD_INTERACTION_PREFIX)?;
+    let (app_id, token) = rest.split_once(':')?;
+    if app_id.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some((app_id.to_string(), token.to_string()))
+}
+
+/// Register the prototype `/ask` global command (idempotent — Discord upserts
+/// by name). Global commands can take up to an hour to propagate the first time.
+async fn register_slash_commands(
+    client: &reqwest::Client,
+    bot_token: &str,
+    app_id: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://discord.com/api/v10/applications/{app_id}/commands");
+    let body = json!([{
+        "name": "ask",
+        "description": "Ask the agent a question",
+        "type": 1, // CHAT_INPUT
+        "options": [{
+            "name": "prompt",
+            "description": "What to ask",
+            "type": 3, // STRING
+            "required": true
+        }]
+    }]);
+    let resp = client
+        .put(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("slash command registration failed ({status}): {err}");
+    }
+    Ok(())
+}
+
+/// Acknowledge an interaction within Discord's 3-second window with a
+/// type-5 "deferred channel message" (the "thinking…" state).
+async fn discord_defer_interaction(
+    client: &reqwest::Client,
+    interaction_id: &str,
+    interaction_token: &str,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+    );
+    // type 5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+    let body = json!({ "type": 5 });
+    let resp = client.post(&url).json(&body).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("interaction defer failed ({status}): {err}");
+    }
+    Ok(())
+}
+
+/// Deliver the agent's answer by editing the deferred interaction response
+/// (`PATCH /webhooks/{app_id}/{token}/messages/@original`). The token is valid
+/// for 15 minutes; no bot auth header is required for the followup webhook.
+async fn discord_edit_interaction_response(
+    client: &reqwest::Client,
+    app_id: &str,
+    interaction_token: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "https://discord.com/api/v10/webhooks/{app_id}/{interaction_token}/messages/@original"
+    );
+    let trimmed: String = content.chars().take(DISCORD_MAX_MESSAGE_LENGTH).collect();
+    let resp = client
+        .patch(&url)
+        .json(&json!({ "content": trimmed }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("interaction followup edit failed ({status}): {err}");
+    }
+    Ok(())
+}
+
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Discord's maximum message length for regular messages.
@@ -1495,6 +1617,15 @@ impl Channel for DiscordChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Slash-command replies: the recipient carries an
+        // `interaction:{app_id}:{token}` sentinel. Answer by editing the
+        // deferred interaction response instead of posting a channel message.
+        if let Some((app_id, token)) = parse_discord_interaction_target(&message.recipient) {
+            let content = crate::util::strip_tool_call_tags(&message.content);
+            let client = self.http_client();
+            return discord_edit_interaction_response(&client, &app_id, &token, &content).await;
+        }
+
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
         let (mut local_files, remote_urls, failures) =
@@ -1839,6 +1970,30 @@ impl Channel for DiscordChannel {
                                 ),
                                 "discord READY received"
                             );
+                            // Slash commands: register `/ask` once on READY.
+                            // The application id is carried in the READY payload
+                            // (`d.application.id`), so no extra REST call is needed.
+                            // Spawned so registration never blocks the heartbeat.
+                            if self.slash_commands {
+                                let app_id = event
+                                    .get("d")
+                                    .and_then(|d| d.get("application"))
+                                    .and_then(|a| a.get("id"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                if let Some(app_id) = app_id {
+                                    let client = self.http_client();
+                                    let bot_token = self.bot_token.clone();
+                                    zeroclaw_spawn::spawn!(async move {
+                                        match register_slash_commands(&client, &bot_token, &app_id).await {
+                                            Ok(()) => ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "discord slash commands registered"),
+                                            Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord slash command registration failed"),
+                                        }
+                                    });
+                                } else {
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "slash_commands enabled but READY had no application.id");
+                                }
+                            }
                             continue;
                         }
                         "RESUMED" => {
@@ -1883,6 +2038,87 @@ impl Channel for DiscordChannel {
                             break;
                         }
                         _ => {}
+                    }
+
+                    // Slash commands arrive as INTERACTION_CREATE over this same
+                    // gateway. Handle APPLICATION_COMMAND (type 2) interactions:
+                    // ack within 3s (deferred), then enqueue the prompt as a
+                    // normal ChannelMessage whose reply_target carries the
+                    // interaction sentinel so send() answers via the followup
+                    // webhook. The defer POST is spawned so it never blocks the
+                    // heartbeat.
+                    if self.slash_commands && event_type == "INTERACTION_CREATE" {
+                        if let Some(d) = event.get("d") {
+                            let itype = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                            // type 2 = APPLICATION_COMMAND
+                            if itype == 2 {
+                                let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let app_id = d.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let command = d.get("data").and_then(|x| x.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                                // user is under `member.user` (guild) or `user` (DM)
+                                let user_id = d
+                                    .get("member")
+                                    .and_then(|m| m.get("user"))
+                                    .or_else(|| d.get("user"))
+                                    .and_then(|u| u.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                // Reconstruct the prompt from the `prompt` option.
+                                let prompt = d
+                                    .get("data")
+                                    .and_then(|x| x.get("options"))
+                                    .and_then(|o| o.as_array())
+                                    .and_then(|opts| {
+                                        opts.iter().find(|o| {
+                                            o.get("name").and_then(|n| n.as_str()) == Some("prompt")
+                                        })
+                                    })
+                                    .and_then(|o| o.get("value"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                if command == "ask"
+                                    && !interaction_id.is_empty()
+                                    && !interaction_token.is_empty()
+                                    && !app_id.is_empty()
+                                    && !prompt.is_empty()
+                                {
+                                    // Ack within 3s (spawned, off the heartbeat loop).
+                                    let client = self.http_client();
+                                    let defer_id = interaction_id.clone();
+                                    let defer_token = interaction_token.clone();
+                                    zeroclaw_spawn::spawn!(async move {
+                                        if let Err(e) = discord_defer_interaction(&client, &defer_id, &defer_token).await {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction defer failed");
+                                        }
+                                    });
+
+                                    let channel_msg = ChannelMessage {
+                                        id: format!("discord_interaction_{interaction_id}"),
+                                        sender: user_id,
+                                        reply_target: discord_interaction_reply_target(&app_id, &interaction_token),
+                                        content: prompt,
+                                        channel: "discord".to_string(),
+                                        channel_alias: Some(self.alias.clone()),
+                                        timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        interruption_scope_id: None,
+                                        thread_ts: None,
+                                        attachments: Vec::new(),
+                                        subject: None,
+                                    };
+                                    if tx.send(channel_msg).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
                     }
 
                     // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
@@ -2664,6 +2900,29 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interaction_reply_target_roundtrips() {
+        let target = discord_interaction_reply_target("app123", "tok456");
+        assert_eq!(target, "interaction:app123:tok456");
+        assert_eq!(
+            parse_discord_interaction_target(&target),
+            Some(("app123".to_string(), "tok456".to_string()))
+        );
+    }
+
+    #[test]
+    fn non_interaction_targets_are_ignored() {
+        // A normal Discord channel id must NOT be treated as an interaction.
+        assert_eq!(parse_discord_interaction_target("123456789012345678"), None);
+        // Malformed sentinels (missing token / app id) are rejected.
+        assert_eq!(
+            parse_discord_interaction_target("interaction:app-only"),
+            None
+        );
+        assert_eq!(parse_discord_interaction_target("interaction::tok"), None);
+        assert_eq!(parse_discord_interaction_target("interaction:app:"), None);
+    }
 
     #[test]
     fn discord_channel_name() {
