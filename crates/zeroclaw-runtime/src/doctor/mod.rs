@@ -263,11 +263,40 @@ fn create_doctor_model_provider(
     }
 }
 
+/// Default number of model names printed per provider in `zeroclaw models list`
+/// before the list is truncated with a `… and N more (use --all)` hint. Keeps a
+/// large catalog (OpenAI/Anthropic can expose 100+) from flooding the terminal.
+pub const DEFAULT_MODEL_LIST_LIMIT: usize = 10;
+
+/// Render the indented model-name bullet block for one provider.
+///
+/// `limit = Some(n)` truncates to the first `n` names and appends a
+/// `… and N more (use --all)` hint; `limit = None` prints every name. Pure
+/// (no I/O) so the truncation behaviour is unit-testable without live probing.
+fn format_model_names(models: &[String], limit: Option<usize>) -> String {
+    let shown = match limit {
+        Some(n) => models.len().min(n),
+        None => models.len(),
+    };
+    let mut out = String::new();
+    for m in &models[..shown] {
+        out.push_str(&format!("      • {}\n", m));
+    }
+    if shown < models.len() {
+        out.push_str(&format!(
+            "      … and {} more (use --all)\n",
+            models.len() - shown
+        ));
+    }
+    out
+}
+
 pub async fn run_models(
     config: &Config,
     provider_override: Option<&str>,
     _use_cache: bool,
     show_model_names: bool,
+    model_name_limit: Option<usize>,
 ) -> Result<()> {
     let targets = doctor_model_targets(config, provider_override);
 
@@ -300,9 +329,7 @@ pub async fn run_models(
                 ok_count += 1;
                 println!("    ✅ {} models", models.len());
                 if show_model_names && !models.is_empty() {
-                    for m in &models {
-                        println!("      • {}", m);
-                    }
+                    print!("{}", format_model_names(&models, model_name_limit));
                 }
                 matrix_rows.push((
                     provider_name.clone(),
@@ -1139,6 +1166,30 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn format_model_names_caps_and_appends_hint() {
+        let n = DEFAULT_MODEL_LIST_LIMIT;
+        let total = n + 5;
+        let models: Vec<String> = (1..=total).map(|i| format!("m{i}")).collect();
+
+        // Capped at the default: first N bullets + a "… and 5 more" hint.
+        let capped = format_model_names(&models, Some(n));
+        assert_eq!(capped.matches('•').count(), n);
+        assert!(capped.contains(&format!("… and {} more (use --all)", total - n)));
+        assert!(capped.contains(&format!("• m{n}")) && !capped.contains(&format!("• m{}", n + 1)));
+
+        // --all (no limit): every name, no hint.
+        let all = format_model_names(&models, None);
+        assert_eq!(all.matches('•').count(), total);
+        assert!(!all.contains("more"));
+
+        // Fewer than the cap: no hint, no truncation.
+        let few: Vec<String> = vec!["a".into(), "b".into()];
+        let out = format_model_names(&few, Some(n));
+        assert_eq!(out.matches('•').count(), 2);
+        assert!(!out.contains("more"));
+    }
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
