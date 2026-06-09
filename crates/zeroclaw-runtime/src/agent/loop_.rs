@@ -149,7 +149,8 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers,
+    canonicalize_tool_result_media_markers_for, emergency_history_trim,
     estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
     normalize_system_messages, save_interactive_session_history, trim_history,
     truncate_tool_result,
@@ -1566,10 +1567,12 @@ pub async fn run_tool_call_loop(
             .collect();
         let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
 
-        // Count image markers from user messages only — see
-        // `count_user_image_markers` for why tool-result markers are
-        // excluded from the vision-routing decision.
-        let image_marker_count = count_user_image_markers(history);
+        // Count image markers across user messages and the current
+        // iteration's tool result. False positives from search/listing tools
+        // are suppressed upstream by `canonicalize_tool_result_media_markers_for`
+        // (their paths never become markers), so a genuinely produced/fetched
+        // latest image still routes to a vision provider. See PR #7345.
+        let image_marker_count = multimodal::count_image_markers(history);
 
         // ── Vision model_provider routing ──────────────────────────
         // When the default model_provider lacks vision support but a dedicated
@@ -2753,7 +2756,13 @@ pub async fn run_tool_call_loop(
                     }
                 }
             }
-            let canonical_output = canonicalize_tool_result_media_markers(&outcome.output);
+            // Provenance-gated: search/listing tools (content_search,
+            // glob_search) must not have incidental image paths promoted to
+            // routable [IMAGE:…] markers, or they falsely trigger vision
+            // routing on a text-only provider. Image-producing/fetching tools
+            // keep canonicalization. See PR #7345.
+            let canonical_output =
+                canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
             let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
             // Append HMAC receipt to tool result when receipts are enabled
             if let Some(ref receipt) = outcome.receipt {
@@ -5124,37 +5133,12 @@ pub async fn process_message(
         .await
 }
 
-/// Count `[IMAGE:…]` markers in user-authored messages only.
-///
-/// Tool output from filesystem operations (grep, find, file_read) often
-/// contains local image paths that `canonicalize_tool_result_media_markers`
-/// wraps as `[IMAGE:…]`. Those are not user-attached images and must not
-/// trigger vision routing for a text-only provider.
-///
-/// `multimodal::count_image_markers` (used on `master`) excludes most
-/// tool-result markers, but still counts the *latest* tool-result message —
-/// i.e. the one injected during the current agent-loop iteration — which is
-/// exactly where a filesystem tool's image path leaks into the routing
-/// decision. Counting user messages only removes that false trigger.
-///
-/// `prepare_messages_for_provider` still normalizes all image markers —
-/// including tool-result ones — for the active provider, so real
-/// tool-generated images (e.g. from the image_gen plugin) continue to work
-/// regardless of which provider is selected.
-fn count_user_image_markers(history: &[ChatMessage]) -> usize {
-    history
-        .iter()
-        .filter(|m| m.role == "user")
-        .map(|m| multimodal::parse_image_markers(&m.content).1.len())
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, count_user_image_markers, emergency_history_trim,
-        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-        save_interactive_session_history, truncate_tool_result,
+        apply_text_tool_prompt_policy, canonicalize_tool_result_media_markers_for,
+        emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
+        load_interactive_session_history, save_interactive_session_history, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
@@ -5171,48 +5155,96 @@ mod tests {
         NamedMockTool,
     );
 
-    // ── count_user_image_markers tests ────────────────────────────
-    // Regression for the false vision-routing trigger: a filesystem tool's
-    // result carrying local image paths (wrapped as [IMAGE:…]) must not count
-    // toward the vision decision; only user-attached images do. The
-    // `*_latest_*` case is the one that distinguishes this from master's
-    // `count_image_markers`, which counts the latest tool-result message.
+    // ── vision-routing provenance tests (PR #7345) ────────────────
+    // The vision-routing decision counts the current iteration's tool result
+    // (multimodal::count_image_markers). A search/listing tool that echoes a
+    // local image path must NOT trigger routing, while a genuinely produced
+    // image (image_gen) must. The boundary is enforced upstream by
+    // `canonicalize_tool_result_media_markers_for`: path-listing tools never
+    // get an [IMAGE:…] marker, so there is nothing to count.
 
-    #[test]
-    fn user_image_markers_are_counted() {
-        let history = vec![ChatMessage::user("look at this [IMAGE:/tmp/photo.png]")];
-        assert_eq!(count_user_image_markers(&history), 1);
+    /// Write a throwaway PNG and return its absolute path string (an existing
+    /// local image path is required for canonicalization to fire).
+    fn write_temp_image(dir: &std::path::Path, name: &str) -> String {
+        let image = dir.join(name);
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        image.display().to_string()
     }
 
     #[test]
-    fn latest_tool_result_image_markers_do_not_count() {
-        // Tool result is the LAST message — exactly the current-iteration
-        // injection that master's counter would (wrongly) include.
+    fn search_tool_path_echo_does_not_trigger_vision_routing() {
+        let dir = tempdir().unwrap();
+        let path = write_temp_image(dir.path(), "hit.png");
+        // content_search surfaced an image path as the latest (current-iter)
+        // tool result — the exact false-trigger this fix targets.
+        let content = canonicalize_tool_result_media_markers_for(
+            "content_search",
+            &format!("match: {path}"),
+        );
+        assert!(!content.contains("[IMAGE:"));
         let history = vec![
             ChatMessage::user("find my screenshots"),
             ChatMessage {
                 role: "tool".into(),
-                content: "Found: [IMAGE:/home/u/Pictures/a.png] and [IMAGE:/home/u/Pictures/b.png]"
-                    .into(),
+                content,
             },
         ];
         assert_eq!(
-            count_user_image_markers(&history),
+            zeroclaw_providers::multimodal::count_image_markers(&history),
             0,
-            "current-iteration tool-result markers must not trigger vision routing"
+            "search-tool path echoes must not trigger vision routing"
         );
     }
 
     #[test]
-    fn mixed_history_counts_only_user_markers() {
+    fn prompt_mode_search_tool_path_echo_does_not_trigger_vision_routing() {
+        // Prompt-mode stores tool results as a `user` "[Tool results]" message;
+        // the role filter from the prior approach missed this carrier.
+        let dir = tempdir().unwrap();
+        let path = write_temp_image(dir.path(), "hit.png");
+        let body =
+            canonicalize_tool_result_media_markers_for("glob_search", &format!("found: {path}"));
         let history = vec![
-            ChatMessage::user("[IMAGE:/tmp/mine.jpg] what is this?"),
+            ChatMessage::user("list images"),
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"glob_search\">\n{body}\n</tool_result>"
+            )),
+        ];
+        assert_eq!(
+            zeroclaw_providers::multimodal::count_image_markers(&history),
+            0,
+            "prompt-mode path echoes must not trigger vision routing"
+        );
+    }
+
+    #[test]
+    fn generated_image_tool_result_triggers_vision_routing() {
+        let dir = tempdir().unwrap();
+        let path = write_temp_image(dir.path(), "generated.png");
+        let content =
+            canonicalize_tool_result_media_markers_for("image_gen", &format!("saved to {path}"));
+        assert!(content.contains("[IMAGE:"));
+        let history = vec![
+            ChatMessage::user("draw a cat"),
             ChatMessage {
                 role: "tool".into(),
-                content: "[IMAGE:/tmp/tool-output.png]".into(),
+                content,
             },
         ];
-        assert_eq!(count_user_image_markers(&history), 1);
+        assert_eq!(
+            zeroclaw_providers::multimodal::count_image_markers(&history),
+            1,
+            "a genuinely generated latest image must still route to vision"
+        );
+    }
+
+    #[test]
+    fn user_attached_image_still_counts() {
+        let history = vec![ChatMessage::user("look at this [IMAGE:/tmp/photo.png]")];
+        assert_eq!(
+            zeroclaw_providers::multimodal::count_image_markers(&history),
+            1
+        );
     }
 
     // ── truncate_tool_result tests ────────────────────────────────
