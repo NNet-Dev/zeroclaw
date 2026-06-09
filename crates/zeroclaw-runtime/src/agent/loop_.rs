@@ -150,10 +150,9 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 // History management moved to `super::history`.
 pub use super::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers,
-    canonicalize_tool_result_media_markers_for, emergency_history_trim,
-    estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-    normalize_system_messages, save_interactive_session_history, trim_history,
-    truncate_tool_result,
+    canonicalize_tool_result_media_markers_for, emergency_history_trim, estimate_history_tokens,
+    fast_trim_tool_results, load_interactive_session_history, normalize_system_messages,
+    save_interactive_session_history, trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -5177,10 +5176,8 @@ mod tests {
         let path = write_temp_image(dir.path(), "hit.png");
         // content_search surfaced an image path as the latest (current-iter)
         // tool result — the exact false-trigger this fix targets.
-        let content = canonicalize_tool_result_media_markers_for(
-            "content_search",
-            &format!("match: {path}"),
-        );
+        let content =
+            canonicalize_tool_result_media_markers_for("content_search", &format!("match: {path}"));
         assert!(!content.contains("[IMAGE:"));
         let history = vec![
             ChatMessage::user("find my screenshots"),
