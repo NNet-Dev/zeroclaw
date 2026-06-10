@@ -121,6 +121,7 @@ mod tests {
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
             intents_mask: None,
+            reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
