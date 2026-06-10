@@ -1,0 +1,600 @@
+//! Live model pricing — a single process-global snapshot of token prices
+//! fetched from providers' own `/models` listings (with the models.dev catalog
+//! as a secondary source for models the gateway doesn't price), used as a
+//! FALLBACK beneath the operator's `[cost.rates]` config.
+//!
+//! Single source of truth (AGENTS.md): the snapshot here is the only place
+//! live prices live. It is a materialized view of an EXTERNAL source (each
+//! gateway's `/models` endpoint), resolved on demand by the cost path. Nothing
+//! is copied into `Config`, the cost-tracking context, or any second struct;
+//! the endpoint URL and credentials are read from the existing provider config
+//! at build time and never re-declared.
+//!
+//! Hot-path contract: [`current_snapshot`] + [`lookup`] are synchronous,
+//! non-blocking, and never fetch. Fetching happens only in the background
+//! refresher spawned by [`spawn_refresher`], which the cost-recording path
+//! never awaits.
+//!
+//! Why the models.dev fallback lives here and not inside each provider's
+//! `list_models_with_pricing()`: that listing surface intentionally reports
+//! `pricing: None` for models.dev entries (`ModelPricing` carries per-token
+//! strings, models.dev serves per-MTok floats — see
+//! `compatible.rs::models_dev_to_model_info`), and enriching it would change
+//! what onboarding and the web rates editor display. Merging at snapshot
+//! assembly scopes live prices to cost tracking only.
+
+use crate::traits::{ModelInfo, ModelPricing};
+use futures_util::future::join_all;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::Duration;
+use zeroclaw_config::schema::Config;
+
+/// Normalized per-1M-token token rates — the cost path's view of a live price.
+///
+/// Distinct from the provider-facing [`ModelPricing`] (raw per-token decimal
+/// *strings* as a `/models` listing reports them): the refresher normalizes the
+/// latter into this so the cost path only ever sees clean USD-per-MTok numbers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModelRates {
+    pub input_per_mtok: Option<f64>,
+    pub output_per_mtok: Option<f64>,
+    pub cached_input_per_mtok: Option<f64>,
+}
+
+impl ModelRates {
+    /// True when no dimension carries a rate.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.input_per_mtok.is_none()
+            && self.output_per_mtok.is_none()
+            && self.cached_input_per_mtok.is_none()
+    }
+
+    /// True when every dimension carries a rate (nothing left to fill).
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.input_per_mtok.is_some()
+            && self.output_per_mtok.is_some()
+            && self.cached_input_per_mtok.is_some()
+    }
+
+    /// Per-dimension precedence merge: `self` wins, `fallback` fills only the
+    /// dimensions `self` left unset (`Option::or`). A `Some(0.0)` in `self` —
+    /// a deliberately-free rate — is preserved, never overridden.
+    #[must_use]
+    pub fn or(self, fallback: ModelRates) -> ModelRates {
+        ModelRates {
+            input_per_mtok: self.input_per_mtok.or(fallback.input_per_mtok),
+            output_per_mtok: self.output_per_mtok.or(fallback.output_per_mtok),
+            cached_input_per_mtok: self
+                .cached_input_per_mtok
+                .or(fallback.cached_input_per_mtok),
+        }
+    }
+}
+
+/// Parse one per-token decimal string (e.g. `"0.000003"`) to USD per 1M tokens.
+/// `None` for absent/empty/unparseable/non-finite/negative values.
+///
+/// The web rates editor prefill applies the same per-token → per-MTok
+/// convention in `web/src/components/sections/CostRatesEditor.tsx`; if the
+/// wire unit ever changes, both must move together.
+fn per_token_str_to_mtok(value: &Option<String>) -> Option<f64> {
+    let parsed: f64 = value.as_deref()?.trim().parse().ok()?;
+    (parsed.is_finite() && parsed >= 0.0).then_some(parsed * 1_000_000.0)
+}
+
+/// Normalize a provider's `/models` [`ModelPricing`] (per-token strings) into
+/// per-1M-token [`ModelRates`]. `prompt`→input, `completion`→output,
+/// `input_cache_read`→cached.
+pub(crate) fn normalize_pricing(pricing: &ModelPricing) -> ModelRates {
+    ModelRates {
+        input_per_mtok: per_token_str_to_mtok(&pricing.prompt),
+        output_per_mtok: per_token_str_to_mtok(&pricing.completion),
+        cached_input_per_mtok: per_token_str_to_mtok(&pricing.input_cache_read),
+    }
+}
+
+/// Snapshot layout: provider composite `"<type>.<alias>"` (the ref the cost
+/// path uses) → gateway-reported model id → USD-per-1M-token rates. Nested
+/// `&str`-probeable maps so the per-call cost path looks up without
+/// allocating.
+pub type PriceSnapshot = HashMap<String, HashMap<String, ModelRates>>;
+
+/// How often the background task re-fetches prices.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// The ONE owner of live prices. Empty until the first successful refresh.
+static LIVE_PRICES: LazyLock<RwLock<Arc<PriceSnapshot>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(HashMap::new())));
+
+/// The config handle the refresher reads each cycle. Re-bound on every
+/// [`spawn_refresher`] call: the daemon reload loop re-instantiates subsystems
+/// with a fresh `Arc<RwLock<Config>>` per iteration, so a once-captured handle
+/// would go stale after the first reload and silently ignore later config
+/// edits. Holding a pointer to the canonical config (not a copy of it) keeps
+/// this within the single-source-of-truth rule.
+static CONFIG_HANDLE: LazyLock<RwLock<Option<Arc<RwLock<Config>>>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Guards against spawning more than one refresher when both the channels
+/// orchestrator and the gateway start in the same process.
+static REFRESHER_STARTED: OnceLock<()> = OnceLock::new();
+
+/// Non-blocking read of the current price snapshot. Returns an `Arc` clone of
+/// whatever the last successful refresh produced (empty if none yet). Never
+/// fetches, never `.await`s — safe to call from the synchronous cost path.
+#[must_use]
+pub fn current_snapshot() -> Arc<PriceSnapshot> {
+    Arc::clone(&LIVE_PRICES.read())
+}
+
+/// Model-id candidate forms, most specific first: the id verbatim, then the
+/// path-suffix form (`vendor/slug` → `slug`). The single owner of the
+/// candidate policy — snapshot assembly ([`match_pricing`]) and lookup both
+/// consume it, and the config-rate resolver mirrors it.
+pub fn model_id_candidates(model_id: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(model_id).chain(model_id.rsplit_once('/').map(|(_, suffix)| suffix))
+}
+
+/// Pure lookup of one `(provider_composite, model_id)` against a snapshot.
+/// The provider ref must be the composite `"<type>.<alias>"` form the snapshot
+/// is keyed by; the model id is probed through [`model_id_candidates`].
+#[must_use]
+pub fn lookup<'a>(
+    snapshot: &'a PriceSnapshot,
+    provider_composite: &str,
+    model_id: &str,
+) -> Option<&'a ModelRates> {
+    let models = snapshot.get(provider_composite)?;
+    model_id_candidates(model_id).find_map(|id| models.get(id))
+}
+
+/// Replace the global snapshot. The refresher is the only production writer.
+fn store_snapshot(snapshot: PriceSnapshot) {
+    *LIVE_PRICES.write() = Arc::new(snapshot);
+}
+
+/// True when at least one model provider opts into `live_pricing`.
+fn any_live_pricing(config: &Config) -> bool {
+    config
+        .providers
+        .models
+        .iter_entries()
+        .any(|(_, _, base)| base.live_pricing)
+}
+
+/// Spawn the background price refresher, once per process.
+///
+/// No-op when no provider currently sets `live_pricing = true` — zero network,
+/// zero task; the cost path keeps reading an empty snapshot. This cheap
+/// pre-check runs *before* claiming the once-per-process guard, so a later
+/// `/admin/reload` (or a re-`start_channels`) that newly enables a provider can
+/// still start the refresher. Idempotent: a second concurrent caller (e.g. the
+/// gateway after the channels supervisor, in a combined process) returns at the
+/// guard without building any provider handles.
+///
+/// Every call re-binds [`CONFIG_HANDLE`] before anything else, and the running
+/// task re-resolves it each cycle — so a daemon reload (which re-instantiates
+/// the config `Arc` and re-runs both call sites) re-points the refresher at
+/// the current config, and toggling `live_pricing` on a provider — or changing
+/// its model/endpoint — is honored on the next refresh without a restart. Each
+/// cycle rebuilds the per-gateway poll set via the normal factory path
+/// (reusing each provider's configured `base_url`, credentials, and options),
+/// fetches one `/models` per gateway, and fills only the flagged models —
+/// falling back to the models.dev catalog for models a gateway doesn't price
+/// (or providers with no HTTP listing, e.g. the `kilocli` subprocess gateway).
+/// A fetch error for one source keeps the previous snapshot rather than
+/// regressing good prices to empty; disabling `live_pricing` on the last
+/// flagged provider instead clears the snapshot on the next cycle, so stale
+/// prices stop filling after an opt-out.
+pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
+    // Re-bind before the enabled pre-check so even a "nothing enabled yet"
+    // call leaves the freshest handle for a refresher started later.
+    *CONFIG_HANDLE.write() = Some(Arc::clone(&config));
+    if !any_live_pricing(&config.read()) {
+        return;
+    }
+    if REFRESHER_STARTED.set(()).is_err() {
+        return; // already running
+    }
+
+    ::zeroclaw_spawn::spawn!(async {
+        loop {
+            // Re-resolve the handle (re-bound across daemon reloads), then
+            // clone the config under the lock and build/poll without holding
+            // it. The handle is bound above before this task can exist, and
+            // never unbound, so the `expect` cannot fire.
+            let handle = CONFIG_HANDLE
+                .read()
+                .clone()
+                .expect("config handle is bound before the refresher is spawned");
+            let cfg = handle.read().clone();
+            let groups = enabled_pricing_groups(&cfg);
+            if groups.is_empty() {
+                // Every provider opted back out (e.g. via reload): clear the
+                // snapshot so stale prices stop filling. A deliberate opt-out
+                // is not a failed refresh — only the latter keeps old data.
+                store_snapshot(PriceSnapshot::new());
+            } else {
+                refresh_once(&groups).await;
+            }
+            tokio::time::sleep(REFRESH_INTERVAL).await;
+        }
+    });
+}
+
+/// One model whose price we want filled: the `"<type>.<alias>"` ref the cost
+/// path looks up by, the gateway's model id to match, and the models.dev
+/// provider key to fall back to when the gateway carries no price for it.
+struct WantedModel {
+    composite: String,
+    model_id: String,
+    models_dev_key: Option<String>,
+}
+
+/// A gateway to poll once. `handle` is built from one representative alias on
+/// the gateway (they share the endpoint); `wanted` lists every flagged model on
+/// that same gateway whose price should be filled from the single catalog
+/// response.
+struct GatewayGroup {
+    handle: Arc<dyn crate::traits::ModelProvider>,
+    wanted: Vec<WantedModel>,
+}
+
+/// Build one pollable group per distinct gateway among the providers that set
+/// `live_pricing = true`. Aliases sharing a gateway (same explicit `uri`, or
+/// the same family default when no `uri` is set) are deduped to a single
+/// `/models` call. Reuses the existing factory + each provider's own configured
+/// credentials/endpoint, so no endpoint URL or key is duplicated.
+fn enabled_pricing_groups(config: &zeroclaw_config::schema::Config) -> Vec<GatewayGroup> {
+    // gateway key -> (representative built handle, wanted models)
+    let mut groups: HashMap<String, GatewayGroup> = HashMap::new();
+    for (ty, alias, base) in config.providers.models.iter_entries() {
+        if !base.live_pricing {
+            continue;
+        }
+        // Only a model with a known id can be matched against the catalog.
+        let Some(model_id) = base
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "provider": format!("{ty}.{alias}") })),
+                "live pricing: provider opted in but sets no `model`; nothing to price"
+            );
+            continue;
+        };
+        let composite = format!("{ty}.{alias}");
+        // Aliases on the same explicit endpoint share one call; aliases on a
+        // family default share one call per family type.
+        let gateway_key = base
+            .uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map_or_else(|| format!("type:{ty}"), str::to_string);
+
+        let wanted = WantedModel {
+            composite,
+            model_id: model_id.to_string(),
+            // models.dev provider key for this family, for the fallback path.
+            models_dev_key: crate::catalog::catalog_source_for(ty)
+                .and_then(|(md_key, _)| md_key)
+                .map(str::to_string),
+        };
+
+        if let Some(group) = groups.get_mut(&gateway_key) {
+            group.wanted.push(wanted);
+            continue;
+        }
+        // First alias for this gateway — build the representative handle.
+        let options = crate::options_for_provider_ref(
+            config,
+            &wanted.composite,
+            &crate::ModelProviderRuntimeOptions::default(),
+        );
+        match crate::create_model_provider_for_alias(
+            config,
+            ty,
+            alias,
+            base.api_key.as_deref(),
+            &options,
+        ) {
+            Ok(handle) => {
+                groups.insert(
+                    gateway_key,
+                    GatewayGroup {
+                        handle: Arc::from(handle),
+                        wanted: vec![wanted],
+                    },
+                );
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "provider": wanted.composite,
+                            "error": format!("{error}"),
+                        })),
+                    "live pricing: could not build provider; skipping gateway"
+                );
+            }
+        }
+    }
+    groups.into_values().collect()
+}
+
+/// Match a flagged model id against a `model_id -> rates` catalog through
+/// [`model_id_candidates`].
+fn match_pricing<'a>(
+    catalog: &'a HashMap<String, ModelRates>,
+    model_id: &str,
+) -> Option<&'a ModelRates> {
+    model_id_candidates(model_id).find_map(|id| catalog.get(id))
+}
+
+/// Normalize a provider's `list_models_with_pricing()` result into a
+/// `model_id -> ModelRates` catalog, dropping models that carry no price.
+/// The emptiness filter here (and its twin in `pricing_from_catalog`) is
+/// load-bearing: downstream consumers treat any catalog hit as priced.
+fn rates_catalog(models: Vec<ModelInfo>) -> HashMap<String, ModelRates> {
+    models
+        .into_iter()
+        .filter_map(|info| {
+            let rates = info
+                .pricing
+                .as_ref()
+                .map(normalize_pricing)
+                .unwrap_or_default();
+            (!rates.is_empty()).then_some((info.id, rates))
+        })
+        .collect()
+}
+
+/// Assemble the price snapshot from the per-gateway catalogs and the models.dev
+/// catalogs. Pure (no I/O) so the precedence + fallback logic is unit-tested.
+///
+/// For each flagged model: the gateway's own price wins; otherwise the
+/// models.dev price for that provider's catalog key fills the gap. A model
+/// neither source prices is simply absent (cost recording leaves it at $0, as
+/// before).
+fn assemble_snapshot(
+    gateway_results: &[(&[WantedModel], HashMap<String, ModelRates>)],
+    models_dev: &HashMap<String, HashMap<String, ModelRates>>,
+) -> PriceSnapshot {
+    let mut out = PriceSnapshot::new();
+    for (wanted, catalog) in gateway_results {
+        for want in *wanted {
+            // Gateway first; models.dev (keyed by the provider's catalog name)
+            // fills what the gateway didn't price. Both catalogs drop empty
+            // rates at construction, so any hit carries at least one rate.
+            let rates = match_pricing(catalog, &want.model_id).or_else(|| {
+                want.models_dev_key
+                    .as_deref()
+                    .and_then(|md_key| models_dev.get(md_key))
+                    .and_then(|md_catalog| match_pricing(md_catalog, &want.model_id))
+            });
+            if let Some(rates) = rates {
+                out.entry(want.composite.clone())
+                    .or_default()
+                    .insert(want.model_id.clone(), *rates);
+            }
+        }
+    }
+    out
+}
+
+/// Poll each gateway once, fall back to models.dev for models a gateway didn't
+/// price, and publish the merged snapshot. Keeps the previous snapshot if no
+/// source succeeded (never regress good prices to empty on a transient outage).
+async fn refresh_once(groups: &[GatewayGroup]) {
+    // ── Gather all gateway catalogs concurrently (one `/models` call per
+    // gateway; first-fill latency is bounded by the slowest gateway, not the
+    // sum of all of them) ──
+    let mut any_ok = false;
+    let catalogs = join_all(
+        groups
+            .iter()
+            .map(|group| group.handle.list_models_with_pricing()),
+    )
+    .await;
+    let mut gateway_results: Vec<(&[WantedModel], HashMap<String, ModelRates>)> =
+        Vec::with_capacity(groups.len());
+    for (group, result) in groups.iter().zip(catalogs) {
+        let catalog = match result {
+            Ok(models) => {
+                any_ok = true;
+                rates_catalog(models)
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+                    "live pricing: refresh failed for gateway; falling back to models.dev"
+                );
+                HashMap::new()
+            }
+        };
+        gateway_results.push((group.wanted.as_slice(), catalog));
+    }
+
+    // ── models.dev fallback (one fresh catalog fetch per cycle) ──
+    // Only the keys for models their own gateway left unpriced — the same
+    // `match_pricing` probe `assemble_snapshot` merges by.
+    let mut needed_keys: Vec<&str> = gateway_results
+        .iter()
+        .flat_map(|(wanted, catalog)| {
+            wanted.iter().filter_map(move |w| {
+                if match_pricing(catalog, &w.model_id).is_some() {
+                    None
+                } else {
+                    w.models_dev_key.as_deref()
+                }
+            })
+        })
+        .collect();
+    needed_keys.sort_unstable();
+    needed_keys.dedup();
+
+    let mut models_dev: HashMap<String, HashMap<String, ModelRates>> = HashMap::new();
+    if !needed_keys.is_empty() {
+        // Fetch fresh (not the process-cached catalog) so the fallback tracks
+        // upstream price changes on the same cadence as the gateways.
+        match crate::models_dev::fetch_catalog().await {
+            Ok(catalog) => {
+                for key in needed_keys {
+                    let map = crate::models_dev::pricing_from_catalog(&catalog, key);
+                    if !map.is_empty() {
+                        any_ok = true;
+                        models_dev.insert(key.to_string(), map);
+                    }
+                }
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+                    "live pricing: models.dev fallback fetch failed; keeping previous snapshot"
+                );
+            }
+        }
+    }
+
+    if any_ok {
+        store_snapshot(assemble_snapshot(&gateway_results, &models_dev));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_matches_composite_and_model_with_suffix_probe() {
+        let mut snap = PriceSnapshot::new();
+        snap.entry("opencode.zen".to_string()).or_default().insert(
+            "minimax-m2.5".to_string(),
+            ModelRates {
+                input_per_mtok: Some(0.3),
+                output_per_mtok: Some(1.2),
+                cached_input_per_mtok: Some(0.06),
+            },
+        );
+        let hit = lookup(&snap, "opencode.zen", "minimax-m2.5").expect("hit");
+        assert_eq!(hit.input_per_mtok, Some(0.3));
+        // A recorded `vendor/slug` id degrades to the stored slug.
+        assert!(lookup(&snap, "opencode.zen", "minimax/minimax-m2.5").is_some());
+        assert!(lookup(&snap, "opencode.zen", "other-model").is_none());
+        assert!(lookup(&snap, "other.alias", "minimax-m2.5").is_none());
+    }
+
+    #[test]
+    fn model_id_candidates_yield_verbatim_then_suffix() {
+        assert_eq!(
+            model_id_candidates("anthropic/claude-sonnet-4-5").collect::<Vec<_>>(),
+            vec!["anthropic/claude-sonnet-4-5", "claude-sonnet-4-5"]
+        );
+        assert_eq!(
+            model_id_candidates("minimax-m2.5").collect::<Vec<_>>(),
+            vec!["minimax-m2.5"]
+        );
+    }
+
+    #[test]
+    fn normalize_pricing_scales_per_token_strings_to_mtok() {
+        // 0.000003 USD/token -> 3.0 USD per 1M tokens; absent/garbage -> None.
+        let p = ModelPricing {
+            prompt: Some("0.000003".into()),
+            completion: Some("0.000015".into()),
+            input_cache_read: Some("0.0000003".into()),
+            input_cache_write: None,
+        };
+        let r = normalize_pricing(&p);
+        assert_eq!(r.input_per_mtok, Some(3.0));
+        assert_eq!(r.output_per_mtok, Some(15.0));
+        assert_eq!(r.cached_input_per_mtok, Some(0.3));
+
+        let empty = ModelPricing {
+            prompt: Some("abc".into()),
+            completion: None,
+            input_cache_read: Some("".into()),
+            input_cache_write: None,
+        };
+        assert!(normalize_pricing(&empty).is_empty());
+    }
+
+    #[test]
+    fn current_snapshot_is_synchronous_and_non_blocking() {
+        // Reading the global must never block or require an async runtime:
+        // this whole test runs without a tokio runtime.
+        store_snapshot(PriceSnapshot::new());
+        for _ in 0..10_000 {
+            let snap = current_snapshot();
+            assert!(lookup(&snap, "x.y", "z").is_none());
+        }
+    }
+
+    fn want(composite: &str, model: &str, md_key: Option<&str>) -> WantedModel {
+        WantedModel {
+            composite: composite.to_string(),
+            model_id: model.to_string(),
+            models_dev_key: md_key.map(str::to_string),
+        }
+    }
+
+    fn rate(input: f64) -> ModelRates {
+        ModelRates {
+            input_per_mtok: Some(input),
+            output_per_mtok: None,
+            cached_input_per_mtok: None,
+        }
+    }
+
+    #[test]
+    fn assemble_gateway_wins_then_models_dev_fills_gaps() {
+        let wanted = vec![
+            want("kilo.a", "minimax/m2.7", Some("kilo")), // priced by gateway
+            want("kilo.b", "only-on-mdev", Some("kilo")), // gateway blank → models.dev
+            want("kilo.c", "vendor/slug", Some("kilo")),  // suffix match on gateway
+            want("kilo.d", "nowhere", Some("kilo")),      // neither source
+            want("x.e", "no-key", None),                  // no fallback key
+        ];
+        let mut gateway = HashMap::new();
+        gateway.insert("minimax/m2.7".to_string(), rate(0.3));
+        gateway.insert("slug".to_string(), rate(0.7)); // matched via suffix
+        let gateway_results = vec![(wanted.as_slice(), gateway)];
+
+        let mut md = HashMap::new();
+        // models.dev also lists the gateway-priced model at a different rate —
+        // the gateway must win.
+        md.insert("minimax/m2.7".to_string(), rate(9.9));
+        md.insert("only-on-mdev".to_string(), rate(0.5));
+        let models_dev = HashMap::from([("kilo".to_string(), md)]);
+
+        let snap = assemble_snapshot(&gateway_results, &models_dev);
+
+        // Gateway price wins over models.dev for the shared model.
+        assert_eq!(snap["kilo.a"]["minimax/m2.7"].input_per_mtok, Some(0.3));
+        // models.dev fills a model the gateway didn't price.
+        assert_eq!(snap["kilo.b"]["only-on-mdev"].input_per_mtok, Some(0.5));
+        // Suffix match against the gateway catalog.
+        assert_eq!(snap["kilo.c"]["vendor/slug"].input_per_mtok, Some(0.7));
+        // Neither source, and the no-key case — both absent (left at $0).
+        assert!(!snap.contains_key("kilo.d"));
+        assert!(!snap.contains_key("x.e"));
+    }
+}
