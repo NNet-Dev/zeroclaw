@@ -5678,7 +5678,8 @@ fn build_channel_by_id(
                 )
                 .with_transcription(config.transcription.clone())
                 .with_stall_timeout(dc.stall_timeout_secs)
-                .with_approval_timeout_secs(dc.approval_timeout_secs),
+                .with_approval_timeout_secs(dc.approval_timeout_secs)
+                .with_intents_mask(dc.intents_mask),
             ))
         }
         #[cfg(not(feature = "channel-discord"))]
@@ -6612,7 +6613,8 @@ fn collect_configured_channels(
         .with_proxy_url(dc.proxy_url.clone())
         .with_transcription(config.transcription.clone())
         .with_stall_timeout(dc.stall_timeout_secs)
-        .with_approval_timeout_secs(dc.approval_timeout_secs);
+        .with_approval_timeout_secs(dc.approval_timeout_secs)
+        .with_intents_mask(dc.intents_mask);
         if dc.archive {
             match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
                 Ok(mem) => {
