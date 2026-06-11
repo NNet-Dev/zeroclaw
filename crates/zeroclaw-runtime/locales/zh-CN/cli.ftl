@@ -342,6 +342,8 @@ channel-wecom-ws-dm-access-denied =
     你的 userid: {$userid}
 
     请管理员将你的 userid 加入 {$allowed_users_path}。
+channel-discord-interaction-unauthorized = 你没有权限在此处使用该命令。
+channel-discord-interaction-malformed = 未知或格式错误的命令。
 channel-discord-delivery-failure-note-one = （注意：我无法传送 {$count} 个文件。）
 channel-discord-delivery-failure-note-many = （注意：我无法传送 {$count} 个文件。）
 onboard-openai-auth-note =

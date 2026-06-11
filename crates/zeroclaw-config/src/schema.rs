@@ -11349,7 +11349,7 @@ pub struct DiscordConfig {
     pub mention_only: bool,
     /// When true, register and serve Discord slash commands (e.g. `/ask`)
     /// over the Gateway WebSocket, in addition to message handling. Default
-    /// false. (Prototype — currently registers a single `/ask <prompt>`.)
+    /// false. (Prototype: currently registers a single `/ask <prompt>`.)
     #[tab(Behavior)]
     #[serde(default)]
     pub slash_commands: bool,
