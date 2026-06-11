@@ -2745,6 +2745,7 @@ fn ensure_unique_key(existing: &toml::Table, key: String) -> String {
 // edits.
 
 use anyhow::{Context as MigContext, Result as MigResult};
+#[cfg(feature = "sqlite")]
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -3211,6 +3212,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> MigResult<()> {
 /// On-disk schema version stamped after a successful SQLite memory
 /// migration. Future migrations consult this rather than re-running
 /// PRAGMA detection.
+#[cfg(feature = "sqlite")]
 pub const SQLITE_MEMORY_SCHEMA_VERSION: i64 = 1;
 
 #[cfg(feature = "memory-postgres")]
@@ -3231,6 +3233,7 @@ fn postgres_memory_schema_version() -> MigResult<i32> {
 /// The caller is responsible for opening the connection with
 /// `PRAGMA foreign_keys = ON` (and any other backend-specific PRAGMA
 /// tuning); this function operates on the open connection.
+#[cfg(feature = "sqlite")]
 pub fn migrate_sqlite_memory_to_v3(db_path: &Path, conn: &Connection) -> MigResult<()> {
     if sqlite_memories_agent_id_is_not_null(conn)? && sqlite_memories_has_unique_agent_key(conn)? {
         return Ok(());
@@ -3344,6 +3347,7 @@ pub fn migrate_sqlite_memory_to_v3(db_path: &Path, conn: &Connection) -> MigResu
     }
 }
 
+#[cfg(feature = "sqlite")]
 fn sqlite_ensure_schema_version_table(conn: &Connection) -> MigResult<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
@@ -3355,6 +3359,7 @@ fn sqlite_ensure_schema_version_table(conn: &Connection) -> MigResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
 fn sqlite_memories_agent_id_is_not_null(conn: &Connection) -> MigResult<bool> {
     let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
     let agent_id_notnull: Option<bool> = stmt
@@ -3383,6 +3388,7 @@ fn sqlite_memories_agent_id_is_not_null(conn: &Connection) -> MigResult<bool> {
     Ok(has_fk)
 }
 
+#[cfg(feature = "sqlite")]
 fn sqlite_memories_has_agent_id_column(conn: &Connection) -> MigResult<bool> {
     let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
     Ok(stmt
@@ -3396,6 +3402,7 @@ fn sqlite_memories_has_agent_id_column(conn: &Connection) -> MigResult<bool> {
 /// upsert clause.  A DB that has `agent_id NOT NULL` + FK but was created
 /// before the table-rebuild step (or had it skipped) will return `false`,
 /// causing `migrate_sqlite_memory_to_v3` to fall through and finish the job.
+#[cfg(feature = "sqlite")]
 fn sqlite_memories_has_unique_agent_key(conn: &Connection) -> MigResult<bool> {
     // `PRAGMA index_list` returns one row per index; `PRAGMA index_info`
     // returns one row per column in that index.  We want an index that is
@@ -3433,6 +3440,7 @@ fn sqlite_memories_has_unique_agent_key(conn: &Connection) -> MigResult<bool> {
     Ok(false)
 }
 
+#[cfg(feature = "sqlite")]
 fn sqlite_memories_row_count(conn: &Connection) -> MigResult<i64> {
     let table_exists: bool = conn
         .query_row(
@@ -3452,6 +3460,7 @@ fn sqlite_memories_row_count(conn: &Connection) -> MigResult<i64> {
 /// Mint or query the `default` agent's row. Idempotent on concurrent
 /// first-init: the returned UUID is the row that actually persisted,
 /// not the candidate we attempted to insert.
+#[cfg(feature = "sqlite")]
 pub fn sqlite_ensure_default_agent_uuid(conn: &Connection) -> MigResult<String> {
     sqlite_ensure_agent_uuid(conn, "default")
 }
@@ -3459,6 +3468,7 @@ pub fn sqlite_ensure_default_agent_uuid(conn: &Connection) -> MigResult<String> 
 /// Mint-or-query a single agent row keyed by alias. Used by the
 /// SQLite migration's default-agent backfill and by the `ensure_agent_uuid`
 /// trait impl on the memory backend (alias resolution at agent-loop entry).
+#[cfg(feature = "sqlite")]
 pub fn sqlite_ensure_agent_uuid(conn: &Connection, alias: &str) -> MigResult<String> {
     let new_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -3474,6 +3484,7 @@ pub fn sqlite_ensure_agent_uuid(conn: &Connection, alias: &str) -> MigResult<Str
     Ok(final_id)
 }
 
+#[cfg(feature = "sqlite")]
 fn backup_sqlite_for_multi_agent_migration(db_path: &Path) -> MigResult<()> {
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
     let backup_path = db_path.with_file_name(format!(
@@ -3754,7 +3765,7 @@ pub async fn migrate_qdrant_collection_to_v3(
     Ok(updated)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod fs_db_migration_tests {
     //! End-to-end V2 → V3 filesystem & DB migration test.
     //!
