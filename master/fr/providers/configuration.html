@@ -37,7 +37,7 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-113efe41.js";
+            window.path_to_searchindex_js = "../searchindex-dcfb2c15.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-141ed634.js"></script>
@@ -308,12 +308,14 @@
 <h2 id="emplacements-familiaux"><a class="header" href="#emplacements-familiaux">Emplacements familiaux</a></h2>
 <p>Every slot, its default endpoint, and whether it runs locally is in the <a href="./catalog.html#all-slots">Catalog</a>. There is one canonical key per vendor: no synonyms.</p>
 <h2 id="identifiants"><a class="header" href="#identifiants">Identifiants</a></h2>
-<p>Trois façons de fournir des identifiants, par ordre de résolution :</p>
+<p>Supported credential input and storage forms:</p>
 <ol>
 <li><strong><code>api_key = "..."</code> en ligne</strong> dans l’entrée d’alias (acceptable en développement, risqué pour les configs versionnées).</li>
+<li><strong>1Password references</strong>: set a secret field to <code>op://vault/item/field</code>. ZeroClaw keeps the reference in config and resolves it at runtime with <code>op read</code>, so the 1Password CLI must be installed and signed in.</li>
 <li><strong>Config-level secrets store</strong>: encrypted at <code>~/.zeroclaw/secrets</code> via a local key file.</li>
 <li><strong>Generic env override</strong>: <code>ZEROCLAW_providers__models__&lt;type&gt;__&lt;alias&gt;__api_key=...</code> sets <code>providers.models.&lt;type&gt;.&lt;alias&gt;.api_key</code> at startup. See <a href="../reference/env-vars.html">Environment variables</a> for the full grammar.</li>
 </ol>
+<p>Schema-mirror env overrides win at startup. They replace the in-memory credential for that process without rewriting the stored inline, encrypted, or <code>op://</code> value on disk.</p>
 <p><code>zeroclaw quickstart</code> writes credentials to the secrets store by default. Configs you commit should not contain inline keys. For ecosystem-default names you already export in your shell (<code>$ANTHROPIC_API_KEY</code>, <code>$OPENROUTER_API_KEY</code>, …), the <a href="../reference/env-vars.html#bridging-ecosystem-default-env-vars">env-vars reference</a> shows the one-line bash expansions that point a schema-mirror name at the existing value.</p>
 <h2 id="authentification-oauth-et-authentification-par-abonnement"><a class="header" href="#authentification-oauth-et-authentification-par-abonnement">Authentification OAuth et authentification par abonnement</a></h2>
 <p>Plusieurs fournisseurs acceptent des jetons OAuth ou de type abonnement au lieu de clés API brutes. Obtenez le jeton depuis le tableau de bord ou le flux CLI du fournisseur, puis insérez-le dans l’entrée d’alias de la même manière qu’une clé API :</p>

@@ -38,7 +38,7 @@
             const path_to_root = "";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "searchindex-128ad286.js";
+            window.path_to_searchindex_js = "searchindex-97a59c7c.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-88046f44.js"></script>
@@ -629,6 +629,39 @@
 <h2 id="本地开发与托管替代方案"><a class="header" href="#本地开发与托管替代方案">本地开发与托管替代方案</a></h2>
 <p>并排运行本地 Ollama 代理和托管服务商代理；将每个通道路由到你希望其使用的代理。</p>
 <p>The <code>dev</code> agent runs from the CLI (no channel binding required, <code>zeroclaw agent -a dev</code> is enough). When Ollama is down, the dev agent fails fast and surfaces the error. The prod channels are unaffected.</p>
+<h2 id="local-small-no-text-fallback-profile"><a class="header" href="#local-small-no-text-fallback-profile">Local-small no-text-fallback profile</a></h2>
+<p>Small local models usually need a runtime profile, not a provider-specific mode. Keep the Ollama provider focused on connection details, then use <code>[runtime_profiles.&lt;alias&gt;]</code> to tighten the prompt/tool loop behavior.</p>
+<pre><code class="language-toml">[providers.models.ollama.local]
+uri   = "http://localhost:11434"
+model = "qwen2.5-coder:7b"
+
+[agents.local]
+model_provider  = "ollama.local"
+risk_profile    = "supervised"
+runtime_profile = "local_small"
+
+[risk_profiles.supervised]
+level                            = "supervised"
+workspace_only                   = true
+require_approval_for_medium_risk = true
+block_high_risk_commands         = true
+
+[runtime_profiles.local_small]
+compact_context          = true
+strict_tool_parsing      = true
+max_tool_iterations      = 4
+max_history_messages     = 20
+max_context_tokens       = 8000
+max_tool_result_chars    = 4000
+keep_tool_context_turns  = 1
+</code></pre>
+<p>This profile composes existing primitives:</p>
+<ul>
+<li><code>compact_context</code> keeps startup context small.</li>
+<li><code>strict_tool_parsing</code> treats XML/JSON-looking fallback text as assistant text unless the provider returns native tool calls.</li>
+<li><code>max_tool_iterations</code>, <code>max_context_tokens</code>, and <code>max_tool_result_chars</code> bound runaway loops and oversized tool context.</li>
+</ul>
+<p>With Ollama, this is a no-text-fallback profile: authorized tools remain configured in <code>risk_profile</code>, but text-form tool markup from the model is not executed. Use it for chat-first local agents, or for providers that return native/structured tool calls. If a local model must use ZeroClaw’s text fallback tool syntax, set <code>strict_tool_parsing = false</code> and keep the other small-model limits.</p>
 <h2 id="cost-tiering-heavy-model-when-needed-fast-model-otherwise"><a class="header" href="#cost-tiering-heavy-model-when-needed-fast-model-otherwise">Cost tiering: heavy model when needed, fast model otherwise</a></h2>
 <p>Run two agents and route channels to the appropriate tier. The <code>delegate</code> tool lets one agent hand off to another mid-conversation. <a href="#delegation--subagents">Delegation</a> is gated: the caller’s risk profile must set <code>delegation_policy mode = "allow"</code>, and <strong>both agents must share the same risk profile</strong> (delegation does not cross trust tiers). So the frontline and heavy agents below run on the <em>same</em> <code>trusted</code> risk profile, they differ in model and runtime profile (iteration budget), not in trust surface.</p>
 <p>前线智能体使用 Haiku 处理每一条入站消息。当需要更深入的推理时，它会调用 <code>delegate</code> 工具并设置 <code>agent = "heavy"</code>；由于两个智能体共享 <code>trusted</code> 风险配置，且该配置允许委派，因此更重量级的智能体将使用 Opus 接管该子任务。</p>
@@ -5131,8 +5164,8 @@ zeroclaw daemon
 <tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
 </thead>
 <tbody>
-<tr><td><code>延迟加载</code></td><td>布尔</td><td><code>true</code></td><td>通过 <code>tool_search</code> 按需加载 MCP 工具模式，而不是提前加载</td></tr>
-<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 MCP 工具加载。</td></tr>
+<tr><td><code>延迟加载</code></td><td>布尔</td><td><code>false</code></td><td>通过 <code>tool_search</code> 按需加载 MCP 工具模式，而不是提前加载</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td>启用 MCP 工具加载。</td></tr>
 <tr><td><code>servers</code></td><td>对象[]</td><td><code>[]</code></td><td>已配置的 MCP 服务器。<code>#[nested]</code> 注解使该宏</td></tr>
 </tbody>
 </table>
@@ -5489,7 +5522,7 @@ api_key = "..."
 <h3 id="providersmodels"><a class="header" href="#providersmodels"><code>providers.models</code></a></h3>
 <p>类型化模型提供方容器 — 每个规范 model_provider 类型对应一个槽位。</p>
 <p>使用类型化结构体替换 <code>HashMap&lt;String, HashMap&lt;String, ModelProviderConfig&gt;&gt;</code>，使每个 family 的 per-alias 映射携带其自身的类型化配置（在类型层面可见该 family 的 <code>*Endpoint</code> 枚举和 family 特有的额外项）。</p>
-<p>TOML 结构保持字节级完全一致：每个具名字段都从与之前相同的 <code>[model_providers.&lt;type&gt;.&lt;alias&gt;]</code> 块反序列化而来。</p>
+<p>TOML shape is preserved byte-identical: each named field deserializes from the same <code>[providers.models.&lt;type&gt;.&lt;alias&gt;]</code> block as before.</p>
 <p>Adding a new model_provider family means: define the typed config in <code>schema.rs</code>, then add one row to <code>for_each_model_provider_slot!</code>, and every helper picks up the new slot automatically.</p>
 <p>One slot per family (<code>ai21</code>, <code>aihubmix</code>, <code>anthropic</code>, <code>anyscale</code>, <code>arcee</code>, <code>astrai</code>, <code>atomic_chat</code>, <code>avian</code>, <code>azure</code>, <code>baichuan</code>, <code>baseten</code>, <code>bedrock</code>, <code>cerebras</code>, <code>cloudflare</code>, <code>cohere</code>, <code>copilot</code>, <code>custom</code>, <code>deepinfra</code>, <code>deepmyst</code>, <code>deepseek</code>, <code>doubao</code>, <code>featherless</code>, <code>fireworks</code>, <code>friendli</code>, <code>gemini</code>, <code>gemini_cli</code>, <code>github_models</code>, <code>glm</code>, <code>groq</code>, <code>huggingface</code>, <code>hunyuan</code>, <code>hyperbolic</code>, <code>inception</code>, <code>kilo</code>, <code>kilocli</code>, <code>lambda_ai</code>, <code>lepton</code>, <code>litellm</code>, <code>llamacpp</code>, <code>lmstudio</code>, <code>minimax</code>, <code>mistral</code>, <code>moonshot</code>, <code>morph</code>, <code>nebius</code>, <code>novita</code>, <code>nscale</code>, <code>nvidia</code>, <code>ollama</code>, <code>openai</code>, <code>opencode</code>, <code>openrouter</code>, <code>osaurus</code>, <code>ovh</code>, <code>perplexity</code>, <code>qianfan</code>, <code>qwen</code>, <code>reka</code>, <code>sambanova</code>, <code>sglang</code>, <code>siliconflow</code>, <code>stepfun</code>, <code>synthetic</code>, <code>telnyx</code>, <code>together</code>, <code>upstage</code>, <code>venice</code>, <code>vercel</code>, <code>vllm</code>, <code>xai</code>, <code>yi</code>, <code>zai</code>). Each slot is a <code>[providers.models.&lt;slot&gt;.&lt;alias&gt;]</code> map; see the dedicated section page for the per-field reference.</p>
 <h3 id="providerstranscription"><a class="header" href="#providerstranscription"><code>providers.transcription</code></a></h3>
@@ -5829,7 +5862,7 @@ api_key = "..."
 </div>
 <h2 id="存储"><a class="header" href="#存储"><code>存储</code></a></h2>
 <p>持久化存储配置（<code>[storage]</code> 部分）。</p>
-<p>存储是一个两级别名键控映射：<code>[storage.&lt;backend&gt;.&lt;alias&gt;]</code>，与 <code>[model_providers.&lt;type&gt;.&lt;alias&gt;]</code> 平行。每个后端都有自己的类型化配置结构体。<code>MemoryConfig.backend</code> 携带一个点号引用（<code>"sqlite.default"</code>、<code>"postgres.work"</code>），通过 [<code>Config::resolve_active_storage</code>] 解析为其中一个条目。</p>
+<p>Storage is a two-tier alias-keyed map: <code>[storage.&lt;backend&gt;.&lt;alias&gt;]</code>, parallel to <code>[providers.models.&lt;type&gt;.&lt;alias&gt;]</code>. Each backend has its own typed config struct. <code>MemoryConfig.backend</code> carries a dotted reference (<code>"sqlite.default"</code>, <code>"postgres.work"</code>) that resolves to one of these entries via [<code>Config::resolve_active_storage</code>].</p>
 <p>One slot per family (<code>lucid</code>, <code>markdown</code>, <code>postgres</code>, <code>qdrant</code>, <code>sqlite</code>). Each slot is a <code>[storage.&lt;slot&gt;.&lt;alias&gt;]</code> map; see the dedicated section page for the per-field reference.</p>
 <h2 id="text_browser"><a class="header" href="#text_browser"><code>text_browser</code></a></h2>
 <p>文本浏览器工具配置（<code>[text_browser]</code> 部分）。</p>
@@ -8510,12 +8543,14 @@ api_key = "..."
 <h2 id="家庭席位"><a class="header" href="#家庭席位">家庭席位</a></h2>
 <p>Every slot, its default endpoint, and whether it runs locally is in the <a href="#all-slots">Catalog</a>. There is one canonical key per vendor: no synonyms.</p>
 <h2 id="凭证"><a class="header" href="#凭证">凭证</a></h2>
-<p>三种提供凭据的方式，按解析顺序如下：</p>
+<p>Supported credential input and storage forms:</p>
 <ol>
 <li><strong>内联 <code>api_key = "..."</code></strong>，置于别名条目中（开发时尚可，但对于提交到版本库的配置存在风险）。</li>
+<li><strong>1Password references</strong>: set a secret field to <code>op://vault/item/field</code>. ZeroClaw keeps the reference in config and resolves it at runtime with <code>op read</code>, so the 1Password CLI must be installed and signed in.</li>
 <li><strong>Config-level secrets store</strong>: encrypted at <code>~/.zeroclaw/secrets</code> via a local key file.</li>
 <li><strong>Generic env override</strong>: <code>ZEROCLAW_providers__models__&lt;type&gt;__&lt;alias&gt;__api_key=...</code> sets <code>providers.models.&lt;type&gt;.&lt;alias&gt;.api_key</code> at startup. See <a href="#环境变量">Environment variables</a> for the full grammar.</li>
 </ol>
+<p>Schema-mirror env overrides win at startup. They replace the in-memory credential for that process without rewriting the stored inline, encrypted, or <code>op://</code> value on disk.</p>
 <p><code>zeroclaw quickstart</code> writes credentials to the secrets store by default. Configs you commit should not contain inline keys. For ecosystem-default names you already export in your shell (<code>$ANTHROPIC_API_KEY</code>, <code>$OPENROUTER_API_KEY</code>, …), the <a href="#bridging-ecosystem-default-env-vars">env-vars reference</a> shows the one-line bash expansions that point a schema-mirror name at the existing value.</p>
 <h2 id="oauth-和订阅认证"><a class="header" href="#oauth-和订阅认证">OAuth 和订阅认证</a></h2>
 <p>一些提供商接受 OAuth 或订阅式令牌，而非原始 API 密钥。请从供应商自己的仪表板或 CLI 流程中获取令牌，然后像填写 API 密钥那样将其填入别名条目：</p>
@@ -9060,7 +9095,12 @@ INFO model_provider=anthropic.haiku stream complete tokens={input=512, output=12
 <h2 id="wire-protocol-wire_api--responses"><a class="header" href="#wire-protocol-wire_api--responses">Wire protocol: <code>wire_api = "responses"</code></a></h2>
 <p>Bring-your-own-endpoint slots default to the OpenAI chat-completions wire. An endpoint that only speaks the OpenAI <strong>responses</strong> wire (some self-hosted vLLM / TGI deployments) needs an explicit <code>wire_api = "responses"</code> opt-in on the alias entry.</p>
 <p>When set to <code>"responses"</code>, the provider is built as an <code>OpenAiResponsesModelProvider</code> (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Omit the field, or set <code>"chat_completions"</code>, for the default wire.</p>
-<p><code>wire_api</code> is only honored by the bring-your-own-endpoint families where the wire is operator-configurable: <code>openai</code>, <code>llamacpp</code>, and <code>custom</code> (plus the generic openai-compatible path). Branded vendor slots (<code>groq</code>, <code>mistral</code>, <code>deepseek</code>, …) have a fixed wire protocol and ignore the field. The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares <code>wire_api = "responses"</code> reaches the endpoint over the responses wire.</p>
+<p><code>wire_api</code> is honored by the bring-your-own-endpoint families where the wire is operator-configurable: <code>openai</code>, <code>llamacpp</code>, and <code>custom</code> (plus the generic openai-compatible path). Branded vendor slots (<code>groq</code>, <code>mistral</code>, <code>deepseek</code>, …) have a fixed wire protocol and ignore the field, with one exception: <code>opencode</code> honors <code>wire_api = "responses"</code> because OpenCode Zen serves both wires. With no <code>uri</code> override, the OpenCode responses route targets <code>https://opencode.ai/zen/v1/responses</code>:</p>
+<pre><code class="language-toml">[providers.models.opencode.default]
+model    = "big-pickle"
+wire_api = "responses"
+</code></pre>
+<p>The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares <code>wire_api = "responses"</code> reaches the endpoint over the responses wire.</p>
 <h2 id="验证-2"><a class="header" href="#验证-2">验证</a></h2>
 <p>无论采用哪种方法：</p>
 <div class="os-tabs-src">
@@ -12125,6 +12165,7 @@ zeroclaw channel start
 <h2 id="网页模式"><a class="header" href="#网页模式">网页模式</a></h2>
 <p>WhatsApp Web 模式通过可选的 Web 后端关联普通 WhatsApp 账户。它不需要 Meta Business 账户，但需要启用了 <code>whatsapp-web</code> 特性的 ZeroClaw 构建版本以及一个持久化的会话数据库路径。</p>
 <p>On first start, the Web backend pairs the account using QR or pair-code linking (<code>pair_phone</code> seeds pair-code linking; leave it unset for QR). Keep <code>session_path</code> on persistent storage; removing it forces a fresh device link. Bind the channel to an agent via that agent’s <code>channels</code> list.</p>
+<p>The shared <code>interrupt_on_new_message</code> option applies to both Cloud API mode and Web mode. When enabled, a newer WhatsApp message from the same sender/chat cancels the in-flight response.</p>
 <h2 id="个人和企业行为"><a class="header" href="#个人和企业行为">个人和企业行为</a></h2>
 <p>对于 Web 模式，<code>mode = "personal"</code> 会分别应用私信、群组和自聊策略：</p>
 <div class="table-wrapper">
@@ -12296,18 +12337,37 @@ zeroclaw channel start
 
 </details>
 <details class="cfg-field">
+<summary><code>interrupt_on_new_message</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Cancel an in-flight response from this channel sender when a newer WhatsApp message arrives. Default: <code>false</code>.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-9-9"><a class="header" href="#gateway-dashboard-9-9">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.interrupt_on_new_message</code> field.</p>
+<h4 id="zerocode-9-9"><a class="header" href="#zerocode-9-9">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.interrupt_on_new_message</code> field.</p>
+<h4 id="zeroclaw-config-8-8"><a class="header" href="#zeroclaw-config-8-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.interrupt_on_new_message &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-8-8"><a class="header" href="#environment-variable-8-8">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__interrupt_on_new_message=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
 <summary><code>mention_only</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
 <p>When true, only respond to messages that @-mention the bot in groups (Web mode only). Direct messages are always processed. Bot identity is resolved from the wa-rs device at runtime; <code>pair_phone</code> seeds it on first connect.</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-9-9"><a class="header" href="#gateway-dashboard-9-9">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-10-8"><a class="header" href="#gateway-dashboard-10-8">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.mention_only</code> field.</p>
-<h4 id="zerocode-9-9"><a class="header" href="#zerocode-9-9">zerocode</a></h4>
+<h4 id="zerocode-10-8"><a class="header" href="#zerocode-10-8">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.mention_only</code> field.</p>
-<h4 id="zeroclaw-config-8-8"><a class="header" href="#zeroclaw-config-8-8">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-9-8"><a class="header" href="#zeroclaw-config-9-8">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.mention_only &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-8-8"><a class="header" href="#environment-variable-8-8">Environment variable</a></h4>
+<h4 id="environment-variable-9-8"><a class="header" href="#environment-variable-9-8">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__mention_only=
 </code></pre>
@@ -12319,14 +12379,14 @@ zeroclaw channel start
 <p>Usage mode for WhatsApp Web: “business” (default) or “personal”. In personal mode the bot applies dm_policy, group_policy, and self_chat_mode to decide which chats to respond in.</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-10-8"><a class="header" href="#gateway-dashboard-10-8">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-11-8"><a class="header" href="#gateway-dashboard-11-8">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.mode</code> field.</p>
-<h4 id="zerocode-10-8"><a class="header" href="#zerocode-10-8">zerocode</a></h4>
+<h4 id="zerocode-11-8"><a class="header" href="#zerocode-11-8">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.mode</code> field.</p>
-<h4 id="zeroclaw-config-9-8"><a class="header" href="#zeroclaw-config-9-8">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-10-8"><a class="header" href="#zeroclaw-config-10-8">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.mode &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-9-8"><a class="header" href="#environment-variable-9-8">Environment variable</a></h4>
+<h4 id="environment-variable-10-8"><a class="header" href="#environment-variable-10-8">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__mode=
 </code></pre>
@@ -12338,14 +12398,14 @@ zeroclaw channel start
 <p>Custom pair code for linking (Web mode, optional) Leave empty to let WhatsApp generate one</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-11-8"><a class="header" href="#gateway-dashboard-11-8">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-12-8"><a class="header" href="#gateway-dashboard-12-8">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.pair_code</code> field.</p>
-<h4 id="zerocode-11-8"><a class="header" href="#zerocode-11-8">zerocode</a></h4>
+<h4 id="zerocode-12-8"><a class="header" href="#zerocode-12-8">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.pair_code</code> field.</p>
-<h4 id="zeroclaw-config-10-8"><a class="header" href="#zeroclaw-config-10-8">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-11-7"><a class="header" href="#zeroclaw-config-11-7">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.pair_code &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-10-8"><a class="header" href="#environment-variable-10-8">Environment variable</a></h4>
+<h4 id="environment-variable-11-7"><a class="header" href="#environment-variable-11-7">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__pair_code=
 </code></pre>
@@ -12357,14 +12417,14 @@ zeroclaw channel start
 <p>Phone number for pair code linking (Web mode, optional) Format: country code + number (e.g., “15551234567”) If not set, QR code pairing will be used</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-12-8"><a class="header" href="#gateway-dashboard-12-8">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-13-7"><a class="header" href="#gateway-dashboard-13-7">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.pair_phone</code> field.</p>
-<h4 id="zerocode-12-8"><a class="header" href="#zerocode-12-8">zerocode</a></h4>
+<h4 id="zerocode-13-7"><a class="header" href="#zerocode-13-7">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.pair_phone</code> field.</p>
-<h4 id="zeroclaw-config-11-7"><a class="header" href="#zeroclaw-config-11-7">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-12-7"><a class="header" href="#zeroclaw-config-12-7">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.pair_phone &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-11-7"><a class="header" href="#environment-variable-11-7">Environment variable</a></h4>
+<h4 id="environment-variable-12-7"><a class="header" href="#environment-variable-12-7">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__pair_phone=
 </code></pre>
@@ -12376,14 +12436,14 @@ zeroclaw channel start
 <p>Phone number ID from Meta Business API (Cloud API mode)</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-13-7"><a class="header" href="#gateway-dashboard-13-7">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-14-7"><a class="header" href="#gateway-dashboard-14-7">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.phone_number_id</code> field.</p>
-<h4 id="zerocode-13-7"><a class="header" href="#zerocode-13-7">zerocode</a></h4>
+<h4 id="zerocode-14-7"><a class="header" href="#zerocode-14-7">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.phone_number_id</code> field.</p>
-<h4 id="zeroclaw-config-12-7"><a class="header" href="#zeroclaw-config-12-7">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-13-7"><a class="header" href="#zeroclaw-config-13-7">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.phone_number_id &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-12-7"><a class="header" href="#environment-variable-12-7">Environment variable</a></h4>
+<h4 id="environment-variable-13-7"><a class="header" href="#environment-variable-13-7">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__phone_number_id=
 </code></pre>
@@ -12395,14 +12455,14 @@ zeroclaw channel start
 <p>Per-channel proxy URL (http, https, socks5, socks5h). Overrides the global <code>[proxy]</code> setting for this channel only.</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-14-7"><a class="header" href="#gateway-dashboard-14-7">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-15-7"><a class="header" href="#gateway-dashboard-15-7">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.proxy_url</code> field.</p>
-<h4 id="zerocode-14-7"><a class="header" href="#zerocode-14-7">zerocode</a></h4>
+<h4 id="zerocode-15-7"><a class="header" href="#zerocode-15-7">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.proxy_url</code> field.</p>
-<h4 id="zeroclaw-config-13-7"><a class="header" href="#zeroclaw-config-13-7">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-14-7"><a class="header" href="#zeroclaw-config-14-7">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.proxy_url &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-13-7"><a class="header" href="#environment-variable-13-7">Environment variable</a></h4>
+<h4 id="environment-variable-14-6"><a class="header" href="#environment-variable-14-6">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__proxy_url=
 </code></pre>
@@ -12414,14 +12474,14 @@ zeroclaw channel start
 <p>Per-(channel, recipient) outbound pacing floor in seconds. Range: <code>0..=REPLY_MIN_INTERVAL_MAX_SECS</code> (0 disables).</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-15-7"><a class="header" href="#gateway-dashboard-15-7">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-16-7"><a class="header" href="#gateway-dashboard-16-7">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.reply_min_interval_secs</code> field.</p>
-<h4 id="zerocode-15-7"><a class="header" href="#zerocode-15-7">zerocode</a></h4>
+<h4 id="zerocode-16-7"><a class="header" href="#zerocode-16-7">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.reply_min_interval_secs</code> field.</p>
-<h4 id="zeroclaw-config-14-7"><a class="header" href="#zeroclaw-config-14-7">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-15-7"><a class="header" href="#zeroclaw-config-15-7">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.reply_min_interval_secs &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-14-6"><a class="header" href="#environment-variable-14-6">Environment variable</a></h4>
+<h4 id="environment-variable-15-6"><a class="header" href="#environment-variable-15-6">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__reply_min_interval_secs=
 </code></pre>
@@ -12433,14 +12493,14 @@ zeroclaw channel start
 <p>Per-(channel, recipient) outbound pacing queue depth. Range: <code>0..=REPLY_QUEUE_DEPTH_CEILING</code>. When <code>reply_min_interval_secs &gt; 0</code> and this value is <code>0</code>, the pacing wrapper substitutes <code>DEFAULT_REPLY_QUEUE_DEPTH</code> (16). When the queue is full, the newest send is dropped and a <code>WARN</code> is logged.</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-16-7"><a class="header" href="#gateway-dashboard-16-7">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-17-5"><a class="header" href="#gateway-dashboard-17-5">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.reply_queue_depth_max</code> field.</p>
-<h4 id="zerocode-16-7"><a class="header" href="#zerocode-16-7">zerocode</a></h4>
+<h4 id="zerocode-17-5"><a class="header" href="#zerocode-17-5">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.reply_queue_depth_max</code> field.</p>
-<h4 id="zeroclaw-config-15-7"><a class="header" href="#zeroclaw-config-15-7">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-16-5"><a class="header" href="#zeroclaw-config-16-5">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.reply_queue_depth_max &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-15-6"><a class="header" href="#environment-variable-15-6">Environment variable</a></h4>
+<h4 id="environment-variable-16-3"><a class="header" href="#environment-variable-16-3">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__reply_queue_depth_max=
 </code></pre>
@@ -12452,14 +12512,14 @@ zeroclaw channel start
 <p>When true and mode = “personal”, always respond to messages in the user’s own self-chat (Notes to Self). Defaults to false.</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-17-5"><a class="header" href="#gateway-dashboard-17-5">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-18-4"><a class="header" href="#gateway-dashboard-18-4">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.self_chat_mode</code> field.</p>
-<h4 id="zerocode-17-5"><a class="header" href="#zerocode-17-5">zerocode</a></h4>
+<h4 id="zerocode-18-4"><a class="header" href="#zerocode-18-4">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.self_chat_mode</code> field.</p>
-<h4 id="zeroclaw-config-16-5"><a class="header" href="#zeroclaw-config-16-5">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-17-5"><a class="header" href="#zeroclaw-config-17-5">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.self_chat_mode &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-16-3"><a class="header" href="#environment-variable-16-3">Environment variable</a></h4>
+<h4 id="environment-variable-17-3"><a class="header" href="#environment-variable-17-3">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__self_chat_mode=
 </code></pre>
@@ -12471,14 +12531,14 @@ zeroclaw channel start
 <p>Session database path for WhatsApp Web client (Web mode) When set, enables native WhatsApp Web mode with wa-rs</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-18-4"><a class="header" href="#gateway-dashboard-18-4">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-19-4"><a class="header" href="#gateway-dashboard-19-4">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.session_path</code> field.</p>
-<h4 id="zerocode-18-4"><a class="header" href="#zerocode-18-4">zerocode</a></h4>
+<h4 id="zerocode-19-4"><a class="header" href="#zerocode-19-4">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.session_path</code> field.</p>
-<h4 id="zeroclaw-config-17-5"><a class="header" href="#zeroclaw-config-17-5">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-18-3"><a class="header" href="#zeroclaw-config-18-3">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.session_path &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-17-3"><a class="header" href="#environment-variable-17-3">Environment variable</a></h4>
+<h4 id="environment-variable-18-1"><a class="header" href="#environment-variable-18-1">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__session_path=
 </code></pre>
@@ -12490,14 +12550,14 @@ zeroclaw channel start
 <p>Webhook verify token (you define this, Meta sends it back for verification) Only used in Cloud API mode</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-19-4"><a class="header" href="#gateway-dashboard-19-4">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-20-3"><a class="header" href="#gateway-dashboard-20-3">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.verify_token</code> field.</p>
-<h4 id="zerocode-19-4"><a class="header" href="#zerocode-19-4">zerocode</a></h4>
+<h4 id="zerocode-20-3"><a class="header" href="#zerocode-20-3">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.verify_token</code> field.</p>
-<h4 id="zeroclaw-config-18-3"><a class="header" href="#zeroclaw-config-18-3">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-19-2"><a class="header" href="#zeroclaw-config-19-2">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.verify_token    # masked input, stored encrypted
 </code></pre>
-<h4 id="environment-variable-18-1"><a class="header" href="#environment-variable-18-1">Environment variable</a></h4>
+<h4 id="environment-variable-19-1"><a class="header" href="#environment-variable-19-1">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__verify_token=
 </code></pre>
@@ -12509,14 +12569,14 @@ zeroclaw channel start
 <p>Override the WhatsApp Web WebSocket URL (Web mode, optional). Used by integration tests and proxy setups; leave unset to use the default endpoint that ships with <code>wa-rs</code>.</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-20-3"><a class="header" href="#gateway-dashboard-20-3">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-21-2"><a class="header" href="#gateway-dashboard-21-2">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.ws_url</code> field.</p>
-<h4 id="zerocode-20-3"><a class="header" href="#zerocode-20-3">zerocode</a></h4>
+<h4 id="zerocode-21-2"><a class="header" href="#zerocode-21-2">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.ws_url</code> field.</p>
-<h4 id="zeroclaw-config-19-2"><a class="header" href="#zeroclaw-config-19-2">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-20-2"><a class="header" href="#zeroclaw-config-20-2">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.ws_url &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-19-1"><a class="header" href="#environment-variable-19-1">Environment variable</a></h4>
+<h4 id="environment-variable-20-1"><a class="header" href="#environment-variable-20-1">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__ws_url=
 </code></pre>
@@ -12526,9 +12586,9 @@ zeroclaw channel start
 </div>
 
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-21-2"><a class="header" href="#gateway-dashboard-21-2">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-22-2"><a class="header" href="#gateway-dashboard-22-2">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> in the web dashboard.</p>
-<h4 id="zerocode-21-2"><a class="header" href="#zerocode-21-2">zerocode</a></h4>
+<h4 id="zerocode-22-2"><a class="header" href="#zerocode-22-2">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, under <strong>Channels</strong>.</p>
 </div>
 
@@ -12536,11 +12596,11 @@ zeroclaw channel start
 <p><strong><code>channels.whatsapp.&lt;alias&gt;.access_token</code> is a secret.</strong> Stored encrypted, never in plain <code>config.toml</code>. Set it through one of these, which encrypt on write:</p>
 </blockquote>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-22-2"><a class="header" href="#gateway-dashboard-22-2">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-23-2"><a class="header" href="#gateway-dashboard-23-2">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.access_token</code> field there.</p>
-<h4 id="zerocode-22-2"><a class="header" href="#zerocode-22-2">zerocode</a></h4>
+<h4 id="zerocode-23-2"><a class="header" href="#zerocode-23-2">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.access_token</code> field (input is masked).</p>
-<h4 id="zeroclaw-config-20-2"><a class="header" href="#zeroclaw-config-20-2">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-21-2"><a class="header" href="#zeroclaw-config-21-2">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.access_token    # prompts for masked input, stores encrypted
 </code></pre>
 </div>
@@ -13083,7 +13143,7 @@ zeroclaw channel start
 <p>Open <a href="http://127.0.0.1:42617/config/channels/gmail_push"><code>/config/channels/gmail_push</code></a> and set the <code>channels.gmail_push.&lt;alias&gt;.oauth_token</code> field.</p>
 <h4 id="zerocode-22-3"><a class="header" href="#zerocode-22-3">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.gmail_push.&lt;alias&gt;.oauth_token</code> field.</p>
-<h4 id="zeroclaw-config-21-2"><a class="header" href="#zeroclaw-config-21-2">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-21-3"><a class="header" href="#zeroclaw-config-21-3">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.gmail_push.&lt;alias&gt;.oauth_token &lt;value&gt;
 </code></pre>
 <h4 id="environment-variable-19-2"><a class="header" href="#environment-variable-19-2">Environment variable</a></h4>
@@ -13097,14 +13157,14 @@ zeroclaw channel start
 <summary><code>topic</code>* <span class="cfg-field-meta"><code>string</code> · default <code>—</code></span></summary>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
-<h4 id="gateway-dashboard-23-2"><a class="header" href="#gateway-dashboard-23-2">Gateway dashboard</a></h4>
+<h4 id="gateway-dashboard-23-3"><a class="header" href="#gateway-dashboard-23-3">Gateway dashboard</a></h4>
 <p>Open <a href="http://127.0.0.1:42617/config/channels/gmail_push"><code>/config/channels/gmail_push</code></a> and set the <code>channels.gmail_push.&lt;alias&gt;.topic</code> field.</p>
-<h4 id="zerocode-23-2"><a class="header" href="#zerocode-23-2">zerocode</a></h4>
+<h4 id="zerocode-23-3"><a class="header" href="#zerocode-23-3">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.gmail_push.&lt;alias&gt;.topic</code> field.</p>
 <h4 id="zeroclaw-config-22-2"><a class="header" href="#zeroclaw-config-22-2">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.gmail_push.&lt;alias&gt;.topic &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-20-1"><a class="header" href="#environment-variable-20-1">Environment variable</a></h4>
+<h4 id="environment-variable-20-2"><a class="header" href="#environment-variable-20-2">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__gmail_push__&lt;alias&gt;__topic=
 </code></pre>
@@ -13600,10 +13660,10 @@ zeroclaw channel start
 <p>Open <a href="http://127.0.0.1:42617/config/channels/voice_wake"><code>/config/channels/voice_wake</code></a> and set the <code>channels.voice_wake.&lt;alias&gt;.silence_timeout_ms</code> field.</p>
 <h4 id="zerocode-21-4"><a class="header" href="#zerocode-21-4">zerocode</a></h4>
 <p>In the <strong>Config</strong> pane, set the <code>channels.voice_wake.&lt;alias&gt;.silence_timeout_ms</code> field.</p>
-<h4 id="zeroclaw-config-21-3"><a class="header" href="#zeroclaw-config-21-3">zeroclaw config</a></h4>
+<h4 id="zeroclaw-config-21-4"><a class="header" href="#zeroclaw-config-21-4">zeroclaw config</a></h4>
 <pre><code class="language-sh">zeroclaw config set channels.voice_wake.&lt;alias&gt;.silence_timeout_ms &lt;value&gt;
 </code></pre>
-<h4 id="environment-variable-20-2"><a class="header" href="#environment-variable-20-2">Environment variable</a></h4>
+<h4 id="environment-variable-20-3"><a class="header" href="#environment-variable-20-3">Environment variable</a></h4>
 <p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
 <pre><code class="language-sh">export ZEROCLAW_channels__voice_wake__&lt;alias&gt;__silence_timeout_ms=
 </code></pre>
@@ -14413,10 +14473,11 @@ pub trait Tool: Send + Sync + Attributable {
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="mcp-1"><a class="header" href="#mcp-1">MCP</a></h1>
 <p>ZeroClaw is an MCP client: it connects to external <a href="https://modelcontextprotocol.io">Model Context Protocol</a> servers and exposes their tools to the agent. Each MCP tool is namespaced as <code>&lt;server&gt;__&lt;tool&gt;</code> (for example <code>filesystem__read_file</code>), so tools from different servers never collide.</p>
-<h2 id="enable-mcp"><a class="header" href="#enable-mcp">Enable MCP</a></h2>
-<p>MCP is <strong>off by default</strong>. Set <code>mcp.enabled = true</code>, then add one entry per server under <code>mcp.servers</code>. Configure through the gateway, zerocode, or <code>zeroclaw config set</code>:</p>
-<pre><code class="language-sh">zeroclaw config set mcp.enabled true
+<h2 id="configure-mcp"><a class="header" href="#configure-mcp">Configure MCP</a></h2>
+<p>MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under <code>mcp.servers</code>. Configure through the gateway, zerocode, or <code>zeroclaw config set</code>:</p>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.filesystem.command npx
 </code></pre>
+<p>Set <code>mcp.enabled = false</code> to disable MCP tool loading without removing server definitions.</p>
 <h2 id="transports"><a class="header" href="#transports">Transports</a></h2>
 <p>A server is reached over one of three transports (the <code>transport</code> field):</p>
 <div class="table-wrapper">
@@ -14594,8 +14655,8 @@ pub trait Tool: Send + Sync + Attributable {
 <h2 id="top-level-fields"><a class="header" href="#top-level-fields">Top-level fields</a></h2>
 <div class="cfg-fields">
 <details class="cfg-field">
-<summary><code>deferred_loading</code> <span class="cfg-field-meta"><code>bool</code> · default <code>true</code></span></summary>
-<p>Load MCP tool schemas on-demand via <code>tool_search</code> instead of eagerly including them in the LLM context window. When <code>true</code> (the default), only tool names are listed in the system prompt; the LLM must call <code>tool_search</code> to fetch full schemas before invoking a deferred tool.</p>
+<summary><code>deferred_loading</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Load MCP tool schemas on-demand via <code>tool_search</code> instead of eagerly including them in the LLM context window. When enabled, only tool names are listed in the system prompt; the LLM must call <code>tool_search</code> to fetch full schemas before invoking a deferred tool.</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
 <h4 id="gateway-dashboard-8-13"><a class="header" href="#gateway-dashboard-8-13">Gateway dashboard</a></h4>
@@ -14634,9 +14695,9 @@ pub trait Tool: Send + Sync + Attributable {
 </div>
 
 <h2 id="deferred-loading"><a class="header" href="#deferred-loading">Deferred loading</a></h2>
-<p><code>mcp.deferred_loading</code> is <code>true</code> by default. With it on, only MCP tool <strong>names</strong> are placed in the system prompt; the LLM calls the built-in <code>tool_search</code> tool to fetch a tool’s full schema before invoking it. This keeps the initial context window small when a server exposes many tools. Set it to <code>false</code> to eagerly include every MCP tool’s full schema up front.</p>
+<p><code>mcp.deferred_loading</code> is <code>false</code> by default, so configured MCP tools are included in the model context eagerly. Set it to <code>true</code> to place only MCP tool <strong>names</strong> in the system prompt; the LLM calls the built-in <code>tool_search</code> tool to fetch a tool’s full schema before invoking it. This keeps the initial context window small when a server exposes many tools.</p>
 <h2 id="security-and-approval"><a class="header" href="#security-and-approval">Security and approval</a></h2>
-<p>MCP tool calls go through the same approval gate as every other tool, governed by the agent’s risk profile (<code>risk_profiles.&lt;alias&gt;</code>):</p>
+<p>MCP tool calls go through the same approval gate as every other tool, governed by the agent’s risk profile (<code>risk_profiles.&lt;alias&gt;</code>). The <code>tool_search</code> discovery step is auto-approved so deferred MCP loading can work in non-interactive sessions, but tools discovered from MCP servers still follow the normal approval policy:</p>
 <ul>
 <li>At autonomy <code>level = full</code>, no tool call prompts (MCP tools included).</li>
 <li>Otherwise, an MCP tool call prompts for approval unless its <strong>prefixed</strong> name (<code>&lt;server&gt;__&lt;tool&gt;</code>) is in the profile’s <code>auto_approve</code> list. <code>auto_approve = ["*"]</code> approves everything; an exact entry like <code>auto_approve = ["filesystem__read_file"]</code> approves just that tool.</li>
@@ -18889,11 +18950,12 @@ cargo build --release --features gateway
 <tr><th>工具</th><th>安装</th></tr>
 </thead>
 <tbody>
-<tr><td><code>npm</code></td><td><a href="https://nodejs.org/">https://nodejs.org/</a> 或 <code>nvm install --lts</code></td></tr>
+<tr><td><code>npm</code></td><td><a href="https://nodejs.org/">https://nodejs.org/</a> or <code>nvm install &amp;&amp; nvm use</code> from the repo root</td></tr>
 <tr><td><code>cargo</code></td><td><a href="https://rustup.rs">https://rustup.rs</a></td></tr>
 </tbody>
 </table>
 </div>
+<p>The repo root <code>.nvmrc</code> pins the Node major version used by release web builds. Use it for local dashboard work so <code>npm install</code>, <code>cargo web check</code>, and manual release builds all run against the same Node line.</p>
 <p>如果缺少 <code>npm</code>，<code>cargo web</code> 会快速失败并给出安装提示。</p>
 <h2 id="支持的浏览器最低版本"><a class="header" href="#支持的浏览器最低版本">支持的浏览器（最低版本）</a></h2>
 <p>仪表板面向支持 <code>color-mix()</code> 和 <code>structuredClone()</code> 的常青浏览器。</p>

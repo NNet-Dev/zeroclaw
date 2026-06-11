@@ -37,7 +37,7 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-113efe41.js";
+            window.path_to_searchindex_js = "../searchindex-dcfb2c15.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-141ed634.js"></script>
@@ -294,10 +294,11 @@
                     <main>
                         <h1 id="mcp"><a class="header" href="#mcp">MCP</a></h1>
 <p>ZeroClaw is an MCP client: it connects to external <a href="https://modelcontextprotocol.io">Model Context Protocol</a> servers and exposes their tools to the agent. Each MCP tool is namespaced as <code>&lt;server&gt;__&lt;tool&gt;</code> (for example <code>filesystem__read_file</code>), so tools from different servers never collide.</p>
-<h2 id="enable-mcp"><a class="header" href="#enable-mcp">Enable MCP</a></h2>
-<p>MCP is <strong>off by default</strong>. Set <code>mcp.enabled = true</code>, then add one entry per server under <code>mcp.servers</code>. Configure through the gateway, zerocode, or <code>zeroclaw config set</code>:</p>
-<pre><code class="language-sh">zeroclaw config set mcp.enabled true
+<h2 id="configure-mcp"><a class="header" href="#configure-mcp">Configure MCP</a></h2>
+<p>MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under <code>mcp.servers</code>. Configure through the gateway, zerocode, or <code>zeroclaw config set</code>:</p>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.filesystem.command npx
 </code></pre>
+<p>Set <code>mcp.enabled = false</code> to disable MCP tool loading without removing server definitions.</p>
 <h2 id="transports"><a class="header" href="#transports">Transports</a></h2>
 <p>A server is reached over one of three transports (the <code>transport</code> field):</p>
 <div class="table-wrapper">
@@ -475,8 +476,8 @@
 <h2 id="top-level-fields"><a class="header" href="#top-level-fields">Top-level fields</a></h2>
 <div class="cfg-fields">
 <details class="cfg-field">
-<summary><code>deferred_loading</code> <span class="cfg-field-meta"><code>bool</code> · default <code>true</code></span></summary>
-<p>Load MCP tool schemas on-demand via <code>tool_search</code> instead of eagerly including them in the LLM context window. When <code>true</code> (the default), only tool names are listed in the system prompt; the LLM must call <code>tool_search</code> to fetch full schemas before invoking a deferred tool.</p>
+<summary><code>deferred_loading</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Load MCP tool schemas on-demand via <code>tool_search</code> instead of eagerly including them in the LLM context window. When enabled, only tool names are listed in the system prompt; the LLM must call <code>tool_search</code> to fetch full schemas before invoking a deferred tool.</p>
 <p><strong>Set it on any surface:</strong></p>
 <div class="os-tabs-src">
 <h4 id="gateway-dashboard-8"><a class="header" href="#gateway-dashboard-8">Gateway dashboard</a></h4>
@@ -515,9 +516,9 @@
 </div>
 
 <h2 id="deferred-loading"><a class="header" href="#deferred-loading">Deferred loading</a></h2>
-<p><code>mcp.deferred_loading</code> is <code>true</code> by default. With it on, only MCP tool <strong>names</strong> are placed in the system prompt; the LLM calls the built-in <code>tool_search</code> tool to fetch a tool’s full schema before invoking it. This keeps the initial context window small when a server exposes many tools. Set it to <code>false</code> to eagerly include every MCP tool’s full schema up front.</p>
+<p><code>mcp.deferred_loading</code> is <code>false</code> by default, so configured MCP tools are included in the model context eagerly. Set it to <code>true</code> to place only MCP tool <strong>names</strong> in the system prompt; the LLM calls the built-in <code>tool_search</code> tool to fetch a tool’s full schema before invoking it. This keeps the initial context window small when a server exposes many tools.</p>
 <h2 id="security-and-approval"><a class="header" href="#security-and-approval">Security and approval</a></h2>
-<p>MCP tool calls go through the same approval gate as every other tool, governed by the agent’s risk profile (<code>risk_profiles.&lt;alias&gt;</code>):</p>
+<p>MCP tool calls go through the same approval gate as every other tool, governed by the agent’s risk profile (<code>risk_profiles.&lt;alias&gt;</code>). The <code>tool_search</code> discovery step is auto-approved so deferred MCP loading can work in non-interactive sessions, but tools discovered from MCP servers still follow the normal approval policy:</p>
 <ul>
 <li>At autonomy <code>level = full</code>, no tool call prompts (MCP tools included).</li>
 <li>Otherwise, an MCP tool call prompts for approval unless its <strong>prefixed</strong> name (<code>&lt;server&gt;__&lt;tool&gt;</code>) is in the profile’s <code>auto_approve</code> list. <code>auto_approve = ["*"]</code> approves everything; an exact entry like <code>auto_approve = ["filesystem__read_file"]</code> approves just that tool.</li>
