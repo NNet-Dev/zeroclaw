@@ -77,7 +77,7 @@ path = "src/lib.rs"
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
-zeroclaw-config = { workspace = true, features = ["clap"] }
+zeroclaw-config = { workspace = true, features = ["clap", "sqlite", "ws-proxy"] }
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
