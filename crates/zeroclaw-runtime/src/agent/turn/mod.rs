@@ -18,6 +18,7 @@ pub(crate) mod post_exec;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
+pub(crate) mod results_collect;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
 pub(crate) mod tool_specs;
@@ -43,6 +44,9 @@ pub(crate) use provider_call::{
     ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
 };
 pub use redact::scrub_credentials;
+pub(crate) use results_collect::{
+    CollectedResults, check_identical_output_abort, collect_tool_results,
+};
 #[cfg(test)]
 pub(crate) use stream_consume::StreamedChatOutcome;
 #[cfg(test)]
