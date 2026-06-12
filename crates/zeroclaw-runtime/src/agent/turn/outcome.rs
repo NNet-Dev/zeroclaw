@@ -42,6 +42,43 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
 
 impl std::error::Error for StreamInterruptedAfterOutput {}
 
+/// The user cancelled mid-stream *after* caller-visible text was already
+/// forwarded on `event_tx`.
+///
+/// Carries the forwarded text so the loop can persist the visible partial
+/// with the `[interrupted by user]` marker — the pre-consolidation streaming
+/// engine committed the watched partial on cancel, and losing it makes the
+/// transcript disagree with what the user saw stream. Chains to
+/// [`ToolLoopCancelled`] via `source()`, so [`is_tool_loop_cancelled`] (and
+/// every caller built on it: the no-fallback rule, the fixed observer
+/// message, the wrappers' cancel arms) recognizes it unchanged.
+#[derive(Debug)]
+pub(crate) struct StreamCancelledAfterOutput {
+    pub(crate) partial_text: String,
+    cause: ToolLoopCancelled,
+}
+
+impl StreamCancelledAfterOutput {
+    pub(crate) fn new(partial_text: String) -> Self {
+        Self {
+            partial_text,
+            cause: ToolLoopCancelled,
+        }
+    }
+}
+
+impl std::fmt::Display for StreamCancelledAfterOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop cancelled after streamed output")
+    }
+}
+
+impl std::error::Error for StreamCancelledAfterOutput {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 #[derive(Debug)]
 pub struct ModelSwitchRequested {
     pub model_provider: String,

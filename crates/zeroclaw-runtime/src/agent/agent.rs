@@ -2697,12 +2697,39 @@ impl Agent {
                         }
                     }
                     if crate::agent::loop_::is_tool_loop_cancelled(&error) {
-                        committed_response.push_str("[interrupted by user]");
-                        let interruption = ConversationMessage::Chat(ChatMessage::assistant(
-                            "[interrupted by user]".to_string(),
-                        ));
-                        new_msgs.push(interruption.clone());
-                        self.history.push(interruption);
+                        // When the cancel arrived after event-visible
+                        // streamed text, the loop already persisted
+                        // "{partial}\n\n[interrupted by user]" (replayed
+                        // into history/new_msgs above, and into
+                        // committed_response by the empty-committed rebuild).
+                        // Synthesize the bare marker only when no
+                        // interruption text was committed this round.
+                        let persisted_interruption = round_added
+                            .iter()
+                            .rev()
+                            .find(|m| {
+                                m.role == "assistant"
+                                    && m.content.ends_with("[interrupted by user]")
+                            })
+                            .map(|m| m.content.clone());
+                        match persisted_interruption {
+                            Some(text) => {
+                                if !committed_response.ends_with("[interrupted by user]") {
+                                    if !committed_response.is_empty() {
+                                        committed_response.push_str("\n\n");
+                                    }
+                                    committed_response.push_str(&text);
+                                }
+                            }
+                            None => {
+                                committed_response.push_str("[interrupted by user]");
+                                let interruption = ConversationMessage::Chat(
+                                    ChatMessage::assistant("[interrupted by user]".to_string()),
+                                );
+                                new_msgs.push(interruption.clone());
+                                self.history.push(interruption);
+                            }
+                        }
                         return Err(StreamedTurnError {
                             error: crate::agent::loop_::ToolLoopCancelled.into(),
                             committed_response,

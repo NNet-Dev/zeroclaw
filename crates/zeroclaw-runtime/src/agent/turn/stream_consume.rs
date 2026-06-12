@@ -1,7 +1,7 @@
 //! Streaming provider-response consumption for the turn loop.
 
 use super::events::{DraftEvent, StreamDelta};
-use super::outcome::{StreamInterruptedAfterOutput, ToolLoopCancelled};
+use super::outcome::{StreamCancelledAfterOutput, StreamInterruptedAfterOutput, ToolLoopCancelled};
 use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -69,11 +69,25 @@ pub(crate) async fn consume_provider_streaming_response(
     // surfaces, so a non-streaming retry after a stream error overwrites
     // rather than duplicates.
     let mut visible_event_output = false;
+    // Exactly the text forwarded as `TurnEvent::Chunk` — what an event_tx
+    // consumer actually SAW. On interruption this (never the raw
+    // accumulated `response_text`, which includes guard-withheld and
+    // suppression-buffered text) is the partial that may be persisted as
+    // already-delivered output.
+    let mut forwarded_text = String::new();
 
     loop {
         let next_chunk = if let Some(token) = cancellation_token {
             tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                () = token.cancelled() => {
+                    // Cancel after visible streamed text: persist-worthy,
+                    // exactly like the pre-consolidation engine's
+                    // committed-partial-on-cancel.
+                    if forwarded_text.is_empty() {
+                        return Err(ToolLoopCancelled.into());
+                    }
+                    return Err(StreamCancelledAfterOutput::new(forwarded_text).into());
+                }
                 chunk = provider_stream.next() => chunk,
             }
         } else {
@@ -96,8 +110,12 @@ pub(crate) async fn consume_provider_streaming_response(
                 );
                 let message = format!("model_provider stream error: {err}");
                 if visible_event_output {
+                    // Persist only what the consumer actually saw
+                    // (`forwarded_text`), never the raw accumulated text —
+                    // that includes guard-withheld protocol fragments and
+                    // suppression-buffered output nobody received.
                     return Err(StreamInterruptedAfterOutput {
-                        partial_text: outcome.response_text,
+                        partial_text: forwarded_text,
                         message,
                     }
                     .into());
@@ -193,6 +211,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     if let Some(tx) = event_tx {
                         outcome.forwarded_live_deltas = true;
                         visible_event_output = true;
+                        forwarded_text.push_str(&sanitized_delta);
                         let _ = tx
                             .send(TurnEvent::Chunk {
                                 delta: sanitized_delta.clone(),
@@ -215,6 +234,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 if let Some(tx) = event_tx {
                     outcome.forwarded_live_deltas = true;
                     visible_event_output = true;
+                    forwarded_text.push_str(&forward_text);
                     let _ = tx
                         .send(TurnEvent::Chunk {
                             delta: forward_text.clone(),
