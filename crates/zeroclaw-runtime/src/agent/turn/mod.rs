@@ -5,6 +5,11 @@
 //! `/opt/notes/work/zeroclaw/unification_modular/RUN_SHEET.md` during the
 //! #7415 migration.
 
+pub(crate) mod outcome;
 pub(crate) mod redact;
 
+pub use outcome::{
+    ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
+    is_tool_loop_cancelled,
+};
 pub use redact::scrub_credentials;
