@@ -116,6 +116,17 @@ pub(crate) async fn finish_after_max_iterations(
             if text.is_empty() {
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
+            // Persist the summary like every other final assistant response:
+            // without it, persistent-history callers (the streamed wrapper's
+            // replay, new_messages consumers) store a transcript ending on
+            // the synthetic user prompt with no answer — the delivered
+            // summary would be absent and the model re-answers the synthetic
+            // prompt next turn.
+            let summary_msg = ChatMessage::assistant(text.clone());
+            if let Some(out) = &mut new_messages_out {
+                out.push(summary_msg.clone());
+            }
+            history.push(summary_msg);
             accumulated_display_text.push_str(&text);
             Ok(accumulated_display_text)
         }
