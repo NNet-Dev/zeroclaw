@@ -50,6 +50,14 @@ One-to-many or public-feed integrations.
 
 See [Social channels](./social.md).
 
+### Developer platforms
+
+| Channel | Feature flag | Protocol / service |
+|---|---|---|
+| GitHub | `channel-github` | GitHub App; REST polling of issues & PRs |
+
+See [GitHub](./github.md).
+
 ### Email
 
 | Channel | Feature flag | Notes |

@@ -78,7 +78,7 @@ The daemon's structured log stream, filterable and attribution-aware, in the sam
 
 ### Channels
 
-- [New channels](https://docs.zeroclawlabs.ai/master/en/channels/overview.html): Twitch chat (#7275), WeCom AI Bot (#6680), AMQP with mutual TLS (#7369), and multi-tenant Linq with per-agent routing (#7041).
+- [New channels](https://docs.zeroclawlabs.ai/master/en/channels/overview.html): Twitch chat (#7275), WeCom AI Bot (#6680), AMQP with mutual TLS (#7369), multi-tenant Linq with per-agent routing (#7041), and a GitHub App channel that converses through issue/PR comments via REST polling — no webhook or inbound exposure required.
 - Per-recipient reply pacing across nine channels (#6389), a configurable in-flight message budget (#7391), webhook retry with exponential backoff (#5838), a reply-intent precheck that can route to a cheaper per-agent classifier model (#6068, #6945), and selective channel builds behind the new lean default bundle (#6866, #6904).
 
 ### Tools and plugins

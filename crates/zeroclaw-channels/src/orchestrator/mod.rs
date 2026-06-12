@@ -36,6 +36,8 @@ pub use crate::dingtalk::DingTalkChannel;
 pub use crate::discord::DiscordChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::email_channel::EmailChannel;
+#[cfg(feature = "channel-github")]
+pub use crate::github::GithubChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::gmail_push::GmailPushChannel;
 #[cfg(feature = "channel-imessage")]
@@ -6247,6 +6249,29 @@ fn build_channel_by_id(
         "twitter" => {
             anyhow::bail!("X/Twitter channel requires the `channel-twitter` feature");
         }
+        #[cfg(feature = "channel-github")]
+        "github" => {
+            let gh = config
+                .channels
+                .github
+                .get("default")
+                .context("GitHub channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("github", &alias))
+            };
+            Ok(Arc::new(GithubChannel::new(
+                gh.clone(),
+                alias,
+                peer_resolver,
+            )))
+        }
+        #[cfg(not(feature = "channel-github"))]
+        "github" => {
+            anyhow::bail!("GitHub channel requires the `channel-github` feature");
+        }
         #[cfg(feature = "channel-mochat")]
         "mochat" => {
             let mc = config
@@ -6332,7 +6357,7 @@ fn build_channel_by_id(
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
+            email, gmail_push, github, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
 }
@@ -7500,6 +7525,37 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "X/Twitter channel is configured but this build was compiled without \
              `channel-twitter`; skipping X/Twitter."
+        );
+    }
+
+    #[cfg(feature = "channel-github")]
+    for (alias, gh) in &config.channels.github {
+        if !active_channel_aliases.contains(&format!("github.{alias}")) {
+            continue;
+        }
+        if !gh.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("github", &alias))
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "GitHub",
+            alias: Some(alias.clone()),
+            channel: Arc::new(GithubChannel::new(gh.clone(), alias.clone(), peer_resolver)),
+        });
+    }
+
+    #[cfg(not(feature = "channel-github"))]
+    if !config.channels.github.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "GitHub channel is configured but this build was compiled without \
+             `channel-github`; skipping GitHub."
         );
     }
 

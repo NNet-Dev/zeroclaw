@@ -34,6 +34,8 @@ pub mod dingtalk;
 pub mod discord;
 #[cfg(feature = "channel-email")]
 pub mod email_channel;
+#[cfg(feature = "channel-github")]
+pub mod github;
 #[cfg(feature = "channel-email")]
 pub mod gmail_push;
 #[cfg(feature = "channel-imessage")]
