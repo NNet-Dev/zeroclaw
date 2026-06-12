@@ -128,17 +128,25 @@ pub fn section_group_for_key(key: &str) -> SectionGroup {
     }
     match key.replace('-', "_").as_str() {
         // Agent loop, scheduling, and orchestration.
-        "agent" | "heartbeat" | "hooks" | "pacing" | "pipeline" | "query_classification"
-        | "reliability" | "runtime" | "scheduler" | "sop" | "verifiable_intent" => {
-            SectionGroup::Agent
-        }
+        "agent"
+        | "heartbeat"
+        | "hooks"
+        | "pacing"
+        | "pipeline"
+        | "query_classification"
+        | "reliability"
+        | "runtime"
+        | "scheduler"
+        | "sop"
+        | "verifiable_intent" => SectionGroup::Agent,
         // Multi-agent / delegation.
         "delegate" => SectionGroup::MultiAgent,
         // Tool integrations.
         "browser" | "browser_delegate" | "http_request" | "image_gen" | "knowledge"
         | "link_enricher" | "media_pipeline" | "multimodal" | "plugins" | "project_intel"
-        | "shell_tool" | "text_browser" | "transcription" | "tts" | "web_fetch"
-        | "web_search" => SectionGroup::Tools,
+        | "shell_tool" | "text_browser" | "transcription" | "tts" | "web_fetch" | "web_search" => {
+            SectionGroup::Tools
+        }
         // External services / vendor integrations. ACP is included
         // because it is always client-paired — you cannot use it
         // without a client.
@@ -841,7 +849,11 @@ mod tests {
                 "{g:?} missing from SECTION_GROUPS",
             );
         }
-        assert_eq!(SECTION_GROUPS.len(), all.len(), "duplicate group in SECTION_GROUPS");
+        assert_eq!(
+            SECTION_GROUPS.len(),
+            all.len(),
+            "duplicate group in SECTION_GROUPS"
+        );
         assert_eq!(
             SECTION_GROUPS.last(),
             Some(&SectionGroup::Other),
@@ -895,18 +907,33 @@ mod tests {
     #[test]
     fn section_group_for_key_resolves_curated_tail_and_unknown() {
         // Curated rows, including former gap sections.
-        assert_eq!(section_group_for_key("providers.models"), SectionGroup::Foundation);
-        assert_eq!(section_group_for_key("providers.tts"), SectionGroup::Foundation);
+        assert_eq!(
+            section_group_for_key("providers.models"),
+            SectionGroup::Foundation
+        );
+        assert_eq!(
+            section_group_for_key("providers.tts"),
+            SectionGroup::Foundation
+        );
         assert_eq!(section_group_for_key("mcp.servers"), SectionGroup::Tools);
         assert_eq!(section_group_for_key("mcp_bundles"), SectionGroup::Tools);
-        assert_eq!(section_group_for_key("knowledge_bundles"), SectionGroup::Tools);
+        assert_eq!(
+            section_group_for_key("knowledge_bundles"),
+            SectionGroup::Tools
+        );
         assert_eq!(section_group_for_key("cron"), SectionGroup::Agent);
         assert_eq!(section_group_for_key("storage"), SectionGroup::Storage);
         // Kebab spelling resolves like snake.
-        assert_eq!(section_group_for_key("peer-groups"), SectionGroup::Foundation);
+        assert_eq!(
+            section_group_for_key("peer-groups"),
+            SectionGroup::Foundation
+        );
         // Hand-mapped long tail (formerly in the gateway).
         assert_eq!(section_group_for_key("gateway"), SectionGroup::Network);
-        assert_eq!(section_group_for_key("observability"), SectionGroup::Operations);
+        assert_eq!(
+            section_group_for_key("observability"),
+            SectionGroup::Operations
+        );
         assert_eq!(section_group_for_key("delegate"), SectionGroup::MultiAgent);
         assert_eq!(section_group_for_key("web_search"), SectionGroup::Tools);
         assert_eq!(section_group_for_key("secrets"), SectionGroup::Storage);

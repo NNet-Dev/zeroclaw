@@ -340,8 +340,7 @@ impl App {
         // group. Daemons that predate group plumbing send "" for every
         // entry — all ranks tie, the sort is a no-op, and the pane
         // renders the flat list exactly as before.
-        self.sections
-            .sort_by_key(|s| Self::group_rank(&s.group));
+        self.sections.sort_by_key(|s| Self::group_rank(&s.group));
         self.templates = self.rpc.config_templates().await?;
         // Eagerly load the first section so the right pane previews content on
         // first paint, matching the zerocode Config tab.
