@@ -1,0 +1,184 @@
+//! Streaming provider-response consumption for the turn loop.
+
+use super::events::{DraftEvent, StreamDelta};
+use super::outcome::ToolLoopCancelled;
+use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
+use anyhow::Result;
+use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
+use zeroclaw_api::model_provider::StreamEvent;
+use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ToolCall};
+
+#[derive(Debug, Default)]
+pub(crate) struct StreamedChatOutcome {
+    pub(crate) response_text: String,
+    /// Accumulated reasoning/thinking content from streaming deltas.
+    ///
+    /// Captured separately from `response_text` so it can be threaded into
+    /// `ChatResponse.reasoning_content` and ultimately persisted on the
+    /// `AssistantToolCalls` history entry. Required for model_providers like
+    /// DeepSeek V4 that reject follow-up requests when the assistant's
+    /// prior `reasoning_content` is missing from replayed tool-call turns
+    ///.
+    pub(crate) reasoning_content: String,
+    pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) forwarded_live_deltas: bool,
+    pub(crate) suppressed_protocol: bool,
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+}
+
+pub(crate) async fn consume_provider_streaming_response(
+    model_provider: &dyn ModelProvider,
+    messages: &[ChatMessage],
+    request_tools: Option<&[crate::tools::ToolSpec]>,
+    model: &str,
+    temperature: Option<f64>,
+    cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+    strict_tool_parsing: bool,
+) -> Result<StreamedChatOutcome> {
+    let mut provider_stream = model_provider.stream_chat(
+        ChatRequest {
+            messages,
+            tools: request_tools,
+            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+        },
+        model,
+        temperature,
+        zeroclaw_providers::traits::StreamOptions::new(true),
+    );
+    let mut outcome = StreamedChatOutcome::default();
+    let mut delta_sender = on_delta;
+    let mut suppress_forwarding = false;
+    let mut text_guard = StreamTextGuard::new(request_tools);
+    let mut think_stripper = StreamThinkTagStripper::default();
+
+    loop {
+        let next_chunk = if let Some(token) = cancellation_token {
+            tokio::select! {
+                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                chunk = provider_stream.next() => chunk,
+            }
+        } else {
+            provider_stream.next().await
+        };
+
+        let Some(event_result) = next_chunk else {
+            break;
+        };
+
+        let event = event_result.map_err(|err| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "model_provider stream emitted an error event"
+            );
+            anyhow::Error::msg(format!("model_provider stream error: {err}"))
+        })?;
+        match event {
+            StreamEvent::Final => break,
+            StreamEvent::Usage(usage) => {
+                outcome.usage = Some(usage);
+            }
+            StreamEvent::ToolCall(tool_call) => {
+                outcome.tool_calls.push(tool_call);
+                suppress_forwarding = true;
+                text_guard.suppress_forwarding = true;
+            }
+            StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
+                // Pre-executed tool events are for observability only.
+                // They are forwarded to the gateway via turn_streamed but
+                // do not affect the agent's tool dispatch loop.
+            }
+            StreamEvent::TextDelta(chunk) => {
+                // Reasoning/thinking deltas arrive on the same `TextDelta`
+                // event as plain text but populate `chunk.reasoning` instead
+                // of `chunk.delta`. They must be captured into the outcome
+                // even when `chunk.delta` is empty — otherwise model_providers
+                // that require reasoning to round-trip on subsequent turns
+                // (DeepSeek V4 thinking mode; see #6059) reject the next
+                // request with a 400. Reasoning is never forwarded as a
+                // visible response delta — it is the model's internal
+                // monologue, kept for replay only.
+                if let Some(reasoning) = chunk.reasoning.as_deref()
+                    && !reasoning.is_empty()
+                {
+                    outcome.reasoning_content.push_str(reasoning);
+                }
+
+                if chunk.delta.is_empty() {
+                    continue;
+                }
+
+                let sanitized_delta = think_stripper.push(&chunk.delta);
+                if sanitized_delta.is_empty() {
+                    continue;
+                }
+
+                outcome.response_text.push_str(&sanitized_delta);
+
+                if suppress_forwarding {
+                    continue;
+                }
+
+                if strict_tool_parsing {
+                    if let Some(tx) = delta_sender {
+                        outcome.forwarded_live_deltas = true;
+                        if tx.send(StreamDelta::Text(sanitized_delta)).await.is_err() {
+                            delta_sender = None;
+                        }
+                    }
+                    continue;
+                }
+
+                let Some(forward_text) = text_guard.push(&sanitized_delta) else {
+                    continue;
+                };
+
+                if let Some(tx) = delta_sender {
+                    outcome.forwarded_live_deltas = true;
+                    if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
+                        delta_sender = None;
+                    }
+                }
+            }
+        }
+    }
+
+    let trailing_delta = think_stripper.finish();
+    if !trailing_delta.is_empty() {
+        outcome.response_text.push_str(&trailing_delta);
+        if !suppress_forwarding {
+            if strict_tool_parsing {
+                if let Some(tx) = delta_sender {
+                    outcome.forwarded_live_deltas = true;
+                    if tx.send(StreamDelta::Text(trailing_delta)).await.is_err() {
+                        delta_sender = None;
+                    }
+                }
+            } else if let Some(forward_text) = text_guard.push(&trailing_delta)
+                && let Some(tx) = delta_sender
+            {
+                outcome.forwarded_live_deltas = true;
+                if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
+                    delta_sender = None;
+                }
+            }
+        }
+    }
+
+    if let Some(forward_text) = text_guard.finish()
+        && let Some(tx) = delta_sender
+    {
+        outcome.forwarded_live_deltas = true;
+        let _ = tx.send(StreamDelta::Text(forward_text)).await;
+    }
+    outcome.suppressed_protocol = text_guard.suppressed_protocol;
+
+    Ok(outcome)
+}
