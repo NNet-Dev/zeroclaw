@@ -3761,7 +3761,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" d
 <a href=#3759 id=3759 data-nosnippet>3759</a>        <span class="kw">crate</span>::i18n::init(<span class="kw-2">&amp;</span>i18n_locale);
 <a href=#3760 id=3760 data-nosnippet>3760</a>
 <a href=#3761 id=3761 data-nosnippet>3761</a>        <span class="comment">// ── Build system prompt from workspace MD files (OpenClaw framework) ──
-<a href=#3762 id=3762 data-nosnippet>3762</a>        </span><span class="kw">let </span>skills = <span class="kw">crate</span>::skills::load_skills_for_agent(<span class="kw-2">&amp;</span>config.data_dir, <span class="kw-2">&amp;</span>config, agent_alias);
+<a href=#3762 id=3762 data-nosnippet>3762</a>        </span><span class="kw">let </span>skills = <span class="kw">crate</span>::skills::load_skills_for_agent_from_config(<span class="kw-2">&amp;</span>config, agent_alias);
 <a href=#3763 id=3763 data-nosnippet>3763</a>
 <a href=#3764 id=3764 data-nosnippet>3764</a>        <span class="comment">// Register skill-defined tools as callable tool specs in the tool registry
 <a href=#3765 id=3765 data-nosnippet>3765</a>        // so the LLM can invoke them via native function calling, not just XML prompts.
@@ -5100,7 +5100,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" d
 <a href=#5098 id=5098 data-nosnippet>5098</a>            .unwrap_or_else(<span class="kw">crate</span>::i18n::detect_locale);
 <a href=#5099 id=5099 data-nosnippet>5099</a>        <span class="kw">crate</span>::i18n::init(<span class="kw-2">&amp;</span>i18n_locale);
 <a href=#5100 id=5100 data-nosnippet>5100</a>
-<a href=#5101 id=5101 data-nosnippet>5101</a>        <span class="kw">let </span>skills = <span class="kw">crate</span>::skills::load_skills_for_agent(<span class="kw-2">&amp;</span>config.data_dir, <span class="kw-2">&amp;</span>config, agent_alias);
+<a href=#5101 id=5101 data-nosnippet>5101</a>        <span class="kw">let </span>skills = <span class="kw">crate</span>::skills::load_skills_for_agent_from_config(<span class="kw-2">&amp;</span>config, agent_alias);
 <a href=#5102 id=5102 data-nosnippet>5102</a>
 <a href=#5103 id=5103 data-nosnippet>5103</a>        <span class="comment">// Register skill-defined tools as callable tool specs (process_message path).
 <a href=#5104 id=5104 data-nosnippet>5104</a>        // Resolution registry = built-in arcs + resolution-only MCP wrappers.

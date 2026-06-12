@@ -1444,7 +1444,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" d
 <a href=#1442 id=1442 data-nosnippet>1442</a>        // Bundle-aware so `[agents.&lt;alias&gt;].skill_bundles` aliases resolve
 <a href=#1443 id=1443 data-nosnippet>1443</a>        // through to `[skill_bundles.&lt;alias&gt;].directory` (defaulting to
 <a href=#1444 id=1444 data-nosnippet>1444</a>        // `&lt;install&gt;/shared/skills/&lt;alias&gt;/`).
-<a href=#1445 id=1445 data-nosnippet>1445</a>        </span><span class="kw">let </span>skills = <span class="kw">crate</span>::skills::load_skills_for_agent(<span class="kw-2">&amp;</span>config.data_dir, config, agent_alias);
+<a href=#1445 id=1445 data-nosnippet>1445</a>        </span><span class="kw">let </span>skills = <span class="kw">crate</span>::skills::load_skills_for_agent_from_config(config, agent_alias);
 <a href=#1446 id=1446 data-nosnippet>1446</a>        <span class="comment">// Resolution registry = built-in arcs + resolution-only MCP wrappers, so
 <a href=#1447 id=1447 data-nosnippet>1447</a>        // skill elevation (kind = "builtin" / "mcp") can resolve either target.
 <a href=#1448 id=1448 data-nosnippet>1448</a>        </span><span class="kw">let </span>skill_resolution_registry: Vec&lt;Arc&lt;<span class="kw">dyn </span>tools::Tool&gt;&gt; = all_tools_result
