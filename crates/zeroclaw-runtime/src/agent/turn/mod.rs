@@ -6,6 +6,7 @@
 //! #7415 migration.
 
 pub(crate) mod context;
+pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
 pub(crate) mod events;
 pub(crate) mod history_window;
@@ -20,6 +21,7 @@ pub(crate) mod tool_specs;
 pub(crate) mod vision_route;
 
 pub(crate) use context::TurnCtx;
+pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub(crate) use events::STREAM_CHUNK_MIN_CHARS;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};

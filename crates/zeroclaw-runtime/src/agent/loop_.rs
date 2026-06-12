@@ -907,84 +907,19 @@ pub async fn run_tool_call_loop(
                 )
             }
             Err(e) => {
-                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    model_provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some(safe_error.clone()),
-                    input_tokens: None,
-                    output_tokens: None,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                });
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_duration(
-                            u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        )
-                        .with_attrs(::serde_json::json!({
-                            "model": model,
-                            "iteration": iteration + 1,
-                            "error": safe_error,
-                            "trace_id": turn_id,
-                        })),
-                    "llm_response"
+                super::turn::record_llm_failure(
+                    observer,
+                    provider_name,
+                    model,
+                    llm_started_at,
+                    iteration,
+                    &turn_id,
+                    &e,
                 );
-
-                // Context overflow recovery: trim history and retry
-                if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"iteration": iteration + 1})),
-                        "Context window exceeded, attempting in-loop recovery"
-                    );
-
-                    // Step 1: fast-trim old tool results (cheap)
-                    let chars_saved = fast_trim_tool_results(history, 4);
-                    if chars_saved > 0 {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"chars_saved": chars_saved})),
-                            "Context recovery: trimmed old tool results, retrying"
-                        );
-                        continue;
-                    }
-
-                    // Step 2: emergency drop oldest non-system messages
-                    let dropped = emergency_history_trim(history, 4);
-                    if dropped > 0 {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"dropped": dropped})),
-                            "Context recovery: dropped old messages, retrying"
-                        );
-                        continue;
-                    }
-
-                    // Nothing left to trim — truly unrecoverable
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                        "Context overflow unrecoverable: no trimmable messages"
-                    );
+                let recovered = super::turn::try_recover_context_overflow(history, &e, iteration);
+                if recovered {
+                    continue;
                 }
-
                 return Err(e);
             }
         };
