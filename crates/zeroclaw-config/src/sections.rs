@@ -3,11 +3,11 @@
 //! a working ZeroClaw deployment.
 //!
 //! Every fact about a section (its enum variant, its on-the-wire key,
-//! its UI shape, its help blurb, its canonical position) lives in ONE
-//! table — the `sections!` invocation below. The macro expands that
-//! table into the [`Section`] enum, every per-variant `match` helper,
-//! and the [`QUICKSTART_SECTIONS`] const, so adding a section is exactly
-//! one row, no hand-listed variant set anywhere else.
+//! its UI shape, its display group, its help blurb, its canonical
+//! position) lives in ONE table — the `sections!` invocation below. The
+//! macro expands that table into the [`Section`] enum, every per-variant
+//! `match` helper, and the [`QUICKSTART_SECTIONS`] const, so adding a
+//! section is exactly one row, no hand-listed variant set anywhere else.
 //!
 //! Consumers (CLI runtime, gateway, dashboard) dispatch off this enum;
 //! drift is a compile error.
@@ -33,6 +33,131 @@ pub enum SectionShape {
     /// flips a top-level field, then the schema form for the chosen
     /// backend/provider renders.
     BackendPicker,
+}
+
+/// Display group for the Config menu. Every curated [`Section`] row
+/// names one in its `group:` cell; the long tail of schema-derived
+/// top-level roots (`gateway`, `observability`, …) that surface in the
+/// section explorer without a curated row resolves through
+/// [`section_group_for_key`]. [`SECTION_GROUPS`] fixes the display
+/// order across every surface.
+///
+/// `Other` is the catch-all: unknown keys land there so new schema
+/// additions still surface in the menu until someone curates them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SectionGroup {
+    /// Quickstart-walked essentials: providers, profiles, channels,
+    /// agents — the most-edited sections, surfaced first.
+    Foundation,
+    /// Agent loop, scheduling, and orchestration tuning.
+    Agent,
+    /// Multi-agent / delegation.
+    MultiAgent,
+    /// Tool integrations the agent can call.
+    Tools,
+    /// External services / vendor integrations.
+    Integrations,
+    /// Networking / multi-node infrastructure.
+    Network,
+    /// Storage, identity, secrets.
+    Storage,
+    /// Operations / monitoring / safety / cost.
+    Operations,
+    /// Catch-all for keys no one has curated yet.
+    Other,
+}
+
+impl SectionGroup {
+    /// UI label. These exact strings are what `ConfigSectionEntry.group`
+    /// carries on the wire and what the dashboard's `GROUP_ORDER`
+    /// (web/src/pages/Config.tsx) and the zerocode Config pane group
+    /// by — change one, change all of them together.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Foundation => "Foundation",
+            Self::Agent => "Agent",
+            Self::MultiAgent => "Multi-agent",
+            Self::Tools => "Tools",
+            Self::Integrations => "Integrations",
+            Self::Network => "Network",
+            Self::Storage => "Storage",
+            Self::Operations => "Operations",
+            Self::Other => "Other",
+        }
+    }
+}
+
+impl std::fmt::Display for SectionGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Canonical display order for section groups across every Config
+/// surface (dashboard sidebar, zerocode Config pane). "All sections"
+/// is not a group — a surface that offers a flat default view renders
+/// that view itself; this list orders the grouped presentation.
+pub const SECTION_GROUPS: &[SectionGroup] = &[
+    SectionGroup::Foundation,
+    SectionGroup::Agent,
+    SectionGroup::MultiAgent,
+    SectionGroup::Tools,
+    SectionGroup::Integrations,
+    SectionGroup::Network,
+    SectionGroup::Storage,
+    SectionGroup::Operations,
+    SectionGroup::Other,
+];
+
+/// Display group for any section key. Curated [`Section`]s read the
+/// `group:` cell of their `sections!` row; everything else — the
+/// schema-derived top-level `Config` roots the section explorer
+/// surfaces without a curated row — is hand-mapped here. This match
+/// moved from the gateway (`api_sections.rs`) so the dashboard, the
+/// RPC `config/sections` handler, and the TUI all read one table.
+/// Unknown keys fall into [`SectionGroup::Other`] so new schema
+/// additions still surface — they just land in the catch-all bucket
+/// until someone curates them.
+#[must_use]
+pub fn section_group_for_key(key: &str) -> SectionGroup {
+    if let Some(s) = Section::from_key(key) {
+        return s.group();
+    }
+    match key.replace('-', "_").as_str() {
+        // Agent loop, scheduling, and orchestration.
+        "agent" | "heartbeat" | "hooks" | "pacing" | "pipeline" | "query_classification"
+        | "reliability" | "runtime" | "scheduler" | "sop" | "verifiable_intent" => {
+            SectionGroup::Agent
+        }
+        // Multi-agent / delegation.
+        "delegate" => SectionGroup::MultiAgent,
+        // Tool integrations.
+        "browser" | "browser_delegate" | "http_request" | "image_gen" | "knowledge"
+        | "link_enricher" | "media_pipeline" | "multimodal" | "plugins" | "project_intel"
+        | "shell_tool" | "text_browser" | "transcription" | "tts" | "web_fetch"
+        | "web_search" => SectionGroup::Tools,
+        // External services / vendor integrations. ACP is included
+        // because it is always client-paired — you cannot use it
+        // without a client.
+        "acp" | "claude_code" | "claude_code_runner" | "codex_cli" | "composio" | "gemini_cli"
+        | "google_workspace" | "jira" | "linkedin" | "notion" | "opencode_cli" => {
+            SectionGroup::Integrations
+        }
+        // Networking / multi-node infrastructure.
+        "gateway" | "node_transport" | "nodes" | "proxy" => SectionGroup::Network,
+        // Storage, identity, secrets. (`storage` itself is a curated
+        // row and resolves above.)
+        "identity" | "secrets" => SectionGroup::Storage,
+        // Operations / monitoring / safety / cost.
+        "backup" | "cloud_ops" | "conversational_ai" | "cost" | "data_retention"
+        | "observability" | "peripherals" | "security" | "security_ops" | "trust" => {
+            SectionGroup::Operations
+        }
+        _ => SectionGroup::Other,
+    }
 }
 
 /// Humanize a section wire key for display (`risk_profiles` → `Risk profiles`,
@@ -74,6 +199,7 @@ macro_rules! sections {
             $var:ident => {
                 key:   $key:literal,
                 shape: $shape:ident,
+                group: $group:ident,
                 help:  $help:expr $(,)?
             }
         ),+ $(,)?
@@ -118,6 +244,18 @@ macro_rules! sections {
             pub const fn shape(self) -> SectionShape {
                 match self {
                     $( Self::$var => SectionShape::$shape, )+
+                }
+            }
+
+            /// Display group for the Config menu — the bucket this
+            /// section renders under in the dashboard sidebar and the
+            /// zerocode Config pane. Read the `group:` cell of the
+            /// `sections!` row; the long tail of non-curated section
+            /// keys resolves through [`section_group_for_key`] instead.
+            #[must_use]
+            pub const fn group(self) -> SectionGroup {
+                match self {
+                    $( Self::$var => SectionGroup::$group, )+
                 }
             }
 
@@ -198,6 +336,7 @@ sections! {
     ModelProviders => {
         key:   "providers.models",
         shape: TypedFamilyMap,
+        group: Foundation,
         help:  "Pick a model provider to configure (Anthropic, OpenAI, OpenRouter, \
                 Ollama, custom OpenAI-compatible gateways, etc.). Multiple aliases per \
                 provider are supported — e.g. anthropic.production and anthropic.dev \
@@ -210,12 +349,14 @@ sections! {
     RiskProfiles => {
         key:   "risk_profiles",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "Named risk profiles binding allowlists, denylists, and approval \
                 thresholds. Agents reference one via `agents.<alias>.risk_profile`.",
     },
     RuntimeProfiles => {
         key:   "runtime_profiles",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "Named runtime tuning profiles (token limits, retry policy, timeouts). \
                 Agents reference one via `agents.<alias>.runtime_profile`.",
     },
@@ -225,6 +366,7 @@ sections! {
     Storage => {
         key:   "storage",
         shape: TypedFamilyMap,
+        group: Storage,
         help:  "SQLite is the safe default for single-node installs (file-based, \
                 zero-config, no extra services). Pick Postgres for shared or \
                 multi-instance deployments, Qdrant for vector search, Markdown or \
@@ -234,6 +376,7 @@ sections! {
     Memory => {
         key:   "memory",
         shape: BackendPicker,
+        group: Foundation,
         help:  "Persistent memory backend. SQLite is the default; pick `none` to \
                 disable long-term recall entirely.",
     },
@@ -243,6 +386,7 @@ sections! {
     Skills => {
         key:   "skills",
         shape: DirectForm,
+        group: Foundation,
         help:  "Skills tool settings — where skill markdown lives on disk (defaults \
                 to the data dir), and how the skills loader handles community \
                 repositories. Add skill BUNDLES under `skill-bundles` below.",
@@ -250,18 +394,21 @@ sections! {
     SkillBundles => {
         key:   "skill_bundles",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "Named bundles of skill files. Agents reference a bundle to load a \
                 set of capabilities at startup.",
     },
     Mcp => {
         key:   "mcp",
         shape: DirectForm,
+        group: Tools,
         help:  "Model Context Protocol settings. Toggle `enabled` and pick deferred \
                 or eager loading. Individual MCP servers live under `mcp.servers[]`.",
     },
     McpServers => {
         key:   "mcp.servers",
         shape: OneTierAliasMap,
+        group: Tools,
         help:  "Individual Model Context Protocol servers. Each entry binds a \
                 transport (stdio, http, sse), the command or URL to reach it, \
                 optional headers, and a `tool_timeout_secs` cap (≤ 600). Each \
@@ -272,12 +419,14 @@ sections! {
     McpBundles => {
         key:   "mcp_bundles",
         shape: OneTierAliasMap,
+        group: Tools,
         help:  "Named bundles of MCP servers. Agents reference a bundle to pull in \
                 a set of MCP tools as one unit.",
     },
     KnowledgeBundles => {
         key:   "knowledge_bundles",
         shape: OneTierAliasMap,
+        group: Tools,
         help:  "Named bundles of knowledge sources (RAG indexes, doc folders). Agents \
                 reference a bundle to surface relevant snippets at inference time.",
     },
@@ -286,12 +435,14 @@ sections! {
     TtsProviders => {
         key:   "providers.tts",
         shape: TypedFamilyMap,
+        group: Foundation,
         help:  "Text-to-speech providers (OpenAI, ElevenLabs, Google, Edge, Piper). \
                 Configure one per voice / language; agents reference them by alias.",
     },
     TranscriptionProviders => {
         key:   "providers.transcription",
         shape: TypedFamilyMap,
+        group: Foundation,
         help:  "Speech-to-text providers (OpenAI Whisper, Groq, Deepgram, AssemblyAI, \
                 Google, local Whisper). Configure one per pipeline; agents reference \
                 them by alias.",
@@ -302,12 +453,14 @@ sections! {
     Channels => {
         key:   "channels",
         shape: TypedFamilyMap,
+        group: Foundation,
         help:  "Pick which chat platforms ZeroClaw should listen on. You can \
                 configure multiple — each channel gets its own alias.",
     },
     Hardware => {
         key:   "hardware",
         shape: DirectForm,
+        group: Foundation,
         help:  "Optional: hardware peripherals (Arduino, STM32, GPIO, etc.). \
                 Skip if you don't need them.",
     },
@@ -320,6 +473,7 @@ sections! {
     Agents => {
         key:   "agents",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "An agent binds a model provider, profiles, bundles, and channels \
                 into one dispatchable unit. Add one per persona; reuse the same \
                 alias across channels to share state.",
@@ -330,6 +484,7 @@ sections! {
     PeerGroups => {
         key:   "peer_groups",
         shape: OneTierAliasMap,
+        group: Foundation,
         help:  "Named groups binding a channel, member agents, and external peers. \
                 Mutual opt-in: two agents become peers only when both appear in the \
                 same group's `agents` list.",
@@ -337,6 +492,7 @@ sections! {
     Cron => {
         key:   "cron",
         shape: OneTierAliasMap,
+        group: Agent,
         help:  "Scheduled tasks. Each cron entry binds a schedule expression to a \
                 prompt, channel, and target.",
     },
@@ -346,6 +502,7 @@ sections! {
     Tunnel => {
         key:   "tunnel",
         shape: BackendPicker,
+        group: Foundation,
         help:  "Optional: expose your gateway over the public internet via Cloudflare \
                 or ngrok. Pick `none` to keep it localhost-only.",
     },
@@ -359,6 +516,7 @@ sections! {
     QuickstartState => {
         key:   "onboard_state",
         shape: DirectForm,
+        group: Operations,
         help:  "Quickstart lifecycle state. `quickstart_completed` flips to true \
                 once the Quickstart finishes a successful run; while false, the \
                 web gateway and TUI auto-launch the Quickstart on startup. \
@@ -646,6 +804,114 @@ mod tests {
                 "{downstream:?} references agents and must follow Agents in the canonical order",
             );
         }
+    }
+
+    /// Every variant of `SectionGroup` appears in `SECTION_GROUPS`
+    /// exactly once, and `Other` is last so the catch-all bucket
+    /// renders at the bottom of every grouped surface.
+    #[test]
+    fn section_groups_const_is_exhaustive_unique_and_other_last() {
+        // Exhaustiveness guard: adding a SectionGroup variant without
+        // updating this list (and SECTION_GROUPS) fails to compile here.
+        let all = [
+            SectionGroup::Foundation,
+            SectionGroup::Agent,
+            SectionGroup::MultiAgent,
+            SectionGroup::Tools,
+            SectionGroup::Integrations,
+            SectionGroup::Network,
+            SectionGroup::Storage,
+            SectionGroup::Operations,
+            SectionGroup::Other,
+        ];
+        for g in all {
+            match g {
+                SectionGroup::Foundation
+                | SectionGroup::Agent
+                | SectionGroup::MultiAgent
+                | SectionGroup::Tools
+                | SectionGroup::Integrations
+                | SectionGroup::Network
+                | SectionGroup::Storage
+                | SectionGroup::Operations
+                | SectionGroup::Other => {}
+            }
+            assert!(
+                SECTION_GROUPS.contains(&g),
+                "{g:?} missing from SECTION_GROUPS",
+            );
+        }
+        assert_eq!(SECTION_GROUPS.len(), all.len(), "duplicate group in SECTION_GROUPS");
+        assert_eq!(
+            SECTION_GROUPS.last(),
+            Some(&SectionGroup::Other),
+            "Other must render last in every grouped surface",
+        );
+    }
+
+    /// Group labels are a wire contract: the dashboard's `GROUP_ORDER`
+    /// (web/src/pages/Config.tsx) and the zerocode Config pane match
+    /// these exact strings from `ConfigSectionEntry.group`. Renaming a
+    /// label means updating those consumers in the same change.
+    #[test]
+    fn group_labels_are_pinned_for_ui_compat() {
+        let expected = [
+            "Foundation",
+            "Agent",
+            "Multi-agent",
+            "Tools",
+            "Integrations",
+            "Network",
+            "Storage",
+            "Operations",
+            "Other",
+        ];
+        for (g, want) in SECTION_GROUPS.iter().zip(expected) {
+            assert_eq!(g.label(), want);
+            assert_eq!(g.to_string(), want);
+        }
+    }
+
+    /// Every curated section resolves to a real bucket — `Other` exists
+    /// only for the uncurated long tail, so a curated row landing there
+    /// means someone forgot to pick a group for a new section.
+    #[test]
+    fn curated_sections_never_fall_into_other() {
+        for s in QUICKSTART_SECTIONS {
+            assert_ne!(
+                s.group(),
+                SectionGroup::Other,
+                "Section::{s:?} needs a real group in its sections! row",
+            );
+        }
+    }
+
+    /// `section_group_for_key` resolves curated rows through the table
+    /// (both snake and kebab spellings), hand-mapped long-tail roots
+    /// through the match, and unknown keys into `Other`. Pins the gap
+    /// fixes that motivated moving grouping into this crate: the MCP
+    /// and provider sub-sections used to fall into `Other` in the
+    /// gateway's hand-list.
+    #[test]
+    fn section_group_for_key_resolves_curated_tail_and_unknown() {
+        // Curated rows, including former gap sections.
+        assert_eq!(section_group_for_key("providers.models"), SectionGroup::Foundation);
+        assert_eq!(section_group_for_key("providers.tts"), SectionGroup::Foundation);
+        assert_eq!(section_group_for_key("mcp.servers"), SectionGroup::Tools);
+        assert_eq!(section_group_for_key("mcp_bundles"), SectionGroup::Tools);
+        assert_eq!(section_group_for_key("knowledge_bundles"), SectionGroup::Tools);
+        assert_eq!(section_group_for_key("cron"), SectionGroup::Agent);
+        assert_eq!(section_group_for_key("storage"), SectionGroup::Storage);
+        // Kebab spelling resolves like snake.
+        assert_eq!(section_group_for_key("peer-groups"), SectionGroup::Foundation);
+        // Hand-mapped long tail (formerly in the gateway).
+        assert_eq!(section_group_for_key("gateway"), SectionGroup::Network);
+        assert_eq!(section_group_for_key("observability"), SectionGroup::Operations);
+        assert_eq!(section_group_for_key("delegate"), SectionGroup::MultiAgent);
+        assert_eq!(section_group_for_key("web_search"), SectionGroup::Tools);
+        assert_eq!(section_group_for_key("secrets"), SectionGroup::Storage);
+        // Unknown keys land in the catch-all, never disappear.
+        assert_eq!(section_group_for_key("not_a_section"), SectionGroup::Other);
     }
 
     /// Storage help must steer first-time operators toward SQLite as the
