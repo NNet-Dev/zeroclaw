@@ -11,6 +11,7 @@ pub(crate) mod events;
 pub(crate) mod history_window;
 pub(crate) mod outcome;
 pub(crate) mod protocol_detect;
+pub(crate) mod provider_call;
 pub(crate) mod redact;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
@@ -29,9 +30,13 @@ pub use outcome::{
 pub(crate) use protocol_detect::{
     detect_internal_protocol_without_tools, detect_tool_call_parse_issue_for_known_tools,
 };
+pub(crate) use provider_call::{
+    ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
+};
 pub use redact::scrub_credentials;
 #[cfg(test)]
 pub(crate) use stream_consume::StreamedChatOutcome;
+#[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};

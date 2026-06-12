@@ -104,7 +104,6 @@ pub(crate) fn seed_channel_handles(
     }
     count
 }
-use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -126,7 +125,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{
     self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
 };
-use zeroclaw_providers::{self, ChatMessage, ChatRequest, ModelProvider, ToolCall};
+#[cfg(test)]
+use zeroclaw_providers::ChatRequest;
+use zeroclaw_providers::{self, ChatMessage, ModelProvider, ToolCall};
 
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
@@ -636,6 +637,7 @@ pub(crate) use super::turn::{
 
 #[cfg(test)]
 pub(crate) use super::turn::StreamedChatOutcome;
+#[cfg(test)]
 pub(crate) use super::turn::consume_provider_streaming_response;
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
@@ -896,72 +898,17 @@ pub async fn run_tool_call_loop(
         )
         .await?;
 
-        // ── Progress: LLM thinking ────────────────────────────
-        if let Some(ref tx) = on_delta {
-            let phase = if iteration == 0 {
-                "\u{1f914} Thinking...\n".to_string()
-            } else {
-                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
-            };
-            let _ = tx.send(StreamDelta::Status(phase)).await;
-        }
+        let llm_started_at = super::turn::announce_llm_request(
+            &ctx,
+            history,
+            active_model_provider,
+            active_model_provider_name,
+            active_model,
+            iteration,
+        )
+        .await;
 
-        observer.record_event(&ObserverEvent::LlmRequest {
-            model_provider: active_model_provider_name.to_string(),
-            model: active_model.to_string(),
-            messages_count: history.len(),
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
-        });
-        {
-            let _provider_guard =
-                ::zeroclaw_log::attribution_span!(active_model_provider).entered();
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
-                    .with_attrs(::serde_json::json!({
-                        "iteration": iteration + 1,
-                        "messages_count": history.len(),
-                        "model": active_model,
-                        "trace_id": turn_id,
-                    })),
-                "llm_request"
-            );
-        }
-
-        let llm_started_at = Instant::now();
-
-        // Fire void hook before LLM call
-        if let Some(hooks) = hooks {
-            hooks.fire_llm_input(history, model).await;
-        }
-
-        // Budget enforcement — block if limit exceeded (no-op when not scoped)
-        if let Some(BudgetCheck::Exceeded {
-            current_usd,
-            limit_usd,
-            period,
-        }) = check_tool_loop_budget()
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "current_usd": current_usd,
-                        "limit_usd": limit_usd,
-                        "period": format!("{period:?}"),
-                    })),
-                "tool-call loop budget exceeded"
-            );
-            anyhow::bail!(
-                "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
-                current_usd,
-                limit_usd,
-                period
-            );
-        }
+        super::turn::enforce_tool_loop_budget()?;
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
@@ -974,147 +921,21 @@ pub async fn run_tool_call_loop(
             && model_provider.supports_streaming()
             && (request_tools.is_none() || model_provider.supports_streaming_tool_events());
         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_on_delta": on_delta.is_some(), "supports_streaming": model_provider.supports_streaming(), "should_consume_provider_stream": should_consume_provider_stream})), &format!("Streaming decision for iteration {}", iteration + 1));
-        let mut streamed_live_deltas = false;
-        let mut streamed_protocol_suppressed = false;
 
-        let chat_result = if should_consume_provider_stream {
-            use ::zeroclaw_log::Instrument;
-            let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
-            let stream_future = ::zeroclaw_log::scope!(
-                model: active_model,
-                =>
-                consume_provider_streaming_response(
-                    active_model_provider,
-                    &prepared_messages.messages,
-                    request_tools,
-                    active_model,
-                    temperature,
-                    cancellation_token.as_ref(),
-                    on_delta.as_ref(),
-                    strict_tool_parsing,
-                )
-            )
-            .instrument(provider_span);
-            match stream_future.await {
-                Ok(streamed) => {
-                    streamed_live_deltas = streamed.forwarded_live_deltas;
-                    streamed_protocol_suppressed = streamed.suppressed_protocol;
-                    let reasoning_content = if streamed.reasoning_content.is_empty() {
-                        None
-                    } else {
-                        Some(streamed.reasoning_content)
-                    };
-                    Ok(zeroclaw_providers::ChatResponse {
-                        text: Some(streamed.response_text),
-                        tool_calls: streamed.tool_calls,
-                        usage: streamed.usage,
-                        reasoning_content,
-                    })
-                }
-                Err(stream_err) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "model": active_model,
-                                "iteration": iteration + 1,
-                                "error": scrub_credentials(&stream_err.to_string()),
-                                "trace_id": turn_id,
-                            })),
-                        "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
-                    );
-                    {
-                        use ::zeroclaw_log::Instrument;
-                        let provider_span =
-                            ::zeroclaw_log::attribution_span!(active_model_provider);
-                        let chat_future = ::zeroclaw_log::scope!(
-                            model: active_model,
-                            =>
-                            active_model_provider.chat(
-                                ChatRequest {
-                                    messages: &prepared_messages.messages,
-                                    tools: request_tools,
-                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                        .try_with(Clone::clone)
-                                        .ok()
-                                        .flatten(),
-                                },
-                                active_model,
-                                temperature,
-                            )
-                        )
-                        .instrument(provider_span);
-                        if let Some(token) = cancellation_token.as_ref() {
-                            tokio::select! {
-                                () = token.cancelled() => Err(ToolLoopCancelled.into()),
-                                result = chat_future => result,
-                            }
-                        } else {
-                            chat_future.await
-                        }
-                    }
-                }
-            }
-        } else {
-            // Non-streaming path: wrap with optional per-step timeout from
-            // pacing config to catch hung model responses.
-            use ::zeroclaw_log::Instrument;
-            let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
-            let chat_future = ::zeroclaw_log::scope!(
-                model: active_model,
-                =>
-                active_model_provider.chat(
-                    ChatRequest {
-                        messages: &prepared_messages.messages,
-                        tools: request_tools,
-                        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                            .try_with(Clone::clone)
-                            .ok()
-                            .flatten(),
-                    },
-                    active_model,
-                    temperature,
-                )
-            )
-            .instrument(provider_span);
-
-            match pacing.step_timeout_secs {
-                Some(step_secs) if step_secs > 0 => {
-                    let step_timeout = Duration::from_secs(step_secs);
-                    if let Some(token) = cancellation_token.as_ref() {
-                        tokio::select! {
-                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                            result = tokio::time::timeout(step_timeout, chat_future) => {
-                                match result {
-                                    Ok(inner) => inner,
-                                    Err(_) => anyhow::bail!(
-                                        "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                                    ),
-                                }
-                            },
-                        }
-                    } else {
-                        match tokio::time::timeout(step_timeout, chat_future).await {
-                            Ok(inner) => inner,
-                            Err(_) => anyhow::bail!(
-                                "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                            ),
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(token) = cancellation_token.as_ref() {
-                        tokio::select! {
-                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                            result = chat_future => result,
-                        }
-                    } else {
-                        chat_future.await
-                    }
-                }
-            }
-        };
+        let super::turn::ProviderCallOutcome {
+            chat_result,
+            streamed_live_deltas,
+            streamed_protocol_suppressed,
+        } = super::turn::call_provider(
+            &ctx,
+            active_model_provider,
+            active_model,
+            &prepared_messages.messages,
+            request_tools,
+            should_consume_provider_stream,
+            iteration,
+        )
+        .await?;
 
         let (
             response_text,
