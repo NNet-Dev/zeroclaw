@@ -1567,3 +1567,55 @@ async fn safety_net_stream_error_persists_only_forwarded_text() {
         "guard-withheld text the consumer never saw must not persist as delivered output"
     );
 }
+
+// ── seam 14: the graceful max-iteration summary persists coherently ─────
+// GracefulSummary pushes a synthetic "provide your best answer" user
+// message and delivers the model's summary as the response. The summary
+// must ALSO persist as the answering assistant message — otherwise
+// persistent-history callers (streamed wrapper, new_messages consumers)
+// store a transcript ending on an unanswered synthetic user prompt and the
+// delivered summary is absent from the conversation.
+
+#[tokio::test]
+async fn safety_net_graceful_summary_persists_assistant_summary() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent_with_runtime(
+        Box::new(ScriptedProvider::new(vec![
+            tool_response(vec![tool_call("s1", "echo")]),
+            tool_response(vec![tool_call("s2", "echo")]),
+            text_response("wrap-up summary"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+        zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: 2,
+            ..zeroclaw_config::schema::ResolvedRuntime::default()
+        },
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    let outcome = agent
+        .turn_streamed_with_steering_state("exhaust the cap", tx, None, None)
+        .await
+        .expect("graceful summary must succeed on the streamed path");
+    assert!(
+        outcome.response.contains("wrap-up summary"),
+        "unexpected response: {}",
+        outcome.response
+    );
+    let last_chat = outcome
+        .new_messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            ConversationMessage::Chat(c) => Some(c),
+            _ => None,
+        })
+        .expect("new_messages must contain chat messages");
+    assert_eq!(
+        (last_chat.role.as_str(), last_chat.content.as_str()),
+        ("assistant", "wrap-up summary"),
+        "the persisted transcript must end with the assistant summary, not the synthetic user prompt"
+    );
+}
