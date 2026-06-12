@@ -125,9 +125,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{
     self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
 };
+use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 #[cfg(test)]
-use zeroclaw_providers::ChatRequest;
-use zeroclaw_providers::{self, ChatMessage, ModelProvider, ToolCall};
+use zeroclaw_providers::{ChatRequest, ToolCall};
 
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
@@ -563,76 +563,14 @@ pub use super::tool_execution::{
     should_execute_tools_in_parallel,
 };
 
-/// Build assistant history entry in JSON format for native tool-call APIs.
-/// `convert_messages` in the OpenRouter model_provider parses this JSON to reconstruct
-/// the proper `NativeMessage` with structured `tool_calls`.
-fn build_native_assistant_history(
-    text: &str,
-    tool_calls: &[ToolCall],
-    reasoning_content: Option<&str>,
-) -> String {
-    let calls_json: Vec<serde_json::Value> = tool_calls
-        .iter()
-        .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-            })
-        })
-        .collect();
+pub(crate) use super::turn::resolve_display_text;
 
-    let content = if text.trim().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(text.trim().to_string())
-    };
-
-    let mut obj = serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    });
-
-    if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
-            "reasoning_content".to_string(),
-            serde_json::Value::String(rc.to_string()),
-        );
-    }
-
-    obj.to_string()
-}
-
-fn resolve_display_text(
-    response_text: &str,
-    parsed_text: &str,
-    has_tool_calls: bool,
-    has_native_tool_calls: bool,
-) -> String {
-    if has_tool_calls {
-        if !parsed_text.is_empty() {
-            return parsed_text.to_string();
-        }
-        if has_native_tool_calls {
-            return response_text.to_string();
-        }
-        return String::new();
-    }
-
-    if parsed_text.is_empty() {
-        response_text.to_string()
-    } else {
-        parsed_text.to_string()
-    }
-}
+#[cfg(test)]
+pub(crate) use super::turn::build_native_assistant_history;
 
 pub use super::turn::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
-};
-
-pub(crate) use super::turn::{
-    detect_internal_protocol_without_tools, detect_tool_call_parse_issue_for_known_tools,
 };
 
 #[cfg(test)]
@@ -857,16 +795,17 @@ pub async fn run_tool_call_loop(
             .into());
         }
 
-        let super::turn::IterationToolSpecs {
-            tool_specs,
-            known_tool_names,
-            use_native_tools,
-        } = super::turn::build_iteration_tool_specs(
+        let iteration_tool_specs = super::turn::build_iteration_tool_specs(
             model_provider,
             tools_registry,
             excluded_tools,
             activated_tools,
         );
+        let super::turn::IterationToolSpecs {
+            ref tool_specs,
+            use_native_tools,
+            ..
+        } = iteration_tool_specs;
 
         let (vision_model_provider_box, degrade_strip_images) =
             super::turn::resolve_vision_provider(
@@ -948,157 +887,21 @@ pub async fn run_tool_call_loop(
             response_streamed_live,
         ) = match chat_result {
             Ok(resp) => {
-                let (resp_input_tokens, resp_output_tokens) = resp
-                    .usage
-                    .as_ref()
-                    .map(|u| (u.input_tokens, u.output_tokens))
-                    .unwrap_or((None, None));
-
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    model_provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: true,
-                    error_message: None,
-                    input_tokens: resp_input_tokens,
-                    output_tokens: resp_output_tokens,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                });
-
-                // Record cost via task-local tracker (no-op when not scoped)
-                let _ = resp
-                    .usage
-                    .as_ref()
-                    .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
-
-                let response_text = strip_think_tags(resp.text_or_empty());
-                // First try native structured tool calls (OpenAI-format).
-                // Fall back to text-based parsing (XML tags, markdown blocks,
-                // GLM format) only if the model_provider returned no native calls —
-                // this ensures we support both native and prompt-guided models.
-                let mut calls: Vec<ParsedToolCall> = if tool_specs.is_empty() {
-                    Vec::new()
-                } else {
-                    resp.tool_calls
-                        .iter()
-                        .map(|call| ParsedToolCall {
-                            name: call.name.clone(),
-                            arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                                .unwrap_or_else(|_| {
-                                    serde_json::Value::Object(serde_json::Map::new())
-                                }),
-                            tool_call_id: Some(call.id.clone()),
-                        })
-                        .collect()
-                };
-                let mut parsed_text = String::new();
-
-                if calls.is_empty()
-                    && !tool_specs.is_empty()
-                    && !strict_tool_parsing
-                    && !looks_like_tool_protocol_example(&response_text)
-                {
-                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                    let filtered_calls: Vec<ParsedToolCall> = fallback_calls
-                        .into_iter()
-                        .filter(|call| known_tool_names.contains(&call.name.to_ascii_lowercase()))
-                        .collect();
-                    if !fallback_text.is_empty() && !filtered_calls.is_empty() {
-                        parsed_text = fallback_text;
-                    }
-                    calls = filtered_calls;
-                }
-
-                let parse_issue = if strict_tool_parsing {
-                    None
-                } else if tool_specs.is_empty() {
-                    detect_internal_protocol_without_tools(&response_text).or_else(|| {
-                        streamed_protocol_suppressed.then(|| {
-                            "streaming text guard suppressed an internal tool protocol envelope"
-                                .to_string()
-                        })
-                    })
-                } else {
-                    detect_tool_call_parse_issue_for_known_tools(
-                        &response_text,
-                        &calls,
-                        &known_tool_names,
-                    )
-                    .or_else(|| {
-                        streamed_protocol_suppressed.then(|| {
-                            "streaming text guard suppressed an internal tool protocol envelope"
-                                .to_string()
-                        })
-                    })
-                };
-                if let Some(ref issue) = parse_issue {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "model": model,
-                                "iteration": iteration + 1,
-                                "issue": issue.as_str(),
-                                "response": scrub_credentials(&response_text),
-                                "trace_id": turn_id,
-                            })),
-                        "tool_call_parse_issue"
-                    );
-                }
-
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                        .with_duration(
-                            u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        )
-                        .with_attrs(::serde_json::json!({
-                            "model": model,
-                            "iteration": iteration + 1,
-                            "input_tokens": resp_input_tokens,
-                            "output_tokens": resp_output_tokens,
-                            "raw_response": scrub_credentials(&response_text),
-                            "native_tool_calls": resp.tool_calls.len(),
-                            "parsed_tool_calls": calls.len(),
-                            "trace_id": turn_id,
-                        })),
-                    "llm_response"
+                let interpreted = super::turn::interpret_chat_response(
+                    &ctx,
+                    resp,
+                    &iteration_tool_specs,
+                    streamed_protocol_suppressed,
+                    llm_started_at,
+                    iteration,
                 );
-
-                // Preserve native tool call IDs in assistant history so role=tool
-                // follow-up messages can reference the exact call id.
-                let reasoning_content = resp.reasoning_content.clone();
-                let assistant_history_content = if resp.tool_calls.is_empty() {
-                    if use_native_tools {
-                        build_native_assistant_history_from_parsed_calls(
-                            &response_text,
-                            &calls,
-                            reasoning_content.as_deref(),
-                        )
-                        .unwrap_or_else(|| response_text.clone())
-                    } else {
-                        response_text.clone()
-                    }
-                } else {
-                    build_native_assistant_history(
-                        &response_text,
-                        &resp.tool_calls,
-                        reasoning_content.as_deref(),
-                    )
-                };
-
-                let native_calls = resp.tool_calls;
                 (
-                    response_text,
-                    parsed_text,
-                    calls,
-                    assistant_history_content,
-                    native_calls,
-                    parse_issue.is_some(),
+                    interpreted.response_text,
+                    interpreted.parsed_text,
+                    interpreted.tool_calls,
+                    interpreted.assistant_history_content,
+                    interpreted.native_tool_calls,
+                    interpreted.parse_issue_detected,
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
                 )

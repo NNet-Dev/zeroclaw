@@ -10,6 +10,7 @@ pub(crate) mod delivery_defaults;
 pub(crate) mod events;
 pub(crate) mod history_window;
 pub(crate) mod outcome;
+pub(crate) mod parse_response;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
@@ -27,9 +28,9 @@ pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
 };
-pub(crate) use protocol_detect::{
-    detect_internal_protocol_without_tools, detect_tool_call_parse_issue_for_known_tools,
-};
+#[cfg(test)]
+pub(crate) use parse_response::build_native_assistant_history;
+pub(crate) use parse_response::{interpret_chat_response, resolve_display_text};
 pub(crate) use provider_call::{
     ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
 };
