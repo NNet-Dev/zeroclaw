@@ -5,17 +5,21 @@
 //! `/opt/notes/work/zeroclaw/unification_modular/RUN_SHEET.md` during the
 //! #7415 migration.
 
+pub(crate) mod context;
 pub(crate) mod delivery_defaults;
 pub(crate) mod events;
+pub(crate) mod history_window;
 pub(crate) mod outcome;
 pub(crate) mod protocol_detect;
 pub(crate) mod redact;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
 
+pub(crate) use context::TurnCtx;
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub(crate) use events::STREAM_CHUNK_MIN_CHARS;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub(crate) use history_window::preflight_history_maintenance;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
