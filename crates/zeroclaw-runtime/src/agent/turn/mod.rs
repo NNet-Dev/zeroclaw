@@ -10,17 +10,20 @@ pub(crate) mod events;
 pub(crate) mod outcome;
 pub(crate) mod protocol_detect;
 pub(crate) mod redact;
+pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
 
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
-pub(crate) use protocol_detect::{
-    detect_internal_protocol_without_tools, detect_tool_call_parse_issue_for_known_tools,
-};
-pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
 pub(crate) use events::STREAM_CHUNK_MIN_CHARS;
+pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
 };
+pub(crate) use protocol_detect::{
+    detect_internal_protocol_without_tools, detect_tool_call_parse_issue_for_known_tools,
+};
 pub use redact::scrub_credentials;
-pub(crate) use stream_guard::{StreamTextGuard, StreamThinkTagStripper};
+#[cfg(test)]
+pub(crate) use stream_consume::StreamedChatOutcome;
+pub(crate) use stream_consume::consume_provider_streaming_response;
