@@ -1,3 +1,16 @@
+# Unreleased
+
+## Runtime: one turn engine for every transport (#7415)
+
+The three agent turn engines are consolidated onto `run_tool_call_loop`, now housed in `crates/zeroclaw-runtime/src/agent/turn/` (one file per step). Channels, CLI, cron, delegate, and SubAgent paths are unchanged — they already ran on it. The streaming paths (gateway WebSocket, RPC/zerocode, ACP — via `Agent::turn_streamed*`) and the embedded `Agent::turn` path are rebuilt as thin wrappers over the same loop.
+
+Behavior changes on the streaming and embedded `Agent` paths:
+
+- **Gained from the shared engine**: malformed tool-protocol retry, context-overflow recovery, per-iteration history maintenance and pruning, and the `fire_llm_input` hook.
+- **Task-local scoping is now uniform**: `TOOL_LOOP_THREAD_ID`, `SESSION_KEY`, and `TOOL_CHOICE_OVERRIDE` are scoped around every entry path, closing the `TOOL_CHOICE_OVERRIDE` provider leak on the streaming/embedded paths.
+- **Deliberately preserved**: tool-call dedup stays **off** on these paths (RPC relies on idempotent retries); `Agent::turn` still **errors at the iteration cap** (an embedder control signal); pattern-based loop detection and `step_timeout` pacing stay off here — the machinery is shared, but these paths keep their existing contracts (an embedder's identical-args tool chain completes; model text with tool-call-looking content is returned verbatim when no tools are in play).
+- **Wire schema unchanged**: `TurnEvent`, `StreamDelta`, and the channel/gateway/ACP message shapes are untouched.
+
 # ZeroClaw v0.8.0
 
 ZeroClaw v0.8.0 is the big one. One daemon now runs many named agents, each with its own workspace, memory, model provider, security policy, channels, and personality, coordinated by a rewritten configuration schema that migrates your existing setup automatically. The release spans 439 commits (not including the squashes) from over 100 contributors since v0.7.5, and also introduces the zerocode terminal UI, a unified logging and attribution pipeline, and a hardened security posture across channels, tools, and the gateway.
