@@ -620,17 +620,16 @@ impl App {
                 }
 
                 // Section pane click: select the clicked section, return focus to
-                // the left pane, and preview that section on the right.
+                // the left pane, and preview that section on the right. Display
+                // rows resolve through the draw-time `last_section_rows` map so
+                // group headers are dead zones rather than off-by-N selections.
                 if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) {
-                    let labels: Vec<String> =
-                        self.sections.iter().map(|s| s.label.clone()).collect();
-                    let visible = self.filtered_indices(&labels);
                     if let Some(pos) = mouse::list_click_index(
                         mouse.row,
                         self.last_section_list_area,
                         0,
-                        visible.len(),
-                    ) && let Some(&orig) = visible.get(pos)
+                        self.last_section_rows.len(),
+                    ) && let Some(&Some(orig)) = self.last_section_rows.get(pos)
                     {
                         self.section_cursor = orig;
                     }
