@@ -438,6 +438,21 @@ pub async fn run_tool_call_loop(
                     }
                     history.push(msg);
                 }
+                // Same for a user cancel after visible streamed output —
+                // the pre-consolidation streaming engine committed the
+                // watched partial with this exact marker.
+                if let Some(cancelled) = e.downcast_ref::<outcome::StreamCancelledAfterOutput>()
+                    && !cancelled.partial_text.is_empty()
+                {
+                    let msg = ChatMessage::assistant(format!(
+                        "{}\n\n[interrupted by user]",
+                        cancelled.partial_text
+                    ));
+                    if let Some(out) = new_messages_out.as_deref_mut() {
+                        out.push(msg.clone());
+                    }
+                    history.push(msg);
+                }
                 return Err(e);
             }
         };

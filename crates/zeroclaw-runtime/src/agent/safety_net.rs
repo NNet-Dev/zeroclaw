@@ -1385,3 +1385,185 @@ async fn safety_net_midbatch_cancel_emits_events_for_completed_tools() {
         "the completed tool must emit its ToolResult event despite the cancel"
     );
 }
+
+// ── seam 13: streamed-partial fidelity on interruption ──────────────────
+// (a) A user cancel after visible streamed text persists the watched
+//     partial with "[interrupted by user]" (the old streaming engine's
+//     committed-partial-on-cancel), without a duplicate bare marker.
+// (b) A stream error persists only text the consumer actually SAW
+//     (forwarded chunks), never guard-withheld protocol fragments.
+
+/// Streams the given events, then hangs (pending) so the test can cancel.
+struct StreamThenHangProvider {
+    events: parking_lot::Mutex<
+        Vec<zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>>,
+    >,
+}
+
+#[async_trait]
+impl ModelProvider for StreamThenHangProvider {
+    async fn chat_with_system(
+        &self,
+        _: Option<&str>,
+        _: &str,
+        _: &str,
+        _: Option<f64>,
+    ) -> Result<String> {
+        Ok("ok".into())
+    }
+    async fn chat(&self, _: ChatRequest<'_>, _: &str, _: Option<f64>) -> Result<ChatResponse> {
+        Ok(text_response("non-streamed fallback (must not be reached)"))
+    }
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+    fn stream_chat(
+        &self,
+        _: ChatRequest<'_>,
+        _: &str,
+        _: Option<f64>,
+        _: zeroclaw_providers::traits::StreamOptions,
+    ) -> futures_util::stream::BoxStream<
+        'static,
+        zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+    > {
+        use futures_util::StreamExt as _;
+        let events = std::mem::take(&mut *self.events.lock());
+        futures_util::stream::iter(events)
+            .chain(futures_util::stream::pending())
+            .boxed()
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for StreamThenHangProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "StreamThenHangProvider"
+    }
+}
+
+fn text_delta(
+    delta: &str,
+) -> zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent> {
+    Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
+        zeroclaw_api::model_provider::StreamChunk {
+            delta: delta.to_string(),
+            reasoning: None,
+            is_final: false,
+            token_count: 0,
+        },
+    ))
+}
+
+#[tokio::test]
+async fn safety_net_cancel_after_streamed_output_persists_partial() {
+    let provider = StreamThenHangProvider {
+        events: parking_lot::Mutex::new(vec![text_delta("partial answer")]),
+    };
+    let mut agent = build_agent(Box::new(provider), vec![]);
+    let token = tokio_util::sync::CancellationToken::new();
+    let cancel = token.clone();
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("stream then cancel", tx, Some(token), None)
+            .await
+    });
+    // Cancel only after the partial is visibly forwarded.
+    while let Some(ev) = rx.recv().await {
+        if matches!(&ev, TurnEvent::Chunk { delta } if delta.contains("partial answer")) {
+            cancel.cancel();
+            break;
+        }
+    }
+    while rx.recv().await.is_some() {}
+    let err = handle
+        .await
+        .expect("task join")
+        .expect_err("cancel must surface as StreamedTurnError");
+
+    assert_eq!(
+        err.committed_response, "partial answer\n\n[interrupted by user]",
+        "committed_response must carry the watched partial with the marker"
+    );
+    let interruption_messages: Vec<&ConversationMessage> = err
+        .new_messages
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                ConversationMessage::Chat(c)
+                    if c.role == "assistant" && c.content.contains("[interrupted by user]")
+            )
+        })
+        .collect();
+    assert_eq!(
+        interruption_messages.len(),
+        1,
+        "exactly one interruption message — the persisted partial, no duplicate bare marker"
+    );
+    assert!(
+        matches!(
+            interruption_messages[0],
+            ConversationMessage::Chat(c) if c.content.starts_with("partial answer")
+        ),
+        "the persisted interruption message must carry the partial text"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_stream_error_persists_only_forwarded_text() {
+    let provider = StreamThenHangProvider {
+        events: parking_lot::Mutex::new(vec![
+            // Thinking marks event-visible output without any forwarded text.
+            Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
+                zeroclaw_api::model_provider::StreamChunk {
+                    delta: String::new(),
+                    reasoning: Some("working on it".into()),
+                    is_final: false,
+                    token_count: 0,
+                },
+            )),
+            // Suspicious protocol prefix: the stream guard withholds it, so
+            // no consumer ever sees this text.
+            text_delta("{\"tool_call\": {\"name\": \"shell\""),
+            Err(zeroclaw_api::model_provider::StreamError::Http(
+                "connection reset".into(),
+            )),
+        ]),
+    };
+    let mut agent = build_agent(Box::new(provider), vec![]);
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("stream then die", tx, None, None)
+            .await
+    });
+    while rx.recv().await.is_some() {}
+    let err = handle
+        .await
+        .expect("task join")
+        .expect_err("stream error after visible output must fail the turn (no fallback retry)");
+
+    assert_eq!(
+        err.committed_response, "[stream interrupted]",
+        "nothing was forwarded, so nothing may be committed as delivered"
+    );
+    assert!(
+        !err.new_messages.iter().any(|m| matches!(
+            m,
+            ConversationMessage::Chat(c) if c.content.contains("tool_call")
+        )),
+        "guard-withheld text the consumer never saw must not persist as delivered output"
+    );
+}
