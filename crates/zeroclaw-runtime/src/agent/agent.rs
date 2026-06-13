@@ -7,7 +7,7 @@ use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, App
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
-use crate::tools::{self, Tool, ToolSpec};
+use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
@@ -133,10 +133,6 @@ impl Drop for TurnGuard {
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
-    // Read only by the superseded direct-execution helpers and tests since
-    // the #7415 consolidation (the loop assembles specs per iteration).
-    #[allow(dead_code)]
-    tool_specs: Vec<ToolSpec>,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
@@ -162,8 +158,6 @@ pub struct Agent {
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
-    #[allow(dead_code)] // WIP: stored for future runtime tool filtering
-    allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
@@ -189,18 +183,6 @@ pub struct Agent {
     /// `start_channels`; this is the alternate path for environments that
     /// build an Agent directly without `start_channels`.
     channel_handles: AgentChannelHandles,
-    /// When `true`, the agent was constructed without persistent memory.
-    /// Memory backend is `NoneMemory`, auto-save is off, and memory tools
-    /// are stripped from the tool set. Used by ACP sessions.
-    #[allow(dead_code)]
-    exclude_memory: bool,
-    /// Per-session cache for resolved local image data URIs.
-    /// Avoids re-reading the same image file on every turn/tool-iteration
-    /// when the multimodal pipeline re-walks the full conversation history.
-    // Used only by the superseded `prepare_provider_messages` since the
-    // #7415 consolidation (the loop prepares messages per iteration).
-    #[allow(dead_code)]
-    image_cache: zeroclaw_providers::multimodal::LocalImageCache,
 }
 
 impl Drop for Agent {
@@ -566,7 +548,6 @@ impl AgentBuilder {
             tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
         }
 
-        let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
         let workspace_dir = self
             .workspace_dir
             .clone()
@@ -606,7 +587,6 @@ impl AgentBuilder {
                 anyhow::Error::msg("model_provider is required")
             })?,
             tools,
-            tool_specs,
             memory: memory.clone(),
             observer: self.observer.ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -675,7 +655,6 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
-            allowed_tools: allowed,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
             autonomy_level: self
@@ -686,8 +665,6 @@ impl AgentBuilder {
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
-            exclude_memory,
-            image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
         })
     }
 }
@@ -4359,8 +4336,8 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        assert_eq!(agent.tool_specs.len(), 1);
-        assert_eq!(agent.tool_specs[0].name, "echo");
+        assert_eq!(agent.tools.len(), 1);
+        assert_eq!(agent.tools[0].name(), "echo");
     }
 
     #[test]
@@ -4391,7 +4368,7 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         assert!(
-            agent.tool_specs.is_empty(),
+            agent.tools.is_empty(),
             "No tools should match a non-existent allowlist entry"
         );
     }
