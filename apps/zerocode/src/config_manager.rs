@@ -273,6 +273,11 @@ pub(crate) struct App {
     /// `None` rows are group headers; mouse clicks resolve through this
     /// so headers are dead zones instead of off-by-N selections.
     last_section_rows: Vec<Option<usize>>,
+    /// Scroll offset of the section-pane list at last draw. Dedicated to
+    /// the sections pane (not the shared `last_list_offset`, which the
+    /// right-pane draws overwrite) so a click on a scrolled section list
+    /// maps to the right row in any screen.
+    last_section_list_offset: usize,
     last_tab_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
 }
@@ -327,6 +332,7 @@ impl App {
             last_section_list_area: Rect::default(),
             last_list_offset: 0,
             last_section_rows: Vec::new(),
+            last_section_list_offset: 0,
             last_tab_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
         }
@@ -626,7 +632,7 @@ impl App {
                     if let Some(pos) = mouse::list_click_index(
                         mouse.row,
                         self.last_section_list_area,
-                        0,
+                        self.last_section_list_offset,
                         self.last_section_rows.len(),
                     ) && let Some(&Some(orig)) = self.last_section_rows.get(pos)
                     {
@@ -2792,6 +2798,7 @@ impl App {
         self.last_section_list_area = list_area;
         self.last_section_rows = row_map;
         self.last_list_offset = state.offset();
+        self.last_section_list_offset = state.offset();
         self.last_tab_area = None;
     }
 

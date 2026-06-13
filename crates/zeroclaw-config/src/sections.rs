@@ -143,11 +143,14 @@ pub fn section_group_for_key(key: &str) -> SectionGroup {
     if let Some(s) = Section::from_key(key) {
         return s.group();
     }
-    // `nested_section_group` arms are keyed kebab-case (the derive runs
-    // each field name through `snake_to_kebab`). Section keys reaching
-    // here may be either spelling, so try as-is then kebab-normalized.
+    // `nested_section_group` arms are keyed by the Rust field ident,
+    // i.e. snake_case (the derive's `snake_to_kebab` is currently an
+    // identity passthrough). Section keys reaching here are snake too
+    // (the RPC/gateway pass `prop_fields()` first segments), so the
+    // direct lookup hits; tolerate a kebab-spelled caller by normalizing
+    // back to snake, matching `Section::from_key`'s leniency.
     crate::schema::Config::nested_section_group(key)
-        .or_else(|| crate::schema::Config::nested_section_group(&key.replace('_', "-")))
+        .or_else(|| crate::schema::Config::nested_section_group(&key.replace('-', "_")))
         .and_then(SectionGroup::from_label)
         .unwrap_or(SectionGroup::Other)
 }
@@ -921,6 +924,15 @@ mod tests {
         assert_eq!(section_group_for_key("delegate"), SectionGroup::MultiAgent);
         assert_eq!(section_group_for_key("web_search"), SectionGroup::Tools);
         assert_eq!(section_group_for_key("secrets"), SectionGroup::Storage);
+        // Kebab spelling of a SCHEMA-grouped (non-curated) root resolves
+        // through the kebab→snake fallback to the snake-keyed
+        // `nested_section_group` arm. (`web_search`/`data_retention` are
+        // schema `#[group]` fields, not curated `sections!` rows.)
+        assert_eq!(section_group_for_key("web-search"), SectionGroup::Tools);
+        assert_eq!(
+            section_group_for_key("data-retention"),
+            SectionGroup::Operations
+        );
         // Unknown keys land in the catch-all, never disappear.
         assert_eq!(section_group_for_key("not_a_section"), SectionGroup::Other);
     }
