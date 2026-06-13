@@ -142,31 +142,37 @@ pub struct Config {
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub observability: ObservabilityConfig,
 
     /// Trust scoring and regression detection configuration (`[trust]`).
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub trust: crate::scattered_types::TrustConfig,
 
     /// Security subsystem configuration (`[security]`).
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub security: SecurityConfig,
 
     /// Backup tool configuration (`[backup]`).
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub backup: BackupConfig,
 
     /// Data retention and purge configuration (`[data_retention]`).
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub data_retention: DataRetentionConfig,
 
     /// Cloud transformation accelerator configuration (`[cloud_ops]`).
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub cloud_ops: CloudOpsConfig,
 
     /// Conversational AI agent builder configuration (`[conversational_ai]`).
@@ -177,31 +183,37 @@ pub struct Config {
     /// deserialize correctly thanks to `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "ConversationalAiConfig::is_disabled")]
     #[nested]
+    #[group = "Operations"]
     pub conversational_ai: ConversationalAiConfig,
 
     /// Managed cybersecurity service configuration (`[security_ops]`).
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub security_ops: SecurityOpsConfig,
 
     /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub runtime: RuntimeConfig,
 
     /// Reliability settings: retries, backoff, key rotation (`[reliability]`).
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub reliability: ReliabilityConfig,
 
     /// Scheduler configuration for periodic task execution (`[scheduler]`).
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub scheduler: SchedulerConfig,
 
     /// Pacing controls for slow/local LLM workloads (`[pacing]`).
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub pacing: PacingConfig,
 
     /// Skills loading and community repository behavior (`[skills]`).
@@ -212,16 +224,19 @@ pub struct Config {
     /// Pipeline tool configuration (`[pipeline]`).
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub pipeline: PipelineConfig,
 
     /// Automatic query classification — maps user messages to model hints.
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub query_classification: QueryClassificationConfig,
 
     /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub heartbeat: HeartbeatConfig,
 
     /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
@@ -236,6 +251,7 @@ pub struct Config {
     /// ACP (Agent Client Protocol) server configuration (`[acp]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub acp: AcpConfig,
 
     /// Channel configurations: Telegram, Discord, Slack, etc. (`[channels]`).
@@ -261,6 +277,7 @@ pub struct Config {
     /// Gateway server configuration: host, port, pairing, rate limits (`[gateway]`).
     #[serde(default)]
     #[nested]
+    #[group = "Network"]
     pub gateway: GatewayConfig,
 
     /// WebSocket Secure (WSS) transport for remote TUI connections (`[wss]`).
@@ -271,6 +288,7 @@ pub struct Config {
     /// Composio managed OAuth tools integration (`[composio]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub composio: ComposioConfig,
 
     /// Microsoft 365 Graph API integration (`[microsoft365]`).
@@ -281,11 +299,13 @@ pub struct Config {
     /// Secrets encryption configuration (`[secrets]`).
     #[serde(default)]
     #[nested]
+    #[group = "Storage"]
     pub secrets: SecretsConfig,
 
     /// Browser automation configuration (`[browser]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub browser: BrowserConfig,
 
     /// Browser delegation configuration (`[browser_delegate]`).
@@ -311,56 +331,67 @@ pub struct Config {
     /// Rollback/migration: remove `[browser_delegate]` or keep `enabled = false` to disable.
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub browser_delegate: crate::scattered_types::BrowserDelegateConfig,
 
     /// HTTP request tool configuration (`[http_request]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub http_request: HttpRequestConfig,
 
     /// Multimodal (image) handling configuration (`[multimodal]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub multimodal: MultimodalConfig,
 
     /// Automatic media understanding pipeline (`[media_pipeline]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub media_pipeline: MediaPipelineConfig,
 
     /// Web fetch tool configuration (`[web_fetch]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub web_fetch: WebFetchConfig,
 
     /// Link enricher configuration (`[link_enricher]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub link_enricher: LinkEnricherConfig,
 
     /// Text browser tool configuration (`[text_browser]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub text_browser: TextBrowserConfig,
 
     /// Web search tool configuration (`[web_search]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub web_search: WebSearchConfig,
 
     /// Project delivery intelligence configuration (`[project_intel]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub project_intel: ProjectIntelConfig,
 
     /// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub google_workspace: GoogleWorkspaceConfig,
 
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     #[nested]
+    #[group = "Network"]
     pub proxy: ProxyConfig,
 
     /// Cost tracking and budget enforcement configuration (`[cost]`).
@@ -368,16 +399,19 @@ pub struct Config {
     /// `[cost.rates.<type>.<model>]`.
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub cost: CostConfig,
 
     /// Peripheral board configuration for hardware integration (`[peripherals]`).
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub peripherals: PeripheralsConfig,
 
     /// Delegate tool global default configuration (`[delegate]`).
     #[serde(default)]
     #[nested]
+    #[group = "Multi-agent"]
     pub delegate: DelegateToolConfig,
 
     /// Aliased agents in this install. Each entry under `[agents.<alias>]`
@@ -427,6 +461,7 @@ pub struct Config {
     /// Hooks configuration (lifecycle hooks and built-in hook toggles).
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub hooks: HooksConfig,
 
     /// Hardware configuration (wizard-driven physical world setup).
@@ -437,11 +472,13 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub transcription: TranscriptionConfig,
 
     /// Text-to-Speech configuration (`[tts]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub tts: TtsConfig,
 
     /// External MCP server connections (`[mcp]`).
@@ -452,6 +489,7 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     #[nested]
+    #[group = "Network"]
     pub nodes: NodesConfig,
 
     /// Meta-state for the Quickstart flow (which sections the user has
@@ -463,31 +501,37 @@ pub struct Config {
     /// Notion integration configuration (`[notion]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub notion: NotionConfig,
 
     /// Jira integration configuration (`[jira]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub jira: JiraConfig,
 
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
+    #[group = "Network"]
     pub node_transport: NodeTransportConfig,
 
     /// Knowledge graph configuration (`[knowledge]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub knowledge: KnowledgeConfig,
 
     /// LinkedIn integration configuration (`[linkedin]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub linkedin: LinkedInConfig,
 
     /// Standalone image generation tool configuration (`[image_gen]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub image_gen: ImageGenConfig,
 
     /// Standalone file upload tool configuration (`[file_upload]`).
@@ -509,6 +553,7 @@ pub struct Config {
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub plugins: PluginsConfig,
 
     /// Locale for tool descriptions (e.g. `"en"`, `"zh-CN"`).
@@ -525,41 +570,49 @@ pub struct Config {
     /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]`).
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub verifiable_intent: VerifiableIntentConfig,
 
     /// Claude Code tool configuration (`[claude_code]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub claude_code: ClaudeCodeConfig,
 
     /// Claude Code task runner with Slack progress and SSH session handoff (`[claude_code_runner]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub claude_code_runner: ClaudeCodeRunnerConfig,
 
     /// Codex CLI tool configuration (`[codex_cli]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub codex_cli: CodexCliConfig,
 
     /// Gemini CLI tool configuration (`[gemini_cli]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub gemini_cli: GeminiCliConfig,
 
     /// OpenCode CLI tool configuration (`[opencode_cli]`).
     #[serde(default)]
     #[nested]
+    #[group = "Integrations"]
     pub opencode_cli: OpenCodeCliConfig,
 
     /// Standard Operating Procedures engine configuration (`[sop]`).
     #[serde(default)]
     #[nested]
+    #[group = "Agent"]
     pub sop: SopConfig,
 
     /// Shell tool configuration (`[shell_tool]`).
     #[serde(default)]
     #[nested]
+    #[group = "Tools"]
     pub shell_tool: ShellToolConfig,
 
     /// Escalation routing configuration (`[escalation]`).
