@@ -218,31 +218,21 @@ pub async fn run_tool_call_loop(
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
     // `turn.context.TurnCtx`).
     let ctx = TurnCtx {
-        model_provider,
-        tools_registry,
         observer,
         provider_name,
         model,
         temperature,
-        silent,
         approval,
         channel_name,
         channel_reply_target,
-        multimodal_config,
         cancellation_token: cancellation_token.as_ref(),
         on_delta: on_delta.as_ref(),
         event_tx: event_tx.as_ref(),
         hooks,
-        excluded_tools,
         dedup_exempt_tools,
-        activated_tools,
         pacing,
         strict_tool_parsing,
-        parallel_tools,
-        max_tool_result_chars,
         channel,
-        receipt_generator,
-        collected_receipts,
         turn_id: &turn_id,
     };
 
