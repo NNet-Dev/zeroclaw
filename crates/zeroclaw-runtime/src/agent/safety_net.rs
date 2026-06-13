@@ -1688,3 +1688,376 @@ async fn safety_net_failed_graceful_summary_does_not_persist_prompt() {
         "the unanswered synthetic summary prompt must not persist when the summary call fails"
     );
 }
+
+// ── seam 15: direct-execution approval semantics, now via the loop ──────
+// The pre-consolidation Agent carried a private `execute_tool_call` that
+// mirrored the loop's approval pipeline; six oracles pinned its
+// `set_runtime_approved_arg` trust semantics. That mirror is deleted — the
+// loop's `turn/call_prep.rs` runs the identical
+//   set_runtime_approved_arg(&name, &mut args, false)   (strip model value)
+//   → gate_tool_approval(..)                             (real decision)
+//   → set_runtime_approved_arg(&name, &mut args, approved)
+// sequence, so the same security oracles now drive the production path
+// (`turn_streamed_with_steering_state` → AskUserApprovalBridge →
+// gate_tool_approval). `approved` is true only when the gate returns an
+// Approved requirement (Yes/Always); NotRequired stays false.
+
+/// Records each approval request and answers with a fixed decision.
+struct RecordingApprovalChannel {
+    response: zeroclaw_api::channel::ChannelApprovalResponse,
+    requests: Arc<AtomicUsize>,
+}
+impl ::zeroclaw_api::attribution::Attributable for RecordingApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        "acp"
+    }
+}
+#[async_trait]
+impl zeroclaw_api::channel::Channel for RecordingApprovalChannel {
+    fn name(&self) -> &str {
+        "acp"
+    }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn listen(
+        &self,
+        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(self.response.clone()))
+    }
+}
+
+/// Counts executions and captures the args it was actually invoked with —
+/// the observable for the `approved`-arg trust assertions.
+struct CapturingArgTool {
+    name: &'static str,
+    output: &'static str,
+    calls: Arc<AtomicUsize>,
+    last_args: Arc<parking_lot::Mutex<Option<serde_json::Value>>>,
+}
+zeroclaw_api::tool_attribution!(
+    CapturingArgTool,
+    ::zeroclaw_api::attribution::ToolKind::Plugin
+);
+#[async_trait]
+impl Tool for CapturingArgTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        self.name
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_args.lock() = Some(args);
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: self.output.into(),
+            error: None,
+        })
+    }
+}
+
+fn tool_call_args(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args.to_string(),
+        extra_content: None,
+    }
+}
+
+/// Build an Agent with an optional approval manager and a single registered
+/// `acp` back-channel, then drive one streamed turn.
+fn approval_agent(
+    provider: Box<dyn ModelProvider>,
+    tools_vec: Vec<Box<dyn Tool>>,
+    manager: Option<Arc<ApprovalManager>>,
+    channel: Option<Arc<dyn zeroclaw_api::channel::Channel>>,
+) -> Agent {
+    let mut builder = Agent::builder()
+        .model_provider(provider)
+        .tools(tools_vec)
+        .memory(mem_none())
+        .observer(Arc::from(observability::NoopObserver {}))
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"));
+    if let Some(mgr) = manager {
+        builder = builder.approval_manager(Some(mgr));
+    }
+    let mut agent = builder.build().expect("agent builder should succeed");
+    if let Some(ch) = channel {
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(handle);
+        agent.channel_handles().register_channel("acp", ch);
+    }
+    agent
+}
+
+#[tokio::test]
+async fn safety_net_loop_approval_requested_then_executed_on_approve() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let risk = zeroclaw_config::schema::RiskProfileConfig {
+        always_ask: vec!["echo".into()],
+        ..zeroclaw_config::schema::RiskProfileConfig::default()
+    };
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![tool_call(
+            "tc1", "echo",
+        )])])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&exec),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive(&risk))),
+        Some(Arc::new(RecordingApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "back-channel asked once"
+    );
+    assert_eq!(exec.load(Ordering::SeqCst), 1, "approved tool executed");
+}
+
+#[tokio::test]
+async fn safety_net_loop_approval_denied_blocks_execution() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let risk = zeroclaw_config::schema::RiskProfileConfig {
+        always_ask: vec!["echo".into()],
+        ..zeroclaw_config::schema::RiskProfileConfig::default()
+    };
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![tool_call(
+            "tc1", "echo",
+        )])])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&exec),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive(&risk))),
+        Some(Arc::new(RecordingApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "back-channel asked once"
+    );
+    assert_eq!(
+        exec.load(Ordering::SeqCst),
+        0,
+        "denied tool must not execute"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_loop_shell_does_not_trust_model_supplied_approved_arg() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(parking_lot::Mutex::new(None));
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args(
+                "tc1",
+                "shell",
+                serde_json::json!({"command": "touch should-not-run", "approved": true}),
+            ),
+        ])])),
+        vec![Box::new(CapturingArgTool {
+            name: "shell",
+            output: "shell-out",
+            calls: Arc::clone(&exec),
+            last_args: Arc::clone(&captured),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ))),
+        Some(Arc::new(RecordingApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "model approved=true must NOT bypass the gate"
+    );
+    assert_eq!(
+        exec.load(Ordering::SeqCst),
+        0,
+        "denied shell must not execute"
+    );
+    assert!(
+        captured.lock().is_none(),
+        "a denied tool is never invoked, so no args are captured"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_loop_shell_marks_args_approved_after_backchannel_approval() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(parking_lot::Mutex::new(None));
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args(
+                "tc1",
+                "shell",
+                serde_json::json!({"command": "touch should-run", "approved": false}),
+            ),
+        ])])),
+        vec![Box::new(CapturingArgTool {
+            name: "shell",
+            output: "shell-out",
+            calls: Arc::clone(&exec),
+            last_args: Arc::clone(&captured),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ))),
+        Some(Arc::new(RecordingApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(exec.load(Ordering::SeqCst), 1, "approved shell executes");
+    let args = captured.lock().clone().expect("executed args captured");
+    assert_eq!(
+        args["approved"], true,
+        "runtime injects approved=true only after a real back-channel approval"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_loop_shell_keeps_runtime_approval_from_always_allowlist() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(parking_lot::Mutex::new(None));
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args(
+                "tc1",
+                "shell",
+                serde_json::json!({"command": "touch first", "approved": false}),
+            ),
+            tool_call_args(
+                "tc2",
+                "shell",
+                serde_json::json!({"command": "touch second", "approved": false}),
+            ),
+        ])])),
+        vec![Box::new(CapturingArgTool {
+            name: "shell",
+            output: "shell-out",
+            calls: Arc::clone(&exec),
+            last_args: Arc::clone(&captured),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ))),
+        Some(Arc::new(RecordingApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "AlwaysApprove on the first call serves the second from the allowlist"
+    );
+    assert_eq!(exec.load(Ordering::SeqCst), 2, "both shell calls execute");
+    let args = captured.lock().clone().expect("executed args captured");
+    assert_eq!(args["approved"], true);
+}
+
+#[tokio::test]
+async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(parking_lot::Mutex::new(None));
+    // No approval manager: cron_add is NotRequired, so it runs without a gate
+    // — but the model-supplied approved=true is still stripped to false.
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args(
+                "tc1",
+                "cron_add",
+                serde_json::json!({"command": "echo hi", "approved": true}),
+            ),
+        ])])),
+        vec![Box::new(CapturingArgTool {
+            name: "cron_add",
+            output: "cron-out",
+            calls: Arc::clone(&exec),
+            last_args: Arc::clone(&captured),
+        })],
+        None,
+        None,
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+    assert_eq!(
+        exec.load(Ordering::SeqCst),
+        1,
+        "cron_add runs (no approval required)"
+    );
+    let args = captured.lock().clone().expect("executed args captured");
+    assert_eq!(
+        args["approved"], false,
+        "model-supplied approved=true must be stripped even with no approval gate"
+    );
+}
