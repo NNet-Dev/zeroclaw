@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::pricing::ModelRates;
 use anyhow::Result;
 use serde::Deserialize;
 use tokio::sync::OnceCell;
@@ -30,13 +31,30 @@ pub(crate) struct ProviderEntry {
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
     id: String,
+    #[serde(default)]
+    cost: Option<ModelCost>,
+}
+
+/// models.dev `cost` block — USD per 1M tokens (the same unit ZeroClaw's rate
+/// sheet uses, so no conversion is needed).
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
+struct ModelCost {
+    #[serde(default)]
+    input: Option<f64>,
+    #[serde(default)]
+    output: Option<f64>,
+    #[serde(default)]
+    cache_read: Option<f64>,
 }
 
 pub(crate) type Catalog = HashMap<String, ProviderEntry>;
 
 static CACHED_CATALOG: OnceCell<Arc<Catalog>> = OnceCell::const_new();
 
-async fn fetch_catalog() -> Result<Arc<Catalog>> {
+/// Fetch and parse the models.dev catalog fresh (no process cache). Used by the
+/// live-pricing refresher so its fallback tracks upstream changes per cycle;
+/// the cached [`list_models_for`] path stays on the process-lifetime cache.
+pub(crate) async fn fetch_catalog() -> Result<Arc<Catalog>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
@@ -80,6 +98,34 @@ pub(crate) fn filter_models(catalog: &Catalog, provider_key: &str) -> Result<Vec
 pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
     let catalog = CACHED_CATALOG.get_or_try_init(fetch_catalog).await?;
     filter_models(catalog, provider_key)
+}
+
+/// Per-model pricing for one model_provider from a parsed catalog, as a
+/// `model_id -> ModelRates` map. Models with no `cost` block are omitted —
+/// like `rates_catalog`, this emptiness filter is load-bearing for downstream
+/// consumers. Pure — unit-testable without the network. Rates are USD per 1M
+/// tokens verbatim (no conversion).
+pub(crate) fn pricing_from_catalog(
+    catalog: &Catalog,
+    provider_key: &str,
+) -> HashMap<String, ModelRates> {
+    let mut out = HashMap::new();
+    let Some(entry) = catalog.get(provider_key) else {
+        return out;
+    };
+    for model in entry.models.values() {
+        let Some(cost) = model.cost else { continue };
+        // models.dev `cost` is already USD per 1M tokens — no scaling.
+        let rates = ModelRates {
+            input_per_mtok: cost.input,
+            output_per_mtok: cost.output,
+            cached_input_per_mtok: cost.cache_read,
+        };
+        if !rates.is_empty() {
+            out.insert(model.id.clone(), rates);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -144,5 +190,27 @@ mod tests {
     #[test]
     fn parse_errors_on_malformed_json() {
         assert!(parse_catalog(b"not json").is_err());
+    }
+
+    #[test]
+    fn pricing_from_catalog_reads_cost_and_skips_unpriced() {
+        // `cost` is USD per 1M tokens; models without it are omitted.
+        let raw = r#"{
+            "kilo": {
+                "models": {
+                    "a": {"id": "minimax-m2.7", "cost": {"input": 0.3, "output": 1.2, "cache_read": 0.06}},
+                    "b": {"id": "no-cost-model"}
+                }
+            }
+        }"#;
+        let catalog = parse_catalog(raw.as_bytes()).unwrap();
+        let map = pricing_from_catalog(&catalog, "kilo");
+        let m = map.get("minimax-m2.7").expect("priced");
+        assert_eq!(m.input_per_mtok, Some(0.3));
+        assert_eq!(m.output_per_mtok, Some(1.2));
+        assert_eq!(m.cached_input_per_mtok, Some(0.06));
+        assert!(!map.contains_key("no-cost-model"));
+        // Unknown provider key yields an empty map, not an error.
+        assert!(pricing_from_catalog(&catalog, "absent").is_empty());
     }
 }

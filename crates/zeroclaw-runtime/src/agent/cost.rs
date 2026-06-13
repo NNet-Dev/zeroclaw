@@ -3,6 +3,7 @@ use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
+use zeroclaw_providers::pricing::ModelRates;
 
 // ── Cost tracking via task-local ──
 
@@ -79,12 +80,13 @@ tokio::task_local! {
 /// 3. The model alias path's last segment (`.../suffix`) tried under the
 ///    same rules.
 ///
-/// Returns `(0.0, 0.0, 0.0)` if no entry matches; the caller logs a
-/// one-shot warn in that case. A zero `cached_input` rate means "no
-/// discount" — the per-token caller bills the cached subset at the
-/// standard input rate.
-fn resolve_rates(pricing: &HashMap<String, f64>, model: &str) -> (f64, f64, f64) {
-    let try_lookup = |key: &str| -> Option<(Option<f64>, Option<f64>, Option<f64>)> {
+/// Each dimension is `None` when nothing matched (so the caller can tell
+/// "configured absent" from a configured `Some(0.0)` and fill only the gaps
+/// from the live-price fallback). A zero `cached_input` rate means "no
+/// discount" — the per-token caller bills the cached subset at the standard
+/// input rate.
+fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
+    let try_lookup = |key: &str| -> Option<ModelRates> {
         let input = pricing.get(&format!("{key}.input")).copied();
         let output = pricing.get(&format!("{key}.output")).copied();
         let cached = pricing.get(&format!("{key}.cached_input")).copied();
@@ -92,27 +94,43 @@ fn resolve_rates(pricing: &HashMap<String, f64>, model: &str) -> (f64, f64, f64)
         if input.is_none() && output.is_none() && cached.is_none() && flat.is_none() {
             None
         } else {
-            Some((input.or(flat), output.or(flat), cached))
+            Some(ModelRates {
+                input_per_mtok: input.or(flat),
+                output_per_mtok: output.or(flat),
+                cached_input_per_mtok: cached,
+            })
         }
     };
 
-    if let Some((input, output, cached)) = try_lookup(model) {
-        return (
-            input.unwrap_or(0.0),
-            output.unwrap_or(0.0),
-            cached.unwrap_or(0.0),
-        );
-    }
-    if let Some((_, suffix)) = model.rsplit_once('/')
-        && let Some((input, output, cached)) = try_lookup(suffix)
-    {
-        return (
-            input.unwrap_or(0.0),
-            output.unwrap_or(0.0),
-            cached.unwrap_or(0.0),
-        );
-    }
-    (0.0, 0.0, 0.0)
+    zeroclaw_providers::pricing::model_id_candidates(model)
+        .find_map(try_lookup)
+        .unwrap_or_default()
+}
+
+/// Live-price fallback for one `(model_provider_name, model)`. Reads the
+/// process-global price snapshot (non-blocking, never fetches). The snapshot
+/// is keyed by the composite `<type>.<alias>` ref this path already receives;
+/// model-id candidate forms are probed inside `pricing::lookup`. `None` when
+/// live pricing is disabled (empty snapshot) or unmatched.
+fn live_pricing_for(model_provider_name: &str, model: &str) -> Option<ModelRates> {
+    let snapshot = zeroclaw_providers::pricing::current_snapshot();
+    zeroclaw_providers::pricing::lookup(&snapshot, model_provider_name, model).copied()
+}
+
+/// Flatten config rates merged with the live-price fallback into the
+/// `(input, output, cached)` tuple used for cost math. Config wins per
+/// dimension ([`ModelRates::or`]); live only fills dimensions config left
+/// unset; any dimension still unset bills at `0.0`.
+fn merge_config_and_live_rates(
+    config_rates: ModelRates,
+    live: Option<ModelRates>,
+) -> (f64, f64, f64) {
+    let merged = config_rates.or(live.unwrap_or_default());
+    (
+        merged.input_per_mtok.unwrap_or(0.0),
+        merged.output_per_mtok.unwrap_or(0.0),
+        merged.cached_input_per_mtok.unwrap_or(0.0),
+    )
 }
 
 /// Resolve the per-model pricing map for a provider reference.
@@ -156,9 +174,17 @@ pub fn record_tool_loop_cost_usage(
         .ok()
         .flatten()?;
     let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
-    let (input_rate, output_rate, cached_rate) = pricing
-        .map(|map| resolve_rates(map, model))
-        .unwrap_or((0.0, 0.0, 0.0));
+    let config_rates = pricing
+        .map(|map| resolve_rates_opt(map, model))
+        .unwrap_or_default();
+
+    // Live-price FALLBACK fills only the dimensions config left unset; never
+    // fetches on this path (reads a cached snapshot, empty unless a provider
+    // opted into `live_pricing`).
+    let live = (!config_rates.is_complete())
+        .then(|| live_pricing_for(model_provider_name, model))
+        .flatten();
+    let (input_rate, output_rate, cached_rate) = merge_config_and_live_rates(config_rates, live);
 
     let cost_usage = CostTokenUsage::new(
         model,
@@ -173,10 +199,12 @@ pub fn record_tool_loop_cost_usage(
     // Promote first sighting of (model_provider, model) without pricing to a WARN
     // so operators notice the silent zero-cost record before they need to
     // grep DEBUG logs. Subsequent sightings stay at DEBUG so the warn
-    // stream doesn't get spammy. Missing pricing means either the
-    // model_provider has no pricing map at all, or the map exists but
-    // produced zero rates for this model.
-    if pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0) {
+    // stream doesn't get spammy. Fires when BOTH config and the live fallback
+    // left input and output at zero. A model the live snapshot just filled
+    // won't warn; a model deliberately priced at 0.0 still trips the one-shot
+    // warn (it is indistinguishable from unpriced here — same as before this
+    // fallback existed).
+    if input_rate == 0.0 && output_rate == 0.0 {
         warn_once_missing_pricing(model_provider_name, model);
     }
 
@@ -268,6 +296,48 @@ mod tests {
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
+    }
+
+    #[test]
+    fn config_rate_wins_live_fills_only_gaps() {
+        // Config priced ONLY input; live prices all three. Input must stay the
+        // configured value; output/cached come from live.
+        let config = ModelRates {
+            input_per_mtok: Some(5.0),
+            ..ModelRates::default()
+        };
+        let live = Some(ModelRates {
+            input_per_mtok: Some(99.0),
+            output_per_mtok: Some(15.0),
+            cached_input_per_mtok: Some(1.5),
+        });
+        assert_eq!(merge_config_and_live_rates(config, live), (5.0, 15.0, 1.5));
+    }
+
+    #[test]
+    fn no_live_leaves_unconfigured_dimensions_zero() {
+        // Empty config + no live snapshot must reproduce today's behavior
+        // exactly: all rates zero.
+        assert_eq!(
+            merge_config_and_live_rates(ModelRates::default(), None),
+            (0.0, 0.0, 0.0)
+        );
+        // A configured zero (genuinely free) is preserved, not "filled".
+        assert_eq!(
+            merge_config_and_live_rates(
+                ModelRates {
+                    input_per_mtok: Some(0.0),
+                    output_per_mtok: Some(0.0),
+                    cached_input_per_mtok: None,
+                },
+                Some(ModelRates {
+                    input_per_mtok: Some(3.0),
+                    output_per_mtok: Some(9.0),
+                    cached_input_per_mtok: Some(0.3),
+                })
+            ),
+            (0.0, 0.0, 0.3)
+        );
     }
 
     #[test]

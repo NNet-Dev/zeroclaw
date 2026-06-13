@@ -36,6 +36,7 @@ pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
 pub mod openrouter_catalog;
+pub mod pricing;
 pub mod reliable;
 pub mod router;
 pub(crate) mod stream_guard;
