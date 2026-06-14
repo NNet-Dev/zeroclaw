@@ -380,7 +380,11 @@ export default function Cron() {
       if (isEditing) {
         const existingTimezone = scheduleTimezone(modalJob as CronJob);
         const timezone = formTimezone.trim();
-        const patch: { name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string } = {
+        const patch: { agent: string; name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string } = {
+          // The gateway requires `agent` on every patch (it risk-gates a
+          // command change); send the job's existing alias so a pure
+          // name/schedule/prompt edit doesn't 422 with "missing field agent".
+          agent: (modalJob as CronJob).agent_alias,
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
         };
@@ -458,7 +462,10 @@ export default function Cron() {
   // flag the scheduler already honours.
   const handleToggleEnabled = async (job: CronJob) => {
     try {
-      const updated = await patchCronJob(job.id, { enabled: !job.enabled });
+      const updated = await patchCronJob(job.id, {
+        agent: job.agent_alias,
+        enabled: !job.enabled,
+      });
       setJobs((prev) => prev.map((j) => (j.id === job.id ? updated : j)));
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t('cron.edit_error'));

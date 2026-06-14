@@ -1459,6 +1459,13 @@ export function triggerCronJob(id: string): Promise<CronTriggerResult> {
 export function patchCronJob(
   id: string,
   patch: {
+    /**
+     * The job's configured agent alias. Always send it: the gateway's
+     * CronPatchBody requires `agent` (it gates a shell-command change by the
+     * agent's risk profile), so a patch that omits it fails with
+     * `422 missing field agent` even for a pure schedule/name/enabled change.
+     */
+    agent: string;
     name?: string;
     schedule?: string;
     tz?: string;
