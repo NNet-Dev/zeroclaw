@@ -9,6 +9,7 @@
 import { useEffect, useState } from 'react';
 import { Save, X } from 'lucide-react';
 import { Button } from '@/components/ui';
+import { t } from '@/lib/i18n';
 import { ApiError, getSections, type ValidationWarning } from '@/lib/api';
 import {
   useConfigDirtyCount,
@@ -87,10 +88,10 @@ export default function UnsavedChangesBanner() {
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="text-sm text-pc-text">
           <span className="font-semibold text-status-warning">
-            {dirtyCount} unsaved {dirtyCount === 1 ? 'change' : 'changes'}
+            {dirtyCount} {dirtyCount === 1 ? t('unsaved_banner.unsaved_change') : t('unsaved_banner.unsaved_changes')}
           </span>
           {sectionList && (
-            <span className="text-pc-text-secondary"> — in {sectionList}</span>
+            <span className="text-pc-text-secondary"> {t('unsaved_banner.in_sections_prefix')}{sectionList}</span>
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -105,7 +106,7 @@ export default function UnsavedChangesBanner() {
             disabled={saving}
           >
             <X className="h-3.5 w-3.5" />
-            Discard all
+            {t('unsaved_banner.discard_all')}
           </Button>
           <Button
             size="sm"
@@ -114,7 +115,7 @@ export default function UnsavedChangesBanner() {
             disabled={saving}
           >
             <Save className="h-3.5 w-3.5" />
-            {saving ? 'Saving…' : 'Save all'}
+            {saving ? t('unsaved_banner.saving') : t('unsaved_banner.save_all')}
           </Button>
         </div>
       </div>

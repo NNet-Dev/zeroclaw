@@ -48,7 +48,7 @@ interface PermissionRequest {
   options: AcpPermissionOption[];
 }
 
-const DEFAULT_PROMPT = 'Summarize the current ZeroClaw gateway state in one paragraph.';
+const DEFAULT_PROMPT_KEY = 'acp.default_prompt';
 const MAX_DETAIL_CHARS = 8_000;
 
 function nowLabel(): string {
@@ -100,7 +100,7 @@ function getToolTitle(update: Record<string, unknown>): string {
   if (typeof update.title === 'string') return update.title;
   if (typeof update.name === 'string') return update.name;
   if (typeof update.kind === 'string') return update.kind;
-  return 'Tool call';
+  return t('acp.tool_call');
 }
 
 function frameLabel(frame: AcpFrame): string {
@@ -138,7 +138,7 @@ export default function AcpConsole() {
   const [agents, setAgents] = useState<AgentPickerSummary[]>([]);
   const [agentsLoading, setAgentsLoading] = useState(true);
   const [selectedAgentAlias, setSelectedAgentAlias] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
+  const [prompt, setPrompt] = useState(() => t(DEFAULT_PROMPT_KEY));
   const [streamingText, setStreamingText] = useState('');
   const [messages, setMessages] = useState<ConsoleMessage[]>([]);
   const [permissions, setPermissions] = useState<PermissionRequest[]>([]);
@@ -223,7 +223,7 @@ export default function AcpConsole() {
       if (thought) {
         addMessage(setMessages, {
           kind: 'thought',
-          title: 'Agent thought',
+          title: t('acp.agent_thought'),
           content: thought,
         });
       }
@@ -234,7 +234,7 @@ export default function AcpConsole() {
       addMessage(setMessages, {
         kind: 'tool',
         title: getToolTitle(update),
-        content: updateKind === 'tool_call' ? 'Started' : 'Finished',
+        content: updateKind === 'tool_call' ? t('acp.tool_started') : t('acp.tool_finished'),
         detail: stringifyDetail(update),
       });
       return;
@@ -242,8 +242,8 @@ export default function AcpConsole() {
 
     addMessage(setMessages, {
       kind: 'system',
-      title: 'Session update',
-      content: typeof updateKind === 'string' ? updateKind : 'Unknown update',
+      title: t('acp.session_update'),
+      content: typeof updateKind === 'string' ? updateKind : t('acp.unknown_update'),
       detail: stringifyDetail(update),
     });
   }, [appendAssistantChunk]);
@@ -518,8 +518,8 @@ export default function AcpConsole() {
               onChange={(event) => setSelectedAgentAlias(event.target.value || null)}
               disabled={agentsLoading || !hasEnabledAgent || busy}
               className="h-9 min-w-0 max-w-full rounded-[var(--radius-md)] border border-pc-border bg-pc-input px-3 text-[13px] font-medium text-pc-text-secondary disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40"
-              aria-label="ACP agent"
-              title="ACP agent"
+              aria-label={t('acp.agent_select_label')}
+              title={t('acp.agent_select_label')}
             >
               {agents.length === 0 || !agents.some((agent) => agent.enabled) ? (
                 <option value="">
@@ -582,7 +582,7 @@ export default function AcpConsole() {
           <Link to="/agents">
             <Button variant="ghost" size="sm">
               <Users className="h-4 w-4" />
-              Manage agents
+              {t('acp.manage_agents')}
             </Button>
           </Link>
         </div>
@@ -752,12 +752,12 @@ function StatusTile({ label, value }: { label: string; value: string }) {
 
 // Calm per-kind treatment for transcript rows. The user turn carries a faint
 // accent tint; everything else sits on neutral surfaces keyed by tokens.
-const TRANSCRIPT_TONE: Record<ConsoleMessageKind, { label: string; className: string }> = {
-  user: { label: 'You', className: 'bg-pc-accent/[0.06] border-pc-accent/25' },
-  assistant: { label: 'Agent', className: 'bg-pc-elevated border-pc-border' },
-  thought: { label: 'Thought', className: 'bg-pc-surface border-pc-border' },
-  tool: { label: 'Tool', className: 'bg-pc-code border-pc-border' },
-  system: { label: 'System', className: 'bg-pc-surface border-pc-border' },
+const TRANSCRIPT_TONE: Record<ConsoleMessageKind, { labelKey: string; className: string }> = {
+  user: { labelKey: 'acp.role_you', className: 'bg-pc-accent/[0.06] border-pc-accent/25' },
+  assistant: { labelKey: 'acp.role_agent', className: 'bg-pc-elevated border-pc-border' },
+  thought: { labelKey: 'acp.role_thought', className: 'bg-pc-surface border-pc-border' },
+  tool: { labelKey: 'acp.role_tool', className: 'bg-pc-code border-pc-border' },
+  system: { labelKey: 'acp.role_system', className: 'bg-pc-surface border-pc-border' },
 };
 
 function TranscriptMessage({ message }: { message: ConsoleMessage }) {
@@ -767,7 +767,7 @@ function TranscriptMessage({ message }: { message: ConsoleMessage }) {
     <article className={`rounded-[var(--radius-md)] border p-3 ${tone.className}`}>
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="text-[11px] font-semibold uppercase tracking-wide text-pc-text-muted">
-          {message.title ?? tone.label}
+          {message.title ?? t(tone.labelKey)}
         </div>
         <time className="text-[11px] font-mono text-pc-text-faint">
           {message.timestamp}

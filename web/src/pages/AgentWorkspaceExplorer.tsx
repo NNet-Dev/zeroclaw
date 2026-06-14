@@ -34,7 +34,7 @@ function PromptDialog({
   message,
   initialValue = '',
   placeholder,
-  confirmLabel = 'Confirm',
+  confirmLabel = t('common.confirm'),
   onConfirm,
   onClose,
 }: {
@@ -134,7 +134,7 @@ function PromptDialog({
         </div>
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-pc-border">
           <Button variant="ghost" onClick={onClose}>
-            Cancel
+            {t('common.cancel')}
           </Button>
           <Button variant="primary" onClick={() => onConfirm(value)}>
             {confirmLabel}
@@ -248,7 +248,7 @@ export default function AgentWorkspaceExplorer() {
     }
     if (trimmed.includes('..')) {
       setCreatingDir(false);
-      setError("Folder name cannot contain '..'");
+      setError(t('workspace.error_folder_name_dotdot'));
       return;
     }
     setCreatingDir(false);
@@ -273,7 +273,7 @@ export default function AgentWorkspaceExplorer() {
     }
     if (next.includes('..')) {
       setRenaming(null);
-      setError("Rename target cannot contain '..'");
+      setError(t('workspace.error_rename_dotdot'));
       return;
     }
     setRenaming(null);
@@ -297,11 +297,11 @@ export default function AgentWorkspaceExplorer() {
         <Link to={`/agent/${encodeURIComponent(alias)}`} className="inline-block">
           <Button variant="ghost" size="sm">
             <ArrowLeft className="h-4 w-4" />
-            {t('common.back')} to chat ({alias})
+            {t('workspace.back_to_chat_prefix')} ({alias})
           </Button>
         </Link>
         <h1 className="text-lg font-semibold text-pc-text">
-          Workspace
+          {t('workspace.title')}
         </h1>
         <code className="text-xs font-mono truncate text-pc-text-muted">
           agents/{alias}/workspace/{cwd}
@@ -311,10 +311,10 @@ export default function AgentWorkspaceExplorer() {
             variant="ghost"
             size="sm"
             onClick={() => setCreatingDir(true)}
-            title="Create a new folder in the current directory"
+            title={t('workspace.new_folder_title')}
           >
             <FolderPlus className="h-4 w-4" />
-            New folder
+            {t('workspace.new_folder')}
           </Button>
           <Button
             variant="ghost"
@@ -346,7 +346,7 @@ export default function AgentWorkspaceExplorer() {
                   className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left text-pc-text-secondary hover:bg-[var(--pc-hover)] transition-colors"
                 >
                   <ArrowUp className="h-3.5 w-3.5 flex-shrink-0" />
-                  .. (up one level)
+                  {t('workspace.up_one_level')}
                 </button>
               </li>
             )}
@@ -356,7 +356,7 @@ export default function AgentWorkspaceExplorer() {
               </li>
             ) : entries.length === 0 ? (
               <li className="px-3 py-3 text-xs italic text-pc-text-faint">
-                (empty)
+                {t('workspace.empty')}
               </li>
             ) : (
               entries.map((entry) => {
@@ -391,7 +391,7 @@ export default function AgentWorkspaceExplorer() {
                       {entry.protected ? (
                         <span
                           className="px-2 flex items-center text-pc-text-faint"
-                          title="Protected — owned by the runtime, cannot be renamed or deleted from the dashboard"
+                          title={t('workspace.protected_title')}
                         >
                           <Lock className="h-3.5 w-3.5" />
                         </span>
@@ -401,7 +401,7 @@ export default function AgentWorkspaceExplorer() {
                             type="button"
                             onClick={() => setRenaming(entry.name)}
                             disabled={busy === full}
-                            title="Rename / move"
+                            title={t('workspace.rename_move_title')}
                             className="px-2 text-pc-text-muted hover:text-pc-text transition-colors disabled:opacity-30"
                           >
                             <Edit2 className="h-3.5 w-3.5" />
@@ -457,8 +457,8 @@ export default function AgentWorkspaceExplorer() {
                     </pre>
                   ) : (
                     <p className="text-sm text-pc-text-muted">
-                      Binary file ({formatBytes(viewer.size)}). Preview is base64-
-                      encoded; download via CLI to inspect.
+                      {t('workspace.binary_file_prefix')} ({formatBytes(viewer.size)}).{' '}
+                      {t('workspace.binary_file_suffix')}
                     </p>
                   )
                 ) : null}
@@ -466,7 +466,7 @@ export default function AgentWorkspaceExplorer() {
             </>
           ) : (
             <div className="flex-1 flex items-center justify-center text-sm text-pc-text-faint">
-              Select a file to view its contents.
+              {t('workspace.select_file_hint')}
             </div>
           )}
         </Card>
@@ -475,22 +475,29 @@ export default function AgentWorkspaceExplorer() {
       <ConfirmDialog
         open={pendingDelete !== null}
         danger
-        title={pendingDelete ? `Delete ${pendingDelete.name}?` : 'Delete?'}
+        title={
+          pendingDelete
+            ? `${t('workspace.delete_title_prefix')} ${pendingDelete.name}?`
+            : t('workspace.delete_title')
+        }
         message={
           pendingDelete ? (
             <>
-              This will delete{' '}
-              {pendingDelete.kind === 'dir' ? 'directory' : 'file'}{' '}
+              {t('workspace.delete_message_prefix')}{' '}
+              {pendingDelete.kind === 'dir'
+                ? t('workspace.kind_directory')
+                : t('workspace.kind_file')}{' '}
               <span className="font-mono text-pc-text-secondary">
                 {cwd ? `${cwd}/${pendingDelete.name}` : pendingDelete.name}
               </span>{' '}
-              from {alias}'s workspace.
-              {pendingDelete.kind === 'dir' && ' Everything inside it goes too.'} This
-              cannot be undone.
+              {t('workspace.delete_message_from')} {alias}
+              {t('workspace.delete_message_workspace_suffix')}
+              {pendingDelete.kind === 'dir' && ` ${t('workspace.delete_message_dir_note')}`}{' '}
+              {t('workspace.delete_message_undone')}
             </>
           ) : undefined
         }
-        confirmLabel="Delete"
+        confirmLabel={t('common.delete')}
         onConfirm={() => {
           if (pendingDelete) void deletePath(pendingDelete.name);
         }}
@@ -499,20 +506,20 @@ export default function AgentWorkspaceExplorer() {
 
       <PromptDialog
         open={creatingDir}
-        title="New folder"
-        message={`Create a folder under agents/${alias}/workspace/${cwd ? `${cwd}/` : ''}`}
-        placeholder="folder-name"
-        confirmLabel="Create"
+        title={t('workspace.new_folder')}
+        message={`${t('workspace.new_folder_under')} agents/${alias}/workspace/${cwd ? `${cwd}/` : ''}`}
+        placeholder={t('workspace.folder_name_placeholder')}
+        confirmLabel={t('workspace.create')}
         onConfirm={(value) => void createDirectory(value)}
         onClose={() => setCreatingDir(false)}
       />
 
       <PromptDialog
         open={renaming !== null}
-        title={renaming ? `Rename ${renaming}` : 'Rename'}
-        message="Enter a new name. Use a path to move it elsewhere in the workspace."
+        title={renaming ? `${t('workspace.rename_title_prefix')} ${renaming}` : t('workspace.rename_title')}
+        message={t('workspace.rename_message')}
         initialValue={renaming ?? ''}
-        confirmLabel="Rename"
+        confirmLabel={t('workspace.rename')}
         onConfirm={(value) => {
           if (renaming !== null) void renamePath(renaming, value.trim());
         }}

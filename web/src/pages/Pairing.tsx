@@ -129,7 +129,7 @@ export default function Pairing() {
             type="button"
             onClick={() => setError(null)}
             className="flex-shrink-0 text-status-error/70 hover:text-status-error transition-colors"
-            aria-label="Dismiss"
+            aria-label={t('pairing.dismiss')}
           >
             <X className="h-4 w-4" />
           </button>
@@ -158,12 +158,10 @@ export default function Pairing() {
         {unauthorized ? (
           <div className="p-8 text-center text-sm text-pc-text-muted">
             <p className="font-medium text-pc-text-secondary">
-              This browser isn’t paired yet
+              {t('pairing.unpaired_title')}
             </p>
             <p className="mt-1">
-              Pairing is required, so the device list can’t be read from here.
-              Pair this browser with a code (above) — then your paired devices
-              will appear.
+              {t('pairing.unpaired_hint')}
             </p>
           </div>
         ) : devices.length === 0 ? (
@@ -179,7 +177,7 @@ export default function Pairing() {
                   <th className="px-5 py-3 font-medium">{t('pairing.type')}</th>
                   <th className="px-5 py-3 font-medium">{t('pairing.paired')}</th>
                   <th className="px-5 py-3 font-medium">{t('pairing.last_seen')}</th>
-                  <th className="px-5 py-3 font-medium">IP</th>
+                  <th className="px-5 py-3 font-medium">{t('pairing.ip')}</th>
                   <th className="px-5 py-3 font-medium text-right">
                     {t('pairing.actions')}
                   </th>
@@ -192,10 +190,10 @@ export default function Pairing() {
                     className="transition-colors hover:bg-pc-elevated/50"
                   >
                     <td className="px-5 py-3 text-pc-text">
-                      {device.name || 'Unnamed'}
+                      {device.name || t('pairing.unnamed')}
                     </td>
                     <td className="px-5 py-3 text-pc-text-secondary">
-                      {device.device_type || 'Unknown'}
+                      {device.device_type || t('pairing.unknown')}
                     </td>
                     <td className="px-5 py-3 text-xs text-pc-text-muted">
                       {new Date(device.paired_at).toLocaleDateString()}
@@ -227,17 +225,17 @@ export default function Pairing() {
       <ConfirmDialog
         open={pendingRevoke !== null}
         danger
-        title="Revoke device?"
+        title={t('pairing.revoke_title')}
         message={
           <>
-            This will revoke{' '}
+            {t('pairing.revoke_message_prefix')}{' '}
             <span className="text-pc-text-secondary">
-              {pendingRevoke?.name || 'this device'}
+              {pendingRevoke?.name || t('pairing.this_device')}
             </span>
-            's access. It will need to be paired again to reconnect.
+            {t('pairing.revoke_message_suffix')}
           </>
         }
-        confirmLabel="Revoke"
+        confirmLabel={t('pairing.revoke')}
         onConfirm={() => {
           if (pendingRevoke) void handleRevokeDevice(pendingRevoke.id);
         }}

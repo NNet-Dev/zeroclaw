@@ -362,7 +362,7 @@ export default function Cron() {
     setFormError(null);
 
     if (!isEditing && !formAgent.trim()) {
-      setFormError(t('cron.agent_required_error') || 'Pick an agent for this cron job');
+      setFormError(t('cron.agent_required_error'));
       setSubmitting(false);
       return;
     }
@@ -370,12 +370,12 @@ export default function Cron() {
     // not accept it, so don't gate edits on the existing job's delivery config.
     if (!isEditing && formDeliveryMode === 'announce') {
       if (!formDeliveryChannel.trim()) {
-        setFormError('Delivery channel is required when announce mode is selected');
+        setFormError(t('cron.delivery_channel_required_error'));
         setSubmitting(false);
         return;
       }
       if (!formDeliveryTo.trim()) {
-        setFormError('Delivery target (room id / user id / address) is required for announce mode');
+        setFormError(t('cron.delivery_target_required_error'));
         setSubmitting(false);
         return;
       }
@@ -478,9 +478,7 @@ export default function Cron() {
       // (CronPatchBody has no `enabled` field, so the flag is silently
       // ignored). Say so rather than leaving the button looking broken.
       if (updated.enabled !== desired) {
-        setToggleError(
-          'This daemon build can’t pause/resume jobs from the web yet — the cron API accepted the request but ignored the enabled change. Update the gateway (add `enabled` to CronPatchBody) and reload to enable it.',
-        );
+        setToggleError(t('cron.pause_resume_unsupported_error'));
       } else {
         setToggleError(null);
       }
@@ -565,10 +563,10 @@ export default function Cron() {
         <Card className="px-4 py-3 flex items-center justify-between">
           <div>
             <span className="text-sm font-medium text-pc-text">
-              Catch up missed jobs on startup
+              {t('cron.catch_up_title')}
             </span>
             <p className="text-xs mt-0.5 text-pc-text-muted">
-              Run all overdue jobs when ZeroClaw starts after downtime
+              {t('cron.catch_up_description')}
             </p>
           </div>
           <button
@@ -653,7 +651,7 @@ export default function Cron() {
               </div>
               <div>
                 <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
-                  Agent {!isEditing && <span className="text-status-error">*</span>}
+                  {t('cron.agent_label')} {!isEditing && <span className="text-status-error">*</span>}
                 </label>
                 {isEditing ? (
                   // patchCronJob does NOT accept `agent`, so on edit this is a
@@ -670,7 +668,7 @@ export default function Cron() {
                       className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm appearance-none cursor-pointer"
                     >
                       {agentOptions.length === 0 ? (
-                        <option value="">no configured agents</option>
+                        <option value="">{t('cron.no_configured_agents')}</option>
                       ) : (
                         agentOptions.map((alias) => (
                           <option key={alias} value={alias}>
@@ -680,7 +678,7 @@ export default function Cron() {
                       )}
                     </select>
                     <p className="text-xs mt-1 text-pc-text-faint">
-                      Runs under this agent's risk profile, model provider, and channel bindings.
+                      {t('cron.agent_help')}
                     </p>
                   </>
                 )}
@@ -689,19 +687,19 @@ export default function Cron() {
                 <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
                   {t('cron.name_optional')}
                 </label>
-                <input type="text" value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="e.g. Daily cleanup" className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm" />
+                <input type="text" value={formName} onChange={(e) => setFormName(e.target.value)} placeholder={t('cron.name_placeholder')} className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm" />
               </div>
               <div>
                 <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
                   {t('cron.schedule_required')} <span className="text-status-error">*</span>
                 </label>
-                <input type="text" value={formSchedule} onChange={(e) => setFormSchedule(e.target.value)} placeholder="e.g. 0 0 * * * (cron expression)" className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm" />
+                <input type="text" value={formSchedule} onChange={(e) => setFormSchedule(e.target.value)} placeholder={t('cron.schedule_placeholder')} className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm" />
               </div>
               <div>
                 <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
                   {t('cron.timezone')}
                 </label>
-                <input type="text" value={formTimezone} onChange={(e) => setFormTimezone(e.target.value)} placeholder="e.g. America/New_York" className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm font-mono" />
+                <input type="text" value={formTimezone} onChange={(e) => setFormTimezone(e.target.value)} placeholder={t('cron.timezone_placeholder')} className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm font-mono" />
               </div>
 
               {/* Conditional fields based on job type */}
@@ -713,7 +711,7 @@ export default function Cron() {
                   <textarea
                     value={formCommand}
                     onChange={(e) => setFormCommand(e.target.value)}
-                    placeholder="e.g. cleanup --older-than 7d"
+                    placeholder={t('cron.command_placeholder')}
                     rows={4}
                     className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm resize-y font-mono"
                   />
@@ -744,7 +742,7 @@ export default function Cron() {
                           {t('cron.model_optional')}
                         </label>
                         <span className="inline-flex items-center px-3 py-2 rounded-[var(--radius-md)] text-sm font-medium border border-pc-border text-pc-text-secondary font-mono">
-                          {formModel.trim() || 'default'}
+                          {formModel.trim() || t('cron.model_default')}
                         </span>
                       </div>
                       <div>
@@ -760,7 +758,7 @@ export default function Cron() {
                           {t('cron.allowed_tools_optional')}
                         </label>
                         <span className="inline-flex items-center px-3 py-2 rounded-[var(--radius-md)] text-sm font-medium border border-pc-border text-pc-text-secondary font-mono break-all">
-                          {formAllowedTools.trim() || 'all tools'}
+                          {formAllowedTools.trim() || t('cron.all_tools')}
                         </span>
                       </div>
                     </>
@@ -842,42 +840,40 @@ export default function Cron() {
                 // instead of being hidden.
                 <div className="border-t border-pc-border pt-4">
                   <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
-                    Delivery
+                    {t('cron.delivery')}
                   </label>
                   {formDeliveryMode === 'announce' ? (
                     <div className="space-y-1.5 text-sm">
                       <div className="flex items-center gap-2">
-                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">mode</span>
-                        <span className="text-pc-text-secondary font-medium">announce</span>
+                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">{t('cron.delivery_mode')}</span>
+                        <span className="text-pc-text-secondary font-medium">{t('cron.delivery_announce')}</span>
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">channel</span>
+                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">{t('cron.delivery_channel')}</span>
                         <span className="text-pc-text-secondary font-mono break-all">{formDeliveryChannel || '-'}</span>
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">to</span>
+                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">{t('cron.delivery_to')}</span>
                         <span className="text-pc-text-secondary font-mono break-all">{formDeliveryTo || '-'}</span>
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">best-effort</span>
-                        <span className="text-pc-text-secondary">{formDeliveryBestEffort ? 'yes' : 'no'}</span>
+                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">{t('cron.delivery_best_effort')}</span>
+                        <span className="text-pc-text-secondary">{formDeliveryBestEffort ? t('cron.yes') : t('cron.no')}</span>
                       </div>
                     </div>
                   ) : (
                     <span className="inline-flex items-center px-3 py-2 rounded-[var(--radius-md)] text-sm font-medium border border-pc-border text-pc-text-secondary">
-                      none
+                      {t('cron.delivery_none')}
                     </span>
                   )}
                   <p className="text-xs mt-3 text-pc-text-faint">
-                    Agent, model, session target, allowed tools, and delivery are fixed after
-                    creation and can't be changed here — this endpoint only edits name, schedule,
-                    timezone, and the command/prompt. To change them, recreate the job.
+                    {t('cron.delivery_fixed_help')}
                   </p>
                 </div>
               ) : (
                 <div className="border-t border-pc-border pt-4">
                   <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
-                    Delivery
+                    {t('cron.delivery')}
                   </label>
                   <div className="flex gap-2 mb-2">
                     <button
@@ -888,7 +884,7 @@ export default function Cron() {
                           : 'border-pc-border text-pc-text-muted hover:bg-[var(--pc-hover)] hover:text-pc-text'
                         }`}
                     >
-                      none
+                      {t('cron.delivery_none')}
                     </button>
                     <button
                       type="button"
@@ -898,7 +894,7 @@ export default function Cron() {
                           : 'border-pc-border text-pc-text-muted hover:bg-[var(--pc-hover)] hover:text-pc-text'
                         }`}
                     >
-                      announce
+                      {t('cron.delivery_announce')}
                     </button>
                   </div>
                   {formDeliveryMode === 'announce' && (
@@ -910,8 +906,8 @@ export default function Cron() {
                       >
                         <option value="">
                           {boundChannels.length === 0
-                            ? 'no channels bound on this agent'
-                            : 'select a channel...'}
+                            ? t('cron.no_channels_bound')
+                            : t('cron.select_channel')}
                         </option>
                         {boundChannels.map((ch) => (
                           <option key={ch.composite} value={ch.composite}>
@@ -924,7 +920,7 @@ export default function Cron() {
                         type="text"
                         value={formDeliveryTo}
                         onChange={(e) => setFormDeliveryTo(e.target.value)}
-                        placeholder="target (room id, user id, channel id, address...)"
+                        placeholder={t('cron.delivery_to_placeholder')}
                         className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2 text-sm font-mono"
                       />
                       <label className="flex items-center gap-2 text-xs text-pc-text-muted">
@@ -934,12 +930,11 @@ export default function Cron() {
                           onChange={(e) => setFormDeliveryBestEffort(e.target.checked)}
                           className="accent-pc-accent"
                         />
-                        best-effort: log on failure, don't mark the job as errored
+                        {t('cron.delivery_best_effort_label')}
                       </label>
                       <p className="text-xs text-pc-text-faint">
-                        Channels from <code className="font-mono text-pc-text-secondary">agents.{formAgent || '<agent>'}.channels</code>.
-                        Picking one that isn't configured yet is allowed; the scheduler will warn
-                        loudly when the job fires.
+                        {t('cron.delivery_channels_from')} <code className="font-mono text-pc-text-secondary">agents.{formAgent || '<agent>'}.channels</code>.
+                        {' '}{t('cron.delivery_channels_warn')}
                       </p>
                     </div>
                   )}
@@ -1024,14 +1019,14 @@ export default function Cron() {
                             )
                           }
                           aria-expanded={expandedJob === job.id}
-                          title="Show this job's recent runs"
+                          title={t('cron.show_recent_runs')}
                         >
                           <ChevronDown
                             className={`h-3.5 w-3.5 shrink-0 transition-transform duration-150 ${
                               expandedJob === job.id ? 'rotate-180' : ''
                             }`}
                           />
-                          Run history
+                          {t('cron.run_history')}
                         </Button>
                       </div>
                     </td>

@@ -4,6 +4,7 @@ import { apiFetch } from '@/lib/api';
 import type { LogEvent, LogsQueryParams, LogsResponse } from '@/lib/api';
 import { usePolling } from '@/hooks/usePolling';
 import { Badge, Button, PageHeader } from '@/components/ui';
+import { t } from '@/lib/i18n';
 
 const DEFAULT_SEVERITY_MIN = 9;
 const PAGE_LIMIT = 200;
@@ -16,7 +17,7 @@ const SEVERITY_OPTIONS: { label: string; value: number | '' }[] = [
   { label: 'INFO+', value: 9 },
   { label: 'WARN+', value: 13 },
   { label: 'ERROR+', value: 17 },
-  { label: 'Any', value: '' },
+  { label: '', value: '' },
 ];
 
 const CATEGORY_OPTIONS = [
@@ -334,13 +335,14 @@ export default function Logs() {
           title={
             <span className="flex items-center gap-2">
               <Activity className="h-5 w-5 text-pc-accent" />
-              Logs
+              {t('logs.title')}
             </span>
           }
           actions={
             <>
               <Badge tone="neutral">
-                {events.length} events{atEnd ? ' · end' : ''}
+                {events.length} {t('logs.events')}
+                {atEnd ? ` · ${t('logs.at_end')}` : ''}
               </Badge>
               <Button
                 variant="ghost"
@@ -365,11 +367,11 @@ export default function Logs() {
               >
                 {paused ? (
                   <>
-                    <Play className="h-3.5 w-3.5" /> Resume
+                    <Play className="h-3.5 w-3.5" /> {t('logs.resume')}
                   </>
                 ) : (
                   <>
-                    <Pause className="h-3.5 w-3.5" /> Pause
+                    <Pause className="h-3.5 w-3.5" /> {t('logs.pause')}
                   </>
                 )}
               </Button>
@@ -380,7 +382,7 @@ export default function Logs() {
                 disabled={loading}
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-                Refresh
+                {t('common.refresh')}
               </Button>
             </>
           }
@@ -392,7 +394,7 @@ export default function Logs() {
           type="search"
           value={filter.q}
           onChange={(event) => setFilter((prev) => ({ ...prev, q: event.target.value }))}
-          placeholder="Search message + attributes"
+          placeholder={t('logs.search_placeholder')}
           className={`${CONTROL_CLASS} min-w-[220px] flex-1`}
         />
         <select
@@ -408,7 +410,7 @@ export default function Logs() {
         >
           {SEVERITY_OPTIONS.map((option) => (
             <option key={String(option.value)} value={option.value}>
-              {option.label}
+              {option.label || t('logs.severity_any')}
             </option>
           ))}
         </select>
@@ -419,7 +421,7 @@ export default function Logs() {
         >
           {CATEGORY_OPTIONS.map((option) => (
             <option key={option} value={option}>
-              {option || 'Any category'}
+              {option || t('logs.any_category')}
             </option>
           ))}
         </select>
@@ -430,7 +432,7 @@ export default function Logs() {
         >
           {OUTCOME_OPTIONS.map((option) => (
             <option key={option} value={option}>
-              {option || 'Any outcome'}
+              {option || t('logs.any_outcome')}
             </option>
           ))}
         </select>
@@ -450,7 +452,7 @@ export default function Logs() {
             }
             style={{ accentColor: 'var(--pc-accent)' }}
           />
-          Hide internal
+          {t('logs.hide_internal')}
         </label>
         <label className="flex items-center gap-1.5 text-[11px] cursor-pointer text-pc-text-muted">
           <input
@@ -461,7 +463,7 @@ export default function Logs() {
             }
             style={{ accentColor: 'var(--pc-accent)' }}
           />
-          Since daemon start
+          {t('logs.since_daemon_start')}
         </label>
         <button
           type="button"
@@ -495,7 +497,7 @@ export default function Logs() {
                 type="button"
                 onClick={() => setFieldEq(key, '')}
                 className="text-pc-text-faint hover:text-pc-text transition-colors"
-                aria-label={`Remove ${key} filter`}
+                aria-label={`${t('logs.remove_filter_prefix')}${key}${t('logs.remove_filter_suffix')}`}
               >
                 <X className="h-3 w-3" />
               </button>
@@ -514,7 +516,7 @@ export default function Logs() {
               className="px-2 py-1 text-[10px] rounded-[var(--radius-md)] border border-pc-border bg-pc-base text-pc-text"
             >
               <option value="" disabled>
-                Pick a key…
+                {t('logs.pick_a_key')}
               </option>
               {inactiveAttributionKeys.map((key) => (
                 <option key={key} value={key}>
@@ -529,7 +531,7 @@ export default function Logs() {
               disabled={inactiveAttributionKeys.length === 0}
               className="inline-flex items-center gap-1 px-2 py-0.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-base text-[10px] text-pc-text-muted transition-colors hover:text-pc-text disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              <Plus className="h-3 w-3" /> Add filter
+              <Plus className="h-3 w-3" /> {t('logs.add_filter')}
             </button>
           )}
           {activeFieldKeys.length > 0 && (
@@ -538,7 +540,7 @@ export default function Logs() {
               onClick={() => setFilter((prev) => ({ ...prev, fieldEq: {} }))}
               className="text-[10px] ml-1 text-pc-accent hover:underline"
             >
-              clear
+              {t('logs.clear_filters')}
             </button>
           )}
         </div>
@@ -554,7 +556,7 @@ export default function Logs() {
         {events.length === 0 && !loading ? (
           <div className="flex flex-col items-center justify-center h-full text-pc-text-muted">
             <Activity className="h-10 w-10 mb-3 text-pc-text-faint" />
-            <p className="text-sm">No events match the current filters.</p>
+            <p className="text-sm">{t('logs.no_events')}</p>
           </div>
         ) : (
           events.map((event) => (
@@ -574,7 +576,7 @@ export default function Logs() {
               onClick={() => void loadOlder()}
               disabled={loadingOlder || !cursorOlder}
             >
-              {loadingOlder ? 'Loading…' : 'Load older'}
+              {loadingOlder ? t('common.loading') : t('logs.load_older')}
             </Button>
           </div>
         )}
@@ -602,7 +604,7 @@ function FilterableValue({
       <button
         type="button"
         onClick={onClick}
-        title={`Filter logs where ${attrKey} = ${value}`}
+        title={`${t('logs.filter_where_prefix')}${attrKey} = ${value}`}
         className="rounded-[var(--radius-sm)] px-0.5 -mx-0.5 text-pc-text-muted transition-colors hover:bg-pc-accent/10 hover:text-pc-accent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-pc-accent cursor-pointer"
       >
         {value}
@@ -645,7 +647,7 @@ function LogRow({
           <button
             type="button"
             onClick={() => onFilterAction(event.event.action)}
-            title={`Filter logs where event.action = ${event.event.action}`}
+            title={`${t('logs.filter_where_prefix')}event.action = ${event.event.action}`}
             className="rounded-[var(--radius-sm)] px-0.5 -mx-0.5 transition-colors hover:bg-pc-accent/10 hover:text-pc-accent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-pc-accent cursor-pointer"
           >
             {event.event.action}
@@ -680,7 +682,7 @@ function LogRow({
           {event.attributes && Object.keys(event.attributes).length > 0 && (
             <details className="mt-1">
               <summary className="cursor-pointer text-[10px] text-pc-text-faint">
-                attributes ({Object.keys(event.attributes).length})
+                {t('logs.attributes')} ({Object.keys(event.attributes).length})
               </summary>
               <pre className="mt-1 p-2 rounded text-[10px] overflow-x-auto border border-pc-border bg-pc-base text-pc-text-muted">
                 {JSON.stringify(event.attributes, null, 2)}

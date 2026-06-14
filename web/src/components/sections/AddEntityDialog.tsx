@@ -24,6 +24,7 @@ import {
 } from "../../lib/api";
 import SectionPicker from "./SectionPicker";
 import { Button } from "@/components/ui";
+import { t } from "@/lib/i18n";
 
 function suggestAlias(aliases: string[]): string {
   const used = new Set(aliases);
@@ -37,7 +38,7 @@ function suggestAlias(aliases: string[]): string {
 
 function validateAlias(alias: string): string | null {
   if (/^(?!_)(?!.*__)(?!.*_$)[a-z0-9_]{1,63}$/.test(alias)) return null;
-  return "Alias must use lowercase letters, digits, or single underscores only; no hyphens, dots, spaces, leading/trailing underscores, or double underscores.";
+  return t("add_entity.alias_invalid");
 }
 
 interface AddEntityDialogProps {
@@ -136,12 +137,13 @@ export default function AddEntityDialog({
       >
         <div className="flex items-center justify-between gap-3">
           <h2 className="text-base font-semibold text-pc-text">
-            Add to {section.label}
+            {t("add_entity.add_to_prefix")}
+            {section.label}
           </h2>
           <button
             type="button"
             onClick={onClose}
-            aria-label="Close"
+            aria-label={t("common.close")}
             className="btn-icon flex-shrink-0"
           >
             <X className="h-4 w-4" />
@@ -178,14 +180,11 @@ export default function AddEntityDialog({
                 className="self-start flex items-center gap-1 text-xs text-pc-text-muted hover:text-pc-text"
               >
                 <ArrowLeft className="h-3.5 w-3.5" />
-                Choose a different type ({type})
+                {t("add_entity.choose_different_type")} ({type})
               </button>
             )}
             <p className="text-xs text-pc-text-secondary leading-relaxed">
-              A short stable name you'll use elsewhere in config to point at
-              this entry. Lowercase letters, digits, single underscores; 1–63
-              chars; no leading/trailing/double underscores, dots, hyphens, or
-              spaces.
+              {t("add_entity.alias_help")}
             </p>
             <div className="flex items-center gap-2">
               <input
@@ -209,7 +208,7 @@ export default function AddEntityDialog({
                 disabled={submitting}
                 className="flex-shrink-0"
               >
-                {submitting ? "Adding…" : "Add"}
+                {submitting ? t("add_entity.adding") : t("add_entity.add")}
               </Button>
             </div>
           </div>

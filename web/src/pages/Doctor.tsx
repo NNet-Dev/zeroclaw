@@ -65,7 +65,7 @@ function remediationTarget(result: DiagResult): RemediationTarget | null {
     return {
       prefix: `channels.${rawType}.${rawAlias}`,
       href: `/config/channels/${type}/${alias}`,
-      label: 'Open config',
+      label: t('doctor.open_config'),
     };
   }
   // `provider` is word-bounded so it doesn't match inside unrelated words; the
@@ -79,7 +79,7 @@ function remediationTarget(result: DiagResult): RemediationTarget | null {
     return {
       prefix: `providers.models.${rawType}.${rawAlias}`,
       href: `/config/providers.models/${type}/${alias}${tab}`,
-      label: 'Open config',
+      label: t('doctor.open_config'),
     };
   }
   return null;
@@ -95,7 +95,7 @@ function fallbackLink(result: DiagResult): [string, string] | null {
   switch (result.category) {
     case 'config':
     case 'workspace':
-      return ['/config', 'Open config'];
+      return ['/config', t('doctor.open_config')];
     default:
       return null;
   }
@@ -127,7 +127,7 @@ function SeverityFilterToggle({
       type="button"
       onClick={onToggle}
       aria-pressed={active}
-      title={active ? `Hide ${label}` : `Show ${label}`}
+      title={active ? `${t('doctor.hide_prefix')}${label}` : `${t('doctor.show_prefix')}${label}`}
       className={[
         'inline-flex items-center gap-2 rounded-[var(--radius-md)] border px-2.5 py-1 transition-colors duration-150 cursor-pointer select-none',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
@@ -174,7 +174,7 @@ export default function Doctor() {
       const data = await runDoctor();
       setResults(data);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to run diagnostics');
+      setError(err instanceof Error ? err.message : t('doctor.run_failed'));
     } finally {
       setLoading(false);
     }
@@ -257,21 +257,21 @@ export default function Doctor() {
             <SeverityFilterToggle
               active={!hidden.has('ok')}
               count={okCount}
-              label="ok"
+              label={t('doctor.severity_ok')}
               icon={<CheckCircle className="h-5 w-5 text-status-success" />}
               onToggle={() => toggleSeverity('ok')}
             />
             <SeverityFilterToggle
               active={!hidden.has('warn')}
               count={warnCount}
-              label={`warning${warnCount !== 1 ? 's' : ''}`}
+              label={t('doctor.severity_warnings')}
               icon={<AlertTriangle className="h-5 w-5 text-status-warning" />}
               onToggle={() => toggleSeverity('warn')}
             />
             <SeverityFilterToggle
               active={!hidden.has('error')}
               count={errorCount}
-              label={`error${errorCount !== 1 ? 's' : ''}`}
+              label={t('doctor.severity_errors')}
               icon={<XCircle className="h-5 w-5 text-status-error" />}
               onToggle={() => toggleSeverity('error')}
             />
@@ -291,7 +291,7 @@ export default function Doctor() {
           {/* All severities toggled off → nothing to show. */}
           {filtered.length === 0 && results.length > 0 && (
             <Card className="text-sm text-center text-pc-text-muted py-8">
-              No findings match the active severity filter.
+              {t('doctor.no_filter_match')}
             </Card>
           )}
 

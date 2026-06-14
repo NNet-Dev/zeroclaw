@@ -216,7 +216,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           onKeyDown={(e) => { if (e.key === 'Escape') onClose(); }}
           role="button"
           tabIndex={-1}
-          aria-label="Close menu"
+          aria-label={t('sidebar.close_menu')}
         />
       )}
 
@@ -256,7 +256,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           open ? 'translate-x-0' : '-translate-x-full',
         ].join(' ')}
         style={{ background: 'var(--pc-bg-sidebar)', borderColor: 'var(--pc-border)' }}
-        aria-label="Mobile menu"
+        aria-label={t('sidebar.mobile_menu')}
       >
         <DrawerLogo />
         <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
@@ -286,7 +286,7 @@ function RailLogo() {
         />
         <img
           src={`${basePath}/_app/zeroclaw-trans.png`}
-          alt="ZeroClaw"
+          alt={t('sidebar.logo_alt')}
           className="relative h-8 w-8 rounded-xl object-cover"
           onError={(e) => {
             e.currentTarget.style.display = 'none';
@@ -311,7 +311,7 @@ function DrawerLogo() {
         />
         <img
           src={`${basePath}/_app/zeroclaw-trans.png`}
-          alt="ZeroClaw"
+          alt={t('sidebar.logo_alt')}
           className="relative h-9 w-9 rounded-xl object-cover"
           onError={(e) => {
             e.currentTarget.style.display = 'none';
@@ -322,7 +322,7 @@ function DrawerLogo() {
         className="text-sm font-semibold tracking-wide whitespace-nowrap"
         style={{ color: 'var(--pc-text-primary)' }}
       >
-        ZeroClaw
+        {t('sidebar.brand')}
       </span>
     </div>
   );
@@ -348,7 +348,7 @@ function RailFooter() {
     <div
       className="border-t shrink-0 flex items-center justify-center"
       style={{ borderColor: 'var(--pc-border)', padding: '10px 0' }}
-      title={version ? `ZeroClaw Gateway v${version}` : 'ZeroClaw Gateway'}
+      title={version ? `${t('sidebar.gateway')} v${version}` : t('sidebar.gateway')}
     >
       {version && (
         <span style={{ fontSize: '9px', color: 'var(--pc-text-faint)' }}>
@@ -367,7 +367,7 @@ function DrawerFooter() {
       className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
       style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
     >
-      ZeroClaw Gateway
+      {t('sidebar.gateway')}
       {version && (
         <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
           v{version}

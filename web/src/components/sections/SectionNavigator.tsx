@@ -28,6 +28,7 @@ import {
   type SectionInfo,
 } from "../../lib/api";
 import { fuzzyFilter } from "../../lib/fuzzy";
+import { t } from "@/lib/i18n";
 
 // One selectable entity under a section. `url` is the entity's existing
 // form URL; `mapPath` is the dotted map path it lives under (used so the
@@ -326,7 +327,7 @@ export default function SectionNavigator({
     if (ents === "loading" || ents === undefined) {
       return (
         <div className="pl-7 pr-3 py-1.5 text-xs text-pc-text-faint">
-          Loading…
+          {t('common.loading')}
         </div>
       );
     }
@@ -340,7 +341,7 @@ export default function SectionNavigator({
     if (ents.length === 0) {
       return (
         <div className="pl-7 pr-3 py-1.5 text-xs text-pc-text-faint italic">
-          Nothing configured yet
+          {t('section_nav.empty')}
         </div>
       );
     }
@@ -380,7 +381,7 @@ export default function SectionNavigator({
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search settings…"
+            placeholder={t('section_nav.search_placeholder')}
             className="w-full pl-8 pr-3 py-2 text-sm rounded-[var(--radius-md)] bg-pc-input border border-pc-border text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:border-pc-border-strong focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
           />
         </div>
@@ -389,7 +390,7 @@ export default function SectionNavigator({
       <nav
         ref={navRef}
         role="tree"
-        aria-label="Settings sections"
+        aria-label={t('section_nav.tree_label')}
         onKeyDown={onTreeKeyDown}
         className="flex-1 overflow-y-auto py-2"
       >
@@ -453,7 +454,7 @@ export default function SectionNavigator({
             </div>
           ) : (
             <div className="px-3 py-6 text-sm text-center text-pc-text-muted">
-              No matches.
+              {t('section_nav.no_matches')}
             </div>
           )
         ) : (
@@ -490,7 +491,7 @@ export default function SectionNavigator({
                         <button
                           type="button"
                           onClick={() => toggle(s.key)}
-                          aria-label={isOpen ? "Collapse" : "Expand"}
+                          aria-label={isOpen ? t('section_nav.collapse') : t('section_nav.expand')}
                           aria-expanded={isOpen}
                           className="flex-shrink-0 p-1.5 text-pc-text-muted hover:text-pc-text"
                         >
@@ -534,8 +535,8 @@ export default function SectionNavigator({
                         <button
                           type="button"
                           onClick={() => onAddToSection(s)}
-                          title={`Add to ${s.label}`}
-                          aria-label={`Add to ${s.label}`}
+                          title={`${t('section_nav.add_to_prefix')}${s.label}`}
+                          aria-label={`${t('section_nav.add_to_prefix')}${s.label}`}
                           // Always visible on touch (no hover); hover-reveal on
                           // desktop only. Was opacity-0 unconditionally, so the
                           // add affordance never appeared on mobile.

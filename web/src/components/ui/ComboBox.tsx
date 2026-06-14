@@ -10,6 +10,7 @@
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Check, ChevronsUpDown } from "lucide-react";
+import { t } from "@/lib/i18n";
 
 export interface ComboBoxProps {
   /** Current value. Free text is allowed — not restricted to `options`. */
@@ -33,7 +34,7 @@ export function ComboBox({
   options,
   id,
   placeholder,
-  emptyText = "No matches",
+  emptyText = t("combobox.no_matches"),
   className = "",
   "aria-label": ariaLabel,
 }: ComboBoxProps) {
@@ -140,7 +141,7 @@ export function ComboBox({
         <button
           type="button"
           tabIndex={-1}
-          aria-label={open ? "Close list" : "Open list"}
+          aria-label={open ? t("combobox.close_list") : t("combobox.open_list")}
           // mousedown (not click) + preventDefault keeps focus on the input so
           // there's no focus→reopen race when toggling closed.
           onMouseDown={(e) => {

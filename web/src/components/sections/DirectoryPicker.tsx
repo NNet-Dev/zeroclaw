@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowUp, FolderOpen, ChevronRight, RefreshCw, FolderPlus, Trash2 } from 'lucide-react';
 import { Button, ConfirmDialog } from '@/components/ui';
+import { t } from '@/lib/i18n';
 import {
   ApiError,
   browseShared,
@@ -115,7 +116,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
     const name = newDirName.trim();
     if (!name) return;
     if (name.includes('/') || name.includes('\\')) {
-      setError("Directory name cannot contain '/' or '\\\\'");
+      setError(t('dir_picker.name_no_slashes'));
       return;
     }
     const target = cwd ? `${cwd}/${name}` : name;
@@ -173,7 +174,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
       tabIndex={-1}
       className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface shadow-[var(--pc-shadow-md)] overflow-hidden focus:outline-none"
       role="dialog"
-      aria-label="Directory picker"
+      aria-label={t('dir_picker.aria_label')}
     >
       <div className="flex items-center gap-2 px-3 py-2 border-b border-pc-border text-xs text-pc-text-secondary">
         <FolderOpen className="h-3.5 w-3.5 flex-shrink-0" />
@@ -183,8 +184,8 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
         <button
           type="button"
           onClick={() => setCreating((v) => !v)}
-          title="New folder here"
-          aria-label="New folder here"
+          title={t('dir_picker.new_folder_here')}
+          aria-label={t('dir_picker.new_folder_here')}
           className="h-6 w-6 inline-flex items-center justify-center rounded-[var(--radius-sm)] text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface"
         >
           <FolderPlus className="h-3.5 w-3.5" />
@@ -192,8 +193,8 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
         <button
           type="button"
           onClick={reload}
-          title="Refresh"
-          aria-label="Refresh"
+          title={t('common.refresh')}
+          aria-label={t('common.refresh')}
           className="h-6 w-6 inline-flex items-center justify-center rounded-[var(--radius-sm)] text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface"
         >
           <RefreshCw className="h-3.5 w-3.5" />
@@ -213,7 +214,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
                 setNewDirName('');
               }
             }}
-            placeholder="new folder name"
+            placeholder={t('dir_picker.new_folder_placeholder')}
             className="input-electric flex-1 px-2 py-1 text-xs"
             autoFocus
           />
@@ -223,7 +224,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
             onClick={() => void handleCreate()}
             disabled={!newDirName.trim()}
           >
-            Create
+            {t('dir_picker.create')}
           </Button>
           <Button
             size="sm"
@@ -233,7 +234,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
               setNewDirName('');
             }}
           >
-            Cancel
+            {t('common.cancel')}
           </Button>
         </div>
       )}
@@ -247,7 +248,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
               className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left text-pc-text-secondary transition-colors hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--pc-focus)]"
             >
               <ArrowUp className="h-3.5 w-3.5 flex-shrink-0" />
-              .. (up one level)
+              {t('dir_picker.up_one_level')}
             </button>
           </li>
         )}
@@ -264,7 +265,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
           </li>
         ) : entries.length === 0 ? (
           <li className="px-3 py-3 text-xs italic text-pc-text-faint">
-            (empty)
+            {t('dir_picker.empty')}
           </li>
         ) : (
           entries.map((entry) => (
@@ -284,8 +285,8 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
                     type="button"
                     onClick={() => setPendingDelete(entry.name)}
                     disabled={busyDir === entry.name}
-                    title={`Delete shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
-                    aria-label={`Delete shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
+                    title={`${t('dir_picker.delete_prefix')}shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
+                    aria-label={`${t('dir_picker.delete_prefix')}shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
                     className="px-2 text-status-error opacity-60 transition-colors hover:opacity-100 hover:bg-status-error/10 disabled:opacity-30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--pc-focus)]"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
@@ -309,19 +310,19 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
 
       <div className="flex items-center justify-between gap-2 px-3 py-2 border-t border-pc-border">
         <span className="text-xs text-pc-text-faint">
-          Picks a directory relative to <code>shared/</code>.
+          {t('dir_picker.relative_hint_prefix')}<code>shared/</code>{t('dir_picker.relative_hint_suffix')}
         </span>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="ghost" onClick={onClose}>
-            Cancel
+            {t('common.cancel')}
           </Button>
           <Button
             size="sm"
             variant="primary"
             onClick={() => onSelect(cwd ? `shared/${cwd}` : 'shared')}
-            title="Use this directory"
+            title={t('dir_picker.use_this_title')}
           >
-            Use this
+            {t('dir_picker.use_this')}
           </Button>
         </div>
       </div>
@@ -332,11 +333,11 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
       <ConfirmDialog
         open={pendingDelete !== null}
         danger
-        title="Delete directory?"
-        message={`Delete shared/${
+        title={t('dir_picker.delete_dialog_title')}
+        message={`${t('dir_picker.delete_prefix')}shared/${
           cwd ? `${cwd}/${pendingDelete}` : pendingDelete
-        }? This removes the directory and everything inside it.`}
-        confirmLabel="Delete"
+        }${t('dir_picker.delete_dialog_suffix')}`}
+        confirmLabel={t('common.delete')}
         onConfirm={() => {
           if (pendingDelete !== null) void confirmDelete(pendingDelete);
           setPendingDelete(null);

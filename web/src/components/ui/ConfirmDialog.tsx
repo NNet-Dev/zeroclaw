@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, type ReactNode } from 'react';
 import { Button } from '@/components/ui/Button';
+import { t } from '@/lib/i18n';
 
 export interface ConfirmDialogProps {
   /** Whether the dialog is mounted/visible. */
@@ -34,8 +35,8 @@ export function ConfirmDialog({
   open,
   title,
   message,
-  confirmLabel = 'Confirm',
-  cancelLabel = 'Cancel',
+  confirmLabel = t('common.confirm'),
+  cancelLabel = t('common.cancel'),
   danger = false,
   onConfirm,
   onClose,

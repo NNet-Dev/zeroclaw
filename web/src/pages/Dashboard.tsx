@@ -153,7 +153,7 @@ function ProcessRamCard({ process }: { process?: ProcessStats }) {
           className="text-xs uppercase tracking-wider font-medium"
           style={{ color: "var(--pc-text-muted)" }}
         >
-          RAM
+          {t("dashboard.ram.label")}
         </span>
       </div>
       <p
@@ -193,7 +193,7 @@ function ProcessCpuCard({ process }: { process?: ProcessStats }) {
           className="text-xs uppercase tracking-wider font-medium"
           style={{ color: "var(--pc-text-muted)" }}
         >
-          CPU
+          {t("dashboard.cpu.label")}
         </span>
       </div>
       <p
@@ -234,13 +234,13 @@ function formatRelative(iso: string): string {
   try {
     const diff = Date.now() - new Date(iso).getTime();
     const seconds = Math.floor(diff / 1000);
-    if (seconds < 60) return `${seconds}s ago`;
+    if (seconds < 60) return `${seconds}${t("dashboard.rel.seconds_ago")}`;
     const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ago`;
+    if (minutes < 60) return `${minutes}${t("dashboard.rel.minutes_ago")}`;
     const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
+    if (hours < 24) return `${hours}${t("dashboard.rel.hours_ago")}`;
     const days = Math.floor(hours / 24);
-    return `${days}d ago`;
+    return `${days}${t("dashboard.rel.days_ago")}`;
   } catch {
     return iso;
   }
@@ -568,7 +568,7 @@ function OverviewTab({
                     id={name}
                     className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all hover:opacity-90"
                     style={{ background: "var(--pc-bg-elevated)" }}
-                    title={`Open channels.${name} config`}
+                    title={`${t("dashboard.open_config_prefix")}channels.${name}${t("dashboard.open_config_suffix")}`}
                   >
                     <span
                       className="text-sm font-mono font-medium"
@@ -697,8 +697,8 @@ function OverviewTab({
                         style={{ color: "var(--pc-text-muted)" }}
                       >
                         {lastOk && (
-                          <span title={`last ok: ${lastOk}`}>
-                            ok {formatRelative(lastOk)}
+                          <span title={`${t("dashboard.last_ok_title")} ${lastOk}`}>
+                            {t("dashboard.ok_prefix")} {formatRelative(lastOk)}
                           </span>
                         )}
                         {comp.restart_count > 0 && (
@@ -770,7 +770,7 @@ function OverviewTab({
                       color: "var(--pc-text-muted)",
                     }}
                   >
-                    {tui.peer_label || tui.transport || "unknown"}
+                    {tui.peer_label || tui.transport || t("dashboard.unknown")}
                   </span>
                 </div>
                 <span
@@ -1136,7 +1136,7 @@ function SessionsTab() {
                         background: "rgba(var(--pc-accent-rgb), 0.10)",
                         color: "var(--pc-accent-light)",
                       }}
-                      title={`Open agents.${session.agent_alias} config`}
+                      title={`${t("dashboard.open_config_prefix")}agents.${session.agent_alias}${t("dashboard.open_config_suffix")}`}
                     >
                       {session.agent_alias}
                     </EntityLink>
@@ -1150,7 +1150,7 @@ function SessionsTab() {
                         background: "rgba(167, 139, 250, 0.10)",
                         color: "#a78bfa",
                       }}
-                      title={`Open channels.${session.channel_id} config`}
+                      title={`${t("dashboard.open_config_prefix")}channels.${session.channel_id}${t("dashboard.open_config_suffix")}`}
                     >
                       {session.channel_id}
                     </EntityLink>
@@ -1471,7 +1471,7 @@ function ChannelsTab() {
                   kind="channel"
                   id={channel.name}
                   className="text-sm font-semibold font-mono break-all hover:underline"
-                  title={`Open channels.${channel.name} config`}
+                  title={`${t("dashboard.open_config_prefix")}channels.${channel.name}${t("dashboard.open_config_suffix")}`}
                 >
                   <span style={{ color: "var(--pc-text-primary)" }}>
                     {channel.name}
@@ -1488,7 +1488,7 @@ function ChannelsTab() {
                         kind="agent"
                         id={channel.owning_agent}
                         className="hover:underline font-mono"
-                        title={`Open agents.${channel.owning_agent} config`}
+                        title={`${t("dashboard.open_config_prefix")}agents.${channel.owning_agent}${t("dashboard.open_config_suffix")}`}
                       >
                         {channel.owning_agent}
                       </EntityLink>
@@ -1838,8 +1838,8 @@ function HealthTab({ status }: { status: StatusResponse }) {
                 style={{ color: "var(--pc-text-muted)" }}
               >
                 {lastOk && (
-                  <span title={`last ok: ${lastOk}`}>
-                    ok {formatRelative(lastOk)}
+                  <span title={`${t("dashboard.last_ok_title")} ${lastOk}`}>
+                    {t("dashboard.ok_prefix")} {formatRelative(lastOk)}
                   </span>
                 )}
                 {comp.restart_count > 0 && (
@@ -2415,7 +2415,7 @@ function MemoriesTab() {
                         background: "rgba(var(--pc-accent-rgb), 0.10)",
                         color: "var(--pc-accent-light)",
                       }}
-                      title={`Open agents.${entry.agent_alias} config`}
+                      title={`${t("dashboard.open_config_prefix")}agents.${entry.agent_alias}${t("dashboard.open_config_suffix")}`}
                     >
                       {entry.agent_alias}
                     </EntityLink>
@@ -2769,7 +2769,9 @@ function AgentsSection() {
     loadAgentSummaries()
       .then(setAgents)
       .catch((err: unknown) =>
-        setError(err instanceof Error ? err.message : "Failed to load agents"),
+        setError(
+          err instanceof Error ? err.message : t("dashboard.load_agents_error"),
+        ),
       );
   }, []);
 
@@ -2797,7 +2799,9 @@ function AgentsSection() {
       );
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : `Failed to toggle ${agent.alias}`,
+        err instanceof Error
+          ? err.message
+          : `${t("dashboard.toggle_agent_error_prefix")} ${agent.alias}`,
       );
     } finally {
       setToggling((prev) => {

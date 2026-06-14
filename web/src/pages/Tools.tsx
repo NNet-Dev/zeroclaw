@@ -62,9 +62,9 @@ function isToolAllowed(tool: string, a: ProfileAccess): boolean {
 }
 
 function accessReason(tool: string, a: ProfileAccess): string {
-  if (a.excluded.includes(tool)) return 'excluded';
-  if (a.allowed.length === 0) return 'all tools allowed';
-  return a.allowed.includes(tool) ? 'in allowlist' : 'not in allowlist';
+  if (a.excluded.includes(tool)) return t('tools.reason_excluded');
+  if (a.allowed.length === 0) return t('tools.reason_all_allowed');
+  return a.allowed.includes(tool) ? t('tools.reason_in_allowlist') : t('tools.reason_not_in_allowlist');
 }
 
 export default function Tools() {
@@ -196,12 +196,11 @@ export default function Tools() {
         title={t('tools.title')}
         description={
           <>
-            This catalog lists every tool the agent can call. Expand a tool to
-            allow or block it per risk profile (gated via{' '}
+            {t('tools.description_prefix')}{' '}
             <code className="rounded-[var(--radius-sm)] px-1 py-0.5 text-[0.85em] font-mono bg-pc-code text-pc-text-secondary">
               risk_profiles.&lt;name&gt;.allowed_tools
             </code>
-            ).
+            {t('tools.description_suffix')}
           </>
         }
         actions={
@@ -222,7 +221,7 @@ export default function Tools() {
               to="/config/risk_profiles"
               className="inline-flex items-center justify-center gap-1.5 h-9 px-3.5 text-sm font-medium whitespace-nowrap rounded-[var(--radius-md)] border border-pc-border bg-transparent text-pc-text-secondary transition-colors duration-150 hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
             >
-              Configure tool access
+              {t('tools.configure_access')}
               <ArrowRight className="h-3.5 w-3.5" />
             </Link>
           </div>
@@ -386,13 +385,13 @@ function ToolAccessMatrix({
 }) {
   if (access === null && accessError === null) {
     return (
-      <p className="text-xs text-pc-text-faint">Loading risk profiles…</p>
+      <p className="text-xs text-pc-text-faint">{t('tools.loading_profiles')}</p>
     );
   }
   if (accessError && !access) {
     return (
       <p className="text-xs text-status-error">
-        Couldn't load risk profiles: {accessError}
+        {t('tools.load_profiles_error')}: {accessError}
       </p>
     );
   }
@@ -400,7 +399,7 @@ function ToolAccessMatrix({
   return (
     <div className="space-y-2">
       <p className="text-[10px] font-semibold uppercase tracking-wider text-pc-text-faint">
-        Tool access by risk profile
+        {t('tools.access_by_profile')}
       </p>
       {accessError && (
         <p className="text-xs text-status-error">{accessError}</p>
@@ -418,7 +417,7 @@ function ToolAccessMatrix({
                 <Link
                   to={`/config/risk_profiles/${encodeURIComponent(profile)}`}
                   className="text-sm font-mono text-pc-text-secondary hover:text-pc-accent truncate inline-flex items-center gap-1"
-                  title={`Open ${profile} in config`}
+                  title={`${t('tools.open_profile_prefix')}${profile}${t('tools.open_profile_suffix')}`}
                 >
                   {profile}
                   <ExternalLink className="h-3 w-3 flex-shrink-0 opacity-60" />
@@ -431,7 +430,11 @@ function ToolAccessMatrix({
                 type="button"
                 onClick={() => onToggle(profile, tool, !allowed)}
                 aria-pressed={allowed}
-                title={allowed ? `Block ${tool} in ${profile}` : `Allow ${tool} in ${profile}`}
+                title={
+                  allowed
+                    ? `${t('tools.block_prefix')}${tool}${t('tools.in_profile_mid')}${profile}`
+                    : `${t('tools.allow_prefix')}${tool}${t('tools.in_profile_mid')}${profile}`
+                }
                 className={[
                   'flex-shrink-0 inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors',
                   allowed
@@ -444,16 +447,15 @@ function ToolAccessMatrix({
                 ) : (
                   <ShieldX className="h-3.5 w-3.5" />
                 )}
-                {allowed ? 'Allowed' : 'Blocked'}
+                {allowed ? t('tools.allowed') : t('tools.blocked')}
               </button>
             </li>
           );
         })}
       </ul>
       <p className="text-[11px] text-pc-text-faint">
-        Changes edit <code className="font-mono">allowed_tools</code> /{' '}
-        <code className="font-mono">excluded_tools</code> and apply on the next
-        daemon reload.
+        {t('tools.changes_edit_prefix')} <code className="font-mono">allowed_tools</code> /{' '}
+        <code className="font-mono">excluded_tools</code> {t('tools.changes_edit_suffix')}
       </p>
     </div>
   );

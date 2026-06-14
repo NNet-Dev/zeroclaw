@@ -27,6 +27,7 @@ import {
   quickstartFields,
 } from "@/lib/api";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
+import { t } from "@/lib/i18n";
 
 // Shared tokenized field control classes. Calm input surface with an accent
 // focus ring — replaces the legacy `input-electric` utility.
@@ -216,22 +217,22 @@ export default function Quickstart() {
   // Required-step progress for the wizard stepper. Channels / peer groups /
   // personality files are optional and intentionally excluded from the gate.
   const steps = [
-    { label: "Provider", done: providerDone },
-    { label: "Risk", done: riskDone },
-    { label: "Memory", done: memoryDone },
-    { label: "Agent", done: agentDone },
+    { label: t("quickstart.step_provider"), done: providerDone },
+    { label: t("quickstart.step_risk"), done: riskDone },
+    { label: t("quickstart.step_memory"), done: memoryDone },
+    { label: t("quickstart.step_agent"), done: agentDone },
   ];
   const completedCount = steps.filter((s) => s.done).length;
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-8 space-y-5">
       <PageHeader
-        title="Quickstart"
-        description="Create one working agent end-to-end. Pick a provider, choose your profiles, and start chatting."
+        title={t("quickstart.title")}
+        description={t("quickstart.description")}
         actions={
           <div className="flex items-center gap-3">
             <Badge tone={allDone ? "ok" : "neutral"}>
-              {completedCount}/{steps.length} required
+              {completedCount}/{steps.length} {t("quickstart.required")}
             </Badge>
             <Button
               variant="ghost"
@@ -249,9 +250,9 @@ export default function Quickstart() {
                 });
                 navigate("/");
               }}
-              title="Leave setup and go to the dashboard"
+              title={t("quickstart.skip_setup_title")}
             >
-              Skip setup
+              {t("quickstart.skip_setup")}
             </Button>
           </div>
         }
@@ -261,7 +262,7 @@ export default function Quickstart() {
 
       <Section
         icon={<Cpu className="h-4 w-4" />}
-        title="Model provider"
+        title={t("quickstart.model_provider_title")}
         done={providerDone}
         summary={
           form.provider
@@ -272,7 +273,7 @@ export default function Quickstart() {
         {form.provider ? (
           <StagedRow
             label={`${form.provider.provider_type}.${form.provider.alias}`}
-            sub={`model: ${form.provider.model}`}
+            sub={`${t("quickstart.model_prefix")}${form.provider.model}`}
             onRemove={() => setForm((f) => ({ ...f, provider: null }))}
           />
         ) : (
@@ -288,7 +289,7 @@ export default function Quickstart() {
 
       <PresetSection
         icon={<ShieldCheck className="h-4 w-4" />}
-        title="Risk profile"
+        title={t("quickstart.risk_profile_title")}
         rows={(state?.risk_presets ?? []).map((p) => ({
           value: p.preset_name,
           label: p.label,
@@ -303,7 +304,7 @@ export default function Quickstart() {
 
       <PresetSection
         icon={<Cpu className="h-4 w-4" />}
-        title="Runtime profile"
+        title={t("quickstart.runtime_profile_title")}
         rows={(state?.runtime_presets ?? []).map((p) => ({
           value: p.preset_name,
           label: p.label,
@@ -318,7 +319,7 @@ export default function Quickstart() {
 
       <PresetSection
         icon={<HardDrive className="h-4 w-4" />}
-        title="Memory"
+        title={t("quickstart.memory_title")}
         rows={(state?.memory_kinds ?? []).map((k) => ({
           value: k,
           label: k,
@@ -333,12 +334,12 @@ export default function Quickstart() {
 
       <Section
         icon={<Radio className="h-4 w-4" />}
-        title="Channels"
+        title={t("quickstart.channels_title")}
         done={true}
         summary={
           form.channels.length === 0
-            ? "none — reachable via CLI"
-            : `${form.channels.length} configured`
+            ? t("quickstart.channels_none")
+            : `${form.channels.length} ${t("quickstart.configured_suffix")}`
         }
       >
         <ChannelsList
@@ -368,12 +369,12 @@ export default function Quickstart() {
 
       <Section
         icon={<Users className="h-4 w-4" />}
-        title="Peer groups"
+        title={t("quickstart.peer_groups_title")}
         done={true}
         summary={
           form.peerGroups.length === 0
-            ? "none — channels accept no peers"
-            : `${form.peerGroups.length} configured`
+            ? t("quickstart.peer_groups_none")
+            : `${form.peerGroups.length} ${t("quickstart.configured_suffix")}`
         }
       >
         <PeerGroupsList
@@ -394,29 +395,29 @@ export default function Quickstart() {
 
       <Section
         icon={<Bot className="h-4 w-4" />}
-        title="Agent"
+        title={t("quickstart.agent_title")}
         done={form.agentName.trim() !== ""}
         summary={form.agentName.trim() || null}
       >
         <LabeledInput
-          label="Name"
+          label={t("common.name")}
           value={form.agentName}
           onChange={(v) => {
             setForm((f) => ({ ...f, agentName: v }));
             recordStep("agent");
           }}
-          placeholder="some_nickname"
+          placeholder={t("quickstart.agent_name_placeholder")}
         />
       </Section>
 
       <Section
         icon={<FileText className="h-4 w-4" />}
-        title="Personality files"
+        title={t("quickstart.personality_files_title")}
         done={true}
         summary={
           form.personalityFiles.length === 0
-            ? "none — agent uses bootstrap defaults"
-            : `${form.personalityFiles.length} staged`
+            ? t("quickstart.personality_files_none")
+            : `${form.personalityFiles.length} ${t("quickstart.staged_suffix")}`
         }
       >
         <PersonalityFilesList
@@ -462,7 +463,7 @@ export default function Quickstart() {
           disabled={busy || !allDone}
           onClick={() => void submit()}
         >
-          {busy ? "Creating..." : "Create"}
+          {busy ? t("quickstart.creating") : t("quickstart.create")}
         </Button>
       </div>
     </div>
@@ -474,7 +475,7 @@ function Stepper({ steps }: { steps: { label: string; done: boolean }[] }) {
   // accent lands on what the operator should fill in next.
   const activeIdx = steps.findIndex((s) => !s.done);
   return (
-    <ol className="flex items-center gap-2" aria-label="Setup progress">
+    <ol className="flex items-center gap-2" aria-label={t("quickstart.setup_progress")}>
       {steps.map((step, i) => {
         const active = i === activeIdx;
         const state = step.done
@@ -575,7 +576,7 @@ function PresetSection({
     >
       {rows.length === 0 ? (
         <div className="text-xs" style={MUTED}>
-          Loading…
+          {t("common.loading")}
         </div>
       ) : (
         <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-base divide-y divide-pc-border overflow-hidden">
@@ -631,7 +632,7 @@ function StagedRow({
           </code>
         )}
       </div>
-      <Button variant="ghost" size="sm" onClick={onRemove} title="Clear">
+      <Button variant="ghost" size="sm" onClick={onRemove} title={t("quickstart.clear")}>
         <Trash2 className="h-4 w-4" />
       </Button>
     </div>
@@ -773,7 +774,7 @@ function ProviderForm({
     <>
       <label className="block">
         <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-          Provider type
+          {t("quickstart.provider_type")}
         </div>
         <select
           className={INPUT_CLASS}
@@ -785,29 +786,29 @@ function ProviderForm({
           }}
         >
           <option value="" disabled>
-            — pick a provider —
+            {t("quickstart.pick_provider")}
           </option>
           {state?.model_provider_types.map((opt) => (
             <option key={opt.kind} value={opt.kind}>
               {opt.display_name}
-              {opt.local ? " (local)" : ""}
+              {opt.local ? ` ${t("quickstart.local_suffix")}` : ""}
             </option>
           ))}
         </select>
       </label>
 
-      <LabeledInput label="alias" value={alias} onChange={setAlias} />
+      <LabeledInput label={t("quickstart.alias")} value={alias} onChange={setAlias} />
 
       <label className="block">
         <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-          model
+          {t("quickstart.model")}
         </div>
         <input
           className={INPUT_CLASS}
           value={model}
           onChange={(e) => setModel(e.target.value)}
           list="qs-model-catalog"
-          placeholder={type ? "pick or type a model id" : ""}
+          placeholder={type ? t("quickstart.model_placeholder") : ""}
         />
         <datalist id="qs-model-catalog">
           {catalog?.live &&
@@ -852,7 +853,7 @@ function ProviderForm({
           }}
         >
           <Plus className="h-3.5 w-3.5" />
-          Add
+          {t("quickstart.add")}
         </Button>
       </div>
     </>
@@ -896,7 +897,7 @@ function ChannelsList({
                   {c.channel_type}.{c.alias}
                 </span>
                 <span className="ml-2 text-xs" style={MUTED}>
-                  {c.mode === "existing" ? "reuse" : "new"}
+                  {c.mode === "existing" ? t("quickstart.reuse") : t("quickstart.new")}
                 </span>
               </div>
               <Button variant="ghost" size="sm" onClick={() => onRemove(i)}>
@@ -922,7 +923,7 @@ function ChannelsList({
       ) : (
         <Button variant="ghost" size="md" onClick={() => setAdding(true)}>
           <Plus className="h-3.5 w-3.5" />
-          Add channel
+          {t("quickstart.add_channel")}
         </Button>
       )}
     </>
@@ -1006,25 +1007,25 @@ function ChannelAddForm({
           disabled={reusable.length === 0}
           onClick={() => setMode("existing")}
         >
-          Use existing
+          {t("quickstart.use_existing")}
         </Button>
         <Button
           variant={mode === "fresh" ? "primary" : "ghost"}
           size="sm"
           onClick={() => setMode("fresh")}
         >
-          Create new
+          {t("quickstart.create_new")}
         </Button>
         <div className="flex-1" />
         <Button variant="ghost" size="sm" onClick={onCancel}>
-          Cancel
+          {t("common.cancel")}
         </Button>
       </div>
 
       {mode === "existing" ? (
         reusable.length === 0 ? (
           <div className="text-xs" style={MUTED}>
-            No unassigned channels available.
+            {t("quickstart.no_unassigned_channels")}
           </div>
         ) : (
           <select
@@ -1043,7 +1044,7 @@ function ChannelAddForm({
         <>
           <label className="block">
             <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-              Channel type
+              {t("quickstart.channel_type")}
             </div>
             <select
               className={INPUT_CLASS}
@@ -1056,7 +1057,7 @@ function ChannelAddForm({
               }}
             >
               <option value="" disabled>
-                — pick a channel type —
+                {t("quickstart.pick_channel_type")}
               </option>
               {state?.channel_types.map((opt) => (
                 <option key={opt.kind} value={opt.kind}>
@@ -1066,10 +1067,10 @@ function ChannelAddForm({
             </select>
           </label>
 
-          <LabeledInput label="Alias" value={alias} onChange={setAlias} />
+          <LabeledInput label={t("quickstart.alias_label")} value={alias} onChange={setAlias} />
           {conflict && (
             <div className="text-xs" style={ERROR}>
-              <code>{freshRef}</code> already exists.
+              <code>{freshRef}</code> {t("quickstart.already_exists")}
             </div>
           )}
 
@@ -1089,7 +1090,7 @@ function ChannelAddForm({
       <div className="flex justify-end">
         <Button size="sm" disabled={!canAdd} onClick={submit}>
           <Plus className="h-3.5 w-3.5" />
-          Add
+          {t("quickstart.add")}
         </Button>
       </div>
     </Card>
@@ -1141,10 +1142,11 @@ function PeerGroupsList({
               <div className="min-w-0">
                 <div className="font-medium text-pc-text">{pg.name}</div>
                 <code className="block text-xs mt-0.5" style={FAINT}>
-                  channel: {pg.channel}
+                  {t("quickstart.channel_prefix")}
+                  {pg.channel}
                   {pg.external_peers.length > 0
-                    ? ` · ${pg.external_peers.length} peers`
-                    : " · no peers"}
+                    ? ` · ${pg.external_peers.length} ${t("quickstart.peers_suffix")}`
+                    : ` · ${t("quickstart.no_peers")}`}
                 </code>
               </div>
               <Button variant="ghost" size="sm" onClick={() => onRemove(i)}>
@@ -1158,8 +1160,8 @@ function PeerGroupsList({
       {available.length === 0 ? (
         <div className="text-xs" style={MUTED}>
           {stagedChannels.length === 0
-            ? "Stage at least one channel above to authorize peers."
-            : "Every available channel has a peer-group staged."}
+            ? t("quickstart.stage_channel_first")
+            : t("quickstart.all_channels_staged")}
         </div>
       ) : adding ? (
         <PeerGroupAddForm
@@ -1173,7 +1175,7 @@ function PeerGroupsList({
       ) : (
         <Button variant="ghost" size="md" onClick={() => setAdding(true)}>
           <Plus className="h-3.5 w-3.5" />
-          Add peer group
+          {t("quickstart.add_peer_group")}
         </Button>
       )}
     </>
@@ -1215,7 +1217,7 @@ function PeerGroupAddForm({
     <Card className="p-4 space-y-3 bg-pc-elevated">
       <label className="block">
         <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-          Channel
+          {t("quickstart.channel_label")}
         </div>
         <select
           className={INPUT_CLASS}
@@ -1231,7 +1233,7 @@ function PeerGroupAddForm({
       </label>
 
       <LabeledInput
-        label="External peers (one per line or comma-separated)"
+        label={t("quickstart.external_peers_label")}
         value={peersBuf}
         onChange={setPeersBuf}
         multiline
@@ -1239,12 +1241,13 @@ function PeerGroupAddForm({
       />
 
       <div className="text-xs" style={MUTED}>
-        Peer group will be named <code>{name || "—"}</code>.
+        {t("quickstart.peer_group_named_prefix")}
+        <code>{name || "—"}</code>.
       </div>
 
       <div className="flex justify-end gap-2">
         <Button variant="ghost" size="sm" onClick={onCancel}>
-          Cancel
+          {t("common.cancel")}
         </Button>
         <Button
           size="sm"
@@ -1252,7 +1255,7 @@ function PeerGroupAddForm({
           onClick={() => onAdd({ name, channel, external_peers: peers })}
         >
           <Plus className="h-3.5 w-3.5" />
-          Add
+          {t("quickstart.add")}
         </Button>
       </div>
     </Card>
@@ -1301,7 +1304,7 @@ function PersonalityFilesList({
   if (filenames.length === 0) {
     return (
       <div className="text-xs" style={MUTED}>
-        Loading…
+        {t("common.loading")}
       </div>
     );
   }
@@ -1319,7 +1322,7 @@ function PersonalityFilesList({
                   <span className="font-medium text-pc-text">{fn}</span>
                   {isStaged && (
                     <span className="ml-2 text-xs" style={MUTED}>
-                      staged
+                      {t("quickstart.staged_badge")}
                     </span>
                   )}
                 </div>
@@ -1329,7 +1332,7 @@ function PersonalityFilesList({
                       variant="ghost"
                       size="sm"
                       onClick={() => onRemove(fn)}
-                      title="Discard"
+                      title={t("quickstart.discard")}
                     >
                       <Trash2 className="h-4 w-4" />
                     </Button>
@@ -1344,9 +1347,9 @@ function PersonalityFilesList({
                         onStage({ filename: fn, content });
                       }
                     }}
-                    title="Stage the default template content for this file"
+                    title={t("quickstart.use_template_title")}
                   >
-                    Use template
+                    {t("quickstart.use_template")}
                   </Button>
                   <Button
                     variant="ghost"
@@ -1365,7 +1368,11 @@ function PersonalityFilesList({
                       }
                     }}
                   >
-                    {isEditing ? "Save" : isStaged ? "Edit" : "Add"}
+                    {isEditing
+                      ? t("common.save")
+                      : isStaged
+                        ? t("common.edit")
+                        : t("quickstart.add")}
                   </Button>
                 </div>
               </div>
@@ -1374,7 +1381,7 @@ function PersonalityFilesList({
                   className={`${TEXTAREA_CLASS} min-h-32 font-mono text-xs`}
                   value={buf}
                   onChange={(e) => setBuf(e.target.value)}
-                  placeholder={`Contents of ${fn}…`}
+                  placeholder={`${t("quickstart.contents_of_prefix")}${fn}…`}
                 />
               )}
             </div>

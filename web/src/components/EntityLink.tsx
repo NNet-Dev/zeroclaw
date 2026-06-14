@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import type { ReactNode, CSSProperties, MouseEventHandler } from 'react';
 import { entityConfigPath, type EntityKind } from '@/lib/entityLinks';
+import { t } from '@/lib/i18n';
 
 export interface EntityLinkProps {
   kind: EntityKind;
@@ -41,7 +42,7 @@ export default function EntityLink({
         .filter(Boolean)
         .join(' ')}
       style={{ color: 'var(--pc-text-link)', ...style }}
-      title={title ?? `Open ${kind} config: ${id}`}
+      title={title ?? `${t('entity_link.open_prefix')}${kind}${t('entity_link.config_sep')}${id}`}
       onClick={onClick}
     >
       {children ?? id}

@@ -5,6 +5,7 @@ import {
   Image, Camera, Calculator, Wrench, CheckCircle2, Loader2,
 } from 'lucide-react';
 import { Card, Badge } from '@/components/ui';
+import { t } from '@/lib/i18n';
 
 export interface ToolCallInfo {
   name: string;
@@ -69,12 +70,12 @@ export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
           {resolved ? (
             <Badge tone="ok">
               <CheckCircle2 className="h-3 w-3" />
-              done
+              {t('tool_call.done')}
             </Badge>
           ) : (
             <Badge tone="neutral">
               <Loader2 className="h-3 w-3 animate-spin" />
-              running
+              {t('tool_call.running')}
             </Badge>
           )}
         </span>
@@ -83,7 +84,7 @@ export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
       {argsStr && (
         <details className="mt-2 group">
           <summary className="cursor-pointer select-none text-pc-text-muted hover:text-pc-text-secondary">
-            args
+            {t('tool_call.args')}
           </summary>
           <pre className="mt-1.5 overflow-auto rounded-[var(--radius-sm)] bg-pc-code p-2 font-mono text-[11px] leading-relaxed text-pc-text-secondary">
             {argsStr}

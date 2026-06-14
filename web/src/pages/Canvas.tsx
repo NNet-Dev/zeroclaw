@@ -5,6 +5,7 @@ import { apiFetch } from '@/lib/api';
 import { basePath } from '@/lib/basePath';
 import { getToken } from '@/lib/auth';
 import { Badge, Button, Card, PageHeader } from '@/components/ui';
+import { t } from '@/lib/i18n';
 
 interface CanvasFrame {
   frame_id: string;
@@ -203,7 +204,7 @@ export default function Canvas() {
       setCurrentFrame(null);
       setHistory([]);
     } catch (err) {
-      showActionError(`Failed to switch canvas: ${err instanceof Error ? err.message : 'unknown error'}`);
+      showActionError(`${t('canvas.switch_failed')}${err instanceof Error ? err.message : t('canvas.unknown_error')}`);
     }
   };
 
@@ -212,7 +213,7 @@ export default function Canvas() {
     try {
       connectWs(canvasId);
     } catch (err) {
-      showActionError(`Failed to reconnect: ${err instanceof Error ? err.message : 'unknown error'}`);
+      showActionError(`${t('canvas.reconnect_failed')}${err instanceof Error ? err.message : t('canvas.unknown_error')}`);
     }
   };
 
@@ -239,7 +240,7 @@ export default function Canvas() {
       setCurrentFrame(null);
       setHistory([]);
     } catch (err) {
-      showActionError(`Failed to clear canvas: ${err instanceof Error ? err.message : 'unknown error'}`);
+      showActionError(`${t('canvas.clear_failed')}${err instanceof Error ? err.message : t('canvas.unknown_error')}`);
     }
   };
 
@@ -254,9 +255,9 @@ export default function Canvas() {
         title={
           <span className="inline-flex items-center gap-2.5">
             <Monitor className="h-5 w-5 text-pc-accent" />
-            Live Canvas
+            {t('canvas.title')}
             <Badge tone={connected ? 'ok' : 'error'}>
-              {connected ? 'Connected' : 'Disconnected'}
+              {connected ? t('canvas.connected') : t('canvas.disconnected')}
             </Badge>
           </span>
         }
@@ -266,7 +267,7 @@ export default function Canvas() {
               variant="ghost"
               size="sm"
               onClick={() => setShowHistory(!showHistory)}
-              title="Toggle history"
+              title={t('canvas.toggle_history')}
               aria-pressed={showHistory}
             >
               <History className="h-4 w-4" />
@@ -276,17 +277,17 @@ export default function Canvas() {
               size="sm"
               onClick={handleClear}
               onBlur={disarmClear}
-              title={clearArmed ? 'Confirm clear' : 'Clear canvas'}
-              aria-label={clearArmed ? 'Confirm clear canvas' : 'Clear canvas'}
+              title={clearArmed ? t('canvas.confirm_clear') : t('canvas.clear_canvas')}
+              aria-label={clearArmed ? t('canvas.confirm_clear_canvas') : t('canvas.clear_canvas')}
             >
               <Trash2 className="h-4 w-4" />
-              {clearArmed && <span className="text-xs">Confirm clear?</span>}
+              {clearArmed && <span className="text-xs">{t('canvas.confirm_clear_prompt')}</span>}
             </Button>
             <Button
               variant="ghost"
               size="sm"
               onClick={handleReconnect}
-              title="Reconnect"
+              title={t('canvas.reconnect')}
             >
               <RefreshCw className="h-4 w-4" />
             </Button>
@@ -311,15 +312,15 @@ export default function Canvas() {
           value={canvasIdInput}
           onChange={(e) => setCanvasIdInput(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleSwitchCanvas()}
-          placeholder="Canvas ID"
+          placeholder={t('canvas.canvas_id_placeholder')}
           className="h-9 px-3 rounded-[var(--radius-md)] text-sm border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40"
         />
         <Button size="md" onClick={handleSwitchCanvas}>
-          Switch
+          {t('canvas.switch')}
         </Button>
         {canvasList.length > 0 && (
           <div className="flex items-center gap-1.5 ml-2 flex-wrap">
-            <span className="text-xs text-pc-text-muted">Active:</span>
+            <span className="text-xs text-pc-text-muted">{t('canvas.active')}</span>
             {canvasList.map((id) => {
               const active = id === canvasId;
               return (
@@ -355,7 +356,7 @@ export default function Canvas() {
               sandbox="allow-scripts"
               srcDoc={srcdoc}
               className="w-full h-full border-0"
-              title={`Canvas: ${canvasId}`}
+              title={`${t('canvas.iframe_title_prefix')}${canvasId}`}
               style={{ background: 'var(--pc-bg-base)' }}
             />
           ) : (
@@ -363,10 +364,10 @@ export default function Canvas() {
               <div className="text-center">
                 <Monitor className="h-12 w-12 mx-auto mb-3 text-pc-text-faint" />
                 <p className="text-sm text-pc-text-muted">
-                  Waiting for content on canvas <span className="font-mono text-pc-text-secondary">"{canvasId}"</span>
+                  {t('canvas.waiting_prefix')} <span className="font-mono text-pc-text-secondary">"{canvasId}"</span>
                 </p>
                 <p className="text-xs mt-1 text-pc-text-faint">
-                  The agent can push content here using the canvas tool
+                  {t('canvas.waiting_hint')}
                 </p>
               </div>
             </div>
@@ -377,10 +378,10 @@ export default function Canvas() {
         {showHistory && (
           <Card padded={false} className="w-64 overflow-y-auto">
             <div className="px-3 py-2 border-b border-pc-border text-[11px] font-medium uppercase tracking-wide text-pc-text-faint sticky top-0 bg-pc-surface">
-              Frame History ({history.length})
+              {t('canvas.frame_history')} ({history.length})
             </div>
             {history.length === 0 ? (
-              <p className="p-3 text-xs text-pc-text-muted">No frames yet</p>
+              <p className="p-3 text-xs text-pc-text-muted">{t('canvas.no_frames')}</p>
             ) : (
               <div className="space-y-1 p-2">
                 {[...history].reverse().map((frame) => {
@@ -421,9 +422,9 @@ export default function Canvas() {
       {currentFrame && (
         <div className="flex items-center justify-between px-3 py-2 rounded-[var(--radius-md)] text-xs bg-pc-elevated border border-pc-border text-pc-text-muted">
           <span>
-            Type: <span className="font-mono text-pc-text-secondary">{currentFrame.content_type}</span>
+            {t('canvas.type_label')} <span className="font-mono text-pc-text-secondary">{currentFrame.content_type}</span>
             <span className="mx-2 text-pc-text-faint">|</span>
-            Frame: <span className="font-mono text-pc-text-secondary">{currentFrame.frame_id.substring(0, 8)}</span>
+            {t('canvas.frame_label')} <span className="font-mono text-pc-text-secondary">{currentFrame.frame_id.substring(0, 8)}</span>
           </span>
           <span>{new Date(currentFrame.timestamp).toLocaleString()}</span>
         </div>

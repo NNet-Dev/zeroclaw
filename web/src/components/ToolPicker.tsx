@@ -12,14 +12,14 @@
 //  * FieldForm — for schema-driven `*.allowed_tools` string-array fields.
 //  * Cron — for the Add/Edit job `allowed_tools` field.
 //
-// i18n: the labels here are literal English. The shared i18n.ts catalog is
-// owned by another surface; t() would render raw keys for any string we
-// added, so user-facing copy is inlined until those keys exist.
+// i18n: user-facing copy is routed through t() under the `tool_picker.`
+// namespace (plus shared `common.` keys); see @/lib/i18n.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, X, Wrench, Terminal } from 'lucide-react';
 import type { ToolSpec, CliTool } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 export interface ToolPickerProps {
   /** Currently-selected tool names. Order is preserved on toggle. */
@@ -112,7 +112,7 @@ export default function ToolPicker({
       })
       .catch((err: unknown) => {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Failed to load tools');
+          setError(err instanceof Error ? err.message : t('tool_picker.load_failed'));
           setLoading(false);
         }
       });
@@ -230,10 +230,10 @@ export default function ToolPicker({
   return (
     <div className="space-y-2">
       {/* Selected chips */}
-      <div className="flex flex-wrap gap-1.5" aria-label="Selected tools">
+      <div className="flex flex-wrap gap-1.5" aria-label={t('tool_picker.selected_tools')}>
         {value.length === 0 ? (
           <span className="text-xs text-pc-text-faint py-0.5">
-            No tools selected
+            {t('tool_picker.no_tools_selected')}
           </span>
         ) : (
           value.map((name) => {
@@ -251,7 +251,7 @@ export default function ToolPicker({
                 title={
                   known
                     ? name
-                    : `${name} — not in the current tool catalog`
+                    : `${name}${t('tool_picker.not_in_catalog_suffix')}`
                 }
               >
                 <span className="font-mono truncate max-w-[16rem]">{name}</span>
@@ -259,7 +259,7 @@ export default function ToolPicker({
                   type="button"
                   onClick={() => removeChip(name)}
                   disabled={disabled}
-                  aria-label={`Remove ${name}`}
+                  aria-label={`${t('tool_picker.remove_prefix')}${name}`}
                   className="inline-flex h-9 w-9 flex-shrink-0 items-center justify-center self-stretch rounded-full hover:bg-pc-accent/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]/40 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
                 >
                   <X className="h-3.5 w-3.5" />
@@ -283,7 +283,7 @@ export default function ToolPicker({
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           disabled={disabled || loading || error !== null}
-          placeholder="Search tools by name or description…"
+          placeholder={t('tool_picker.search_placeholder')}
           className="w-full h-9 pl-9 pr-3 text-sm rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 disabled:opacity-50 disabled:cursor-not-allowed"
         />
       </div>
@@ -295,11 +295,11 @@ export default function ToolPicker({
             className="h-4 w-4 border-2 rounded-full animate-spin border-pc-border"
             style={{ borderTopColor: 'var(--pc-accent)' }}
           />
-          Loading tools…
+          {t('tool_picker.loading')}
         </div>
       ) : error ? (
         <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 px-3 py-2 text-xs text-status-error">
-          Failed to load tools: {error}
+          {t('tool_picker.load_failed_prefix')}{error}
         </div>
       ) : (
         <div
@@ -307,7 +307,7 @@ export default function ToolPicker({
           ref={listboxRef}
           role="listbox"
           aria-multiselectable="true"
-          aria-label="Available tools"
+          aria-label={t('tool_picker.available_tools')}
           onKeyDown={onListboxKeyDown}
           className="max-h-64 overflow-y-auto rounded-[var(--radius-md)] border border-pc-border bg-pc-surface divide-y divide-pc-border/60"
         >
@@ -316,14 +316,14 @@ export default function ToolPicker({
           {unknownSelected.length > 0 && (
             <ToolGroup
               icon={<X className="h-3.5 w-3.5 text-status-warning" />}
-              label="Selected but not in catalog"
+              label={t('tool_picker.group_unknown')}
               count={unknownSelected.length}
             >
               {unknownSelected.map((name) => (
                 <ToolRow
                   key={name}
                   name={name}
-                  description="Unknown tool — kept so your selection isn't dropped."
+                  description={t('tool_picker.unknown_tool_desc')}
                   selected
                   disabled={disabled}
                   unknown
@@ -336,7 +336,7 @@ export default function ToolPicker({
           {agentEntries.length > 0 && (
             <ToolGroup
               icon={<Wrench className="h-3.5 w-3.5 text-pc-accent" />}
-              label="Agent tools"
+              label={t('tool_picker.group_agent')}
               count={agentEntries.length}
             >
               {agentEntries.map((e) => (
@@ -355,7 +355,7 @@ export default function ToolPicker({
           {cliEntries.length > 0 && (
             <ToolGroup
               icon={<Terminal className="h-3.5 w-3.5 text-pc-text-muted" />}
-              label="CLI tools"
+              label={t('tool_picker.group_cli')}
               count={cliEntries.length}
             >
               {cliEntries.map((e) => (
@@ -376,8 +376,8 @@ export default function ToolPicker({
             unknownSelected.length === 0 && (
               <p className="px-3 py-4 text-xs text-center text-pc-text-muted">
                 {search.trim()
-                  ? `No tools match "${search.trim()}".`
-                  : 'No tools available.'}
+                  ? `${t('tool_picker.no_match_prefix')}"${search.trim()}"${t('tool_picker.no_match_suffix')}`
+                  : t('tool_picker.no_tools_available')}
               </p>
             )}
         </div>
@@ -470,7 +470,7 @@ function ToolRow({
           </span>
           {unknown && (
             <span className="text-[10px] uppercase tracking-wide text-status-warning">
-              unknown
+              {t('tool_picker.unknown_badge')}
             </span>
           )}
         </div>

@@ -31,7 +31,7 @@ export default function AgentsList() {
       .catch((err: unknown) =>
         setState({
           loading: false,
-          error: err instanceof Error ? err.message : 'Failed to load agents',
+          error: err instanceof Error ? err.message : t('agents_list.load_failed'),
           agents: [],
         }),
       );
@@ -54,7 +54,7 @@ export default function AgentsList() {
     } catch (err) {
       setState((s) => ({
         ...s,
-        error: err instanceof Error ? err.message : `Failed to toggle ${agent.alias}`,
+        error: err instanceof Error ? err.message : `${t('agents_list.toggle_failed_prefix')}${agent.alias}`,
       }));
     } finally {
       setToggling((prev) => {
@@ -75,12 +75,12 @@ export default function AgentsList() {
       <PageHeader
         className="mb-6"
         title={t('nav.agents')}
-        description="Configured agents on this ZeroClaw instance."
+        description={t('agents_list.description')}
         actions={
           <Link to="/config/agents">
             <Button variant="primary" size="md">
               <Plus className="h-4 w-4" />
-              New Agent
+              {t('agents_list.new_agent')}
             </Button>
           </Link>
         }
@@ -129,15 +129,15 @@ function EmptyState() {
         <Bot className="h-6 w-6 text-pc-accent" />
       </div>
       <p className="text-base font-medium mb-1 text-pc-text">
-        No agents configured yet
+        {t('agents_list.empty_title')}
       </p>
       <p className="text-sm mb-4 text-pc-text-muted">
-        Run Quickstart to create your first agent.
+        {t('agents_list.empty_hint')}
       </p>
       <Link to="/quickstart" className="inline-block">
         <Button variant="primary" size="md">
           <Plus className="h-4 w-4" />
-          Start Quickstart
+          {t('agents_list.start_quickstart')}
         </Button>
       </Link>
     </div>

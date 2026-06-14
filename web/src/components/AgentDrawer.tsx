@@ -144,7 +144,7 @@ export default function AgentDrawer({
                 kind="agent"
                 id={agent.alias}
                 className="block text-base font-semibold truncate text-pc-text hover:underline"
-                title={`Open agents.${agent.alias} config`}
+                title={`${t('agent.open_config_prefix')}agents.${agent.alias}${t('agent.open_config_suffix')}`}
               >
                 {agent.alias}
               </EntityLink>
@@ -153,7 +153,7 @@ export default function AgentDrawer({
                   kind="model-provider"
                   id={agent.modelProvider}
                   className="block text-xs truncate font-mono text-pc-text-muted hover:text-pc-text-secondary hover:underline"
-                  title={`Open providers.models.${agent.modelProvider} config`}
+                  title={`${t('agent.open_config_prefix')}providers.models.${agent.modelProvider}${t('agent.open_config_suffix')}`}
                 >
                   {agent.modelProvider}
                 </EntityLink>
@@ -210,7 +210,7 @@ export default function AgentDrawer({
                   kind="channel"
                   id={ch}
                   className={CHIP_CLASS}
-                  title={`Open channels.${ch} config`}
+                  title={`${t('agent.open_config_prefix')}channels.${ch}${t('agent.open_config_suffix')}`}
                 >
                   {ch}
                 </EntityLink>
@@ -274,7 +274,7 @@ export default function AgentDrawer({
                   kind="skill-bundle"
                   id={s}
                   className={CHIP_CLASS}
-                  title={`Open skill-bundles.${s} config`}
+                  title={`${t('agent.open_config_prefix')}skill-bundles.${s}${t('agent.open_config_suffix')}`}
                 >
                   {s}
                 </EntityLink>
@@ -290,7 +290,7 @@ export default function AgentDrawer({
                   kind="knowledge-bundle"
                   id={k}
                   className={CHIP_CLASS}
-                  title={`Open knowledge-bundles.${k} config`}
+                  title={`${t('agent.open_config_prefix')}knowledge-bundles.${k}${t('agent.open_config_suffix')}`}
                 >
                   {k}
                 </EntityLink>
@@ -306,7 +306,7 @@ export default function AgentDrawer({
                   kind="mcp-bundle"
                   id={m}
                   className={CHIP_CLASS}
-                  title={`Open mcp-bundles.${m} config`}
+                  title={`${t('agent.open_config_prefix')}mcp-bundles.${m}${t('agent.open_config_suffix')}`}
                 >
                   {m}
                 </EntityLink>
@@ -322,7 +322,7 @@ export default function AgentDrawer({
                   kind="peer-group"
                   id={pg}
                   className={CHIP_CLASS}
-                  title={`Open peer_groups.${pg} config`}
+                  title={`${t('agent.open_config_prefix')}peer_groups.${pg}${t('agent.open_config_suffix')}`}
                 >
                   {pg}
                 </EntityLink>
@@ -338,7 +338,7 @@ export default function AgentDrawer({
                   kind="cron"
                   id={c}
                   className={CHIP_CLASS}
-                  title={`Open cron.${c} config`}
+                  title={`${t('agent.open_config_prefix')}cron.${c}${t('agent.open_config_suffix')}`}
                 >
                   {c}
                 </EntityLink>

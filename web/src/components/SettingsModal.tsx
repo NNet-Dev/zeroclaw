@@ -153,7 +153,7 @@ export function SettingsModal({ open, onClose }: Props) {
 
   const tabs: { id: TabId; label: string; icon: typeof Palette }[] = useMemo(() => [
     { id: 'appearance', label: t('settings.tab.appearance'), icon: Settings },
-    { id: 'themes', label: 'Themes', icon: Palette },
+    { id: 'themes', label: t('settings.tab.themes'), icon: Palette },
     { id: 'typography', label: t('settings.tab.typography'), icon: Type },
   ], []);
 
@@ -231,7 +231,7 @@ export function SettingsModal({ open, onClose }: Props) {
           <button
             type="button"
             onClick={onClose}
-            aria-label="Close"
+            aria-label={t('common.close')}
             className="h-11 w-11 -mr-2 rounded-[var(--radius-md)] flex items-center justify-center text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
           >
             <X size={16} />
@@ -315,7 +315,7 @@ export function SettingsModal({ open, onClose }: Props) {
                       onClick={() => setAccent(opt.value)}
                       className="relative flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full p-2 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
                       aria-pressed={accent === opt.value}
-                      aria-label={`${opt.value} accent`}
+                      aria-label={`${opt.value} ${t('settings.accent_suffix')}`}
                     >
                       <span
                         className="flex h-7 w-7 items-center justify-center rounded-full transition-all"
@@ -337,7 +337,7 @@ export function SettingsModal({ open, onClose }: Props) {
           {/* Themes Tab */}
           {tab === 'themes' && (
             <>
-              <SectionTitle>Dark Themes</SectionTitle>
+              <SectionTitle>{t('settings.dark_themes')}</SectionTitle>
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 mb-4">
                 {darkThemes.map(ct => (
                   <ThemePreviewCard
@@ -349,7 +349,7 @@ export function SettingsModal({ open, onClose }: Props) {
                 ))}
               </div>
 
-              <SectionTitle>Light Themes</SectionTitle>
+              <SectionTitle>{t('settings.light_themes')}</SectionTitle>
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 mb-4">
                 {lightThemes.map(ct => (
                   <ThemePreviewCard
@@ -366,10 +366,10 @@ export function SettingsModal({ open, onClose }: Props) {
                 <div className="flex items-center gap-2">
                   <Palette size={14} className="text-pc-accent" />
                   <span className="text-xs font-medium text-pc-text">
-                    {colorThemes.find(ct => ct.id === colorTheme)?.name ?? 'Default Dark'}
+                    {colorThemes.find(ct => ct.id === colorTheme)?.name ?? t('settings.default_dark')}
                   </span>
                   <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-pc-accent/10 text-pc-accent-light">
-                    Active
+                    {t('settings.active')}
                   </span>
                 </div>
               </div>

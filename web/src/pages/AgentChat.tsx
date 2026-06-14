@@ -257,10 +257,10 @@ export function AgentChatInner({
           <Link
             to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
             className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
-            title="Open agent file workspace"
+            title={t('agentchat.open_workspace')}
           >
             <FolderOpen className="h-3.5 w-3.5" />
-            Files
+            {t('agentchat.files')}
           </Link>
         </div>
 
@@ -354,7 +354,7 @@ export function AgentChatInner({
             <div className="h-14 w-14 rounded-[var(--radius-lg)] flex items-center justify-center mb-4 bg-pc-accent/10">
               <Bot className="h-7 w-7 text-pc-accent" />
             </div>
-            <p className="text-base font-semibold mb-1 text-pc-text">ZeroClaw Agent</p>
+            <p className="text-base font-semibold mb-1 text-pc-text">{t('agentchat.empty_title')}</p>
             <p className="text-sm text-pc-text-muted">{t('agent.start_conversation')}</p>
           </div>
         )}
@@ -382,7 +382,7 @@ export function AgentChatInner({
               <div className="rounded-[var(--radius-lg)] px-4 py-3 border border-pc-border bg-pc-elevated text-pc-text max-w-[75%]">
                 {streamingThinking && (
                   <details className="mb-2" open={!streamingContent}>
-                    <summary className="text-xs cursor-pointer select-none text-pc-text-muted">Thinking{!streamingContent && '...'}</summary>
+                    <summary className="text-xs cursor-pointer select-none text-pc-text-muted">{t('agentchat.thinking')}{!streamingContent && '...'}</summary>
                     <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">{streamingThinking}</pre>
                   </details>
                 )}
@@ -518,7 +518,7 @@ const MessageItem = memo(function MessageItem({
         >
           {msg.thinking && (
             <details className="mb-2">
-              <summary className="text-xs cursor-pointer select-none text-pc-text-muted">Thinking</summary>
+              <summary className="text-xs cursor-pointer select-none text-pc-text-muted">{t('agentchat.thinking')}</summary>
               <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">{msg.thinking}</pre>
             </details>
           )}

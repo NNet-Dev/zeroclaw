@@ -263,16 +263,16 @@ function setupRequirement(
   const leaf = entry.path.split(".").pop() ?? "";
   if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
     const localProvider = isLocalModelProviderPath(entry.path);
-    if (leaf === "model") return { label: "Required", tone: "required" };
+    if (leaf === "model") return { label: t("fieldform.badge_required"), tone: "required" };
     if (leaf === "api_key") {
       return localProvider
-        ? { label: "Optional for remote auth", tone: "optional" }
-        : { label: "Required for API-key auth", tone: "required" };
+        ? { label: t("fieldform.badge_optional_for_remote_auth"), tone: "optional" }
+        : { label: t("fieldform.badge_required_for_api_key_auth"), tone: "required" };
     }
     if (leaf === "requires_openai_auth")
-      return { label: "Auth option", tone: "choice" };
-    if (leaf === "uri") return { label: "Endpoint option", tone: "choice" };
-    return { label: "Optional", tone: "optional" };
+      return { label: t("fieldform.badge_auth_option"), tone: "choice" };
+    if (leaf === "uri") return { label: t("fieldform.badge_endpoint_option"), tone: "choice" };
+    return { label: t("fieldform.badge_optional"), tone: "optional" };
   }
   const topLevelAgentField =
     entry.path.match(/^agents\.[^.]+\.([^.]+)$/)?.[1] ?? null;
@@ -282,18 +282,18 @@ function setupRequirement(
         topLevelAgentField,
       )
     ) {
-      return { label: "Required", tone: "required" };
+      return { label: t("fieldform.badge_required"), tone: "required" };
     }
-    return { label: "Optional", tone: "optional" };
+    return { label: t("fieldform.badge_optional"), tone: "optional" };
   }
   if (
     /^risk_profiles\.[^.]+\./.test(entry.path) ||
     /^runtime_profiles\.[^.]+\./.test(entry.path)
   ) {
-    return { label: "Advanced", tone: "optional" };
+    return { label: t("fieldform.badge_advanced"), tone: "optional" };
   }
   if (entry.path === "memory.backend")
-    return { label: "Recommended", tone: "choice" };
+    return { label: t("fieldform.badge_recommended"), tone: "choice" };
   return null;
 }
 
@@ -628,13 +628,13 @@ function AgentEmptyAliasFallback({
         background: "var(--pc-bg-surface-subtle)",
       }}
     >
-      No {label} configured yet.{" "}
+      {t("fieldform.no_alias_configured_prefix")}{label}{t("fieldform.no_alias_configured_suffix")}{" "}
       <Link
         to={path}
         className="inline-flex items-center gap-1 underline"
         style={{ color: "var(--pc-text-link)" }}
       >
-        Configure {label} <ExternalLink className="h-3 w-3" />
+        {t("fieldform.configure_prefix")}{label} <ExternalLink className="h-3 w-3" />
       </Link>
     </div>
   );
@@ -724,7 +724,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           setTopError(`[${e.envelope.code}] ${e.envelope.message}`);
         } else {
           setTopError(
-            `Couldn't load fields for ${prefix}: ${e instanceof Error ? e.message : String(e)}`,
+            `${t("fieldform.load_failed_prefix")}${prefix}: ${e instanceof Error ? e.message : String(e)}`,
           );
         }
       } finally {
@@ -809,7 +809,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
 
       try {
         const resp = await patchConfig(ops);
-        setSavedAt(`Saved ${resp.results.length} field(s).`);
+        setSavedAt(`${t("fieldform.saved_prefix")}${resp.results.length}${t("fieldform.saved_suffix")}`);
         configDraft.discardSection(prefix);
         await reload();
         onSaved?.();
@@ -820,14 +820,14 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           if (env.path) {
             setFieldErrors({ [env.path]: env });
             setTopError(
-              `Save failed: [${env.code}] ${env.message} (field: ${env.path})`,
+              `${t("fieldform.save_failed_prefix")}[${env.code}] ${env.message} (${t("fieldform.field_label")}: ${env.path})`,
             );
           } else {
-            setTopError(`Save failed: [${env.code}] ${env.message}`);
+            setTopError(`${t("fieldform.save_failed_prefix")}[${env.code}] ${env.message}`);
           }
         } else {
           setTopError(
-            `Save failed: ${e instanceof Error ? e.message : String(e)}`,
+            `${t("fieldform.save_failed_prefix")}${e instanceof Error ? e.message : String(e)}`,
           );
         }
         return false;
@@ -1005,9 +1005,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
             type="text"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            placeholder={`Filter ${visibleEntries.length} fields — fuzzy match on name or path`}
+            placeholder={`${t("fieldform.filter_prefix")}${visibleEntries.length}${t("fieldform.filter_suffix")}`}
             className="input-electric w-full px-3 py-2 text-sm"
-            aria-label="Filter fields"
+            aria-label={t("fieldform.filter_aria")}
           />
         )}
 
@@ -1016,7 +1016,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
             className="surface-panel p-6 text-center text-sm"
             style={{ color: "var(--pc-text-muted)" }}
           >
-            No fields under{" "}
+            {t("fieldform.no_fields_under")}{" "}
             <code style={{ color: "var(--pc-text-faint)" }}>{prefix}</code>.
           </div>
         ) : (
@@ -1034,10 +1034,10 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 style={{ color: "var(--pc-text-muted)" }}
               >
                 {filter.trim().length === 0 ? (
-                  <>No configurable settings for this selection.</>
+                  <>{t("fieldform.no_configurable_settings")}</>
                 ) : (
                   <>
-                    No fields match{" "}
+                    {t("fieldform.no_fields_match")}{" "}
                     <code style={{ color: "var(--pc-text-faint)" }}>
                       {filter}
                     </code>
@@ -1129,12 +1129,14 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                   </span>
                 ) : unsavedCount > 0 ? (
                   <span style={{ color: "var(--pc-text-secondary)" }}>
-                    {unsavedCount} unsaved{" "}
-                    {unsavedCount === 1 ? "change" : "changes"}
+                    {unsavedCount}{" "}
+                    {unsavedCount === 1
+                      ? t("fieldform.unsaved_change")
+                      : t("fieldform.unsaved_changes")}
                   </span>
                 ) : (
                   <span style={{ color: "var(--pc-text-faint)" }}>
-                    No unsaved changes
+                    {t("fieldform.no_unsaved_changes")}
                   </span>
                 )}
               </div>
@@ -1146,7 +1148,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 className="flex-shrink-0"
               >
                 <Save className="h-4 w-4" />
-                {saving ? "Saving…" : "Save"}
+                {saving ? t("fieldform.saving") : t("common.save")}
               </Button>
             </div>
           </div>
@@ -1367,7 +1369,7 @@ function FieldRow({
             className="text-xs mt-0.5"
             style={{ color: "var(--pc-text-muted)" }}
           >
-            Staged for removal. Commits on Save.
+            {t("fieldform.staged_for_removal")}
           </p>
         </div>
         {onUndoTombstone && (
@@ -1376,7 +1378,7 @@ function FieldRow({
             onClick={onUndoTombstone}
             className="btn-secondary text-xs px-2 py-1 flex-shrink-0"
           >
-            Undo
+            {t("fieldform.undo")}
           </button>
         )}
       </div>
@@ -1404,7 +1406,7 @@ function FieldRow({
             )}
             {entry.is_secret && (
               <span className="ml-2 text-xs font-sans text-pc-text-muted">
-                🔒 {entry.populated ? "set" : "unset"}
+                🔒 {entry.populated ? t("fieldform.secret_set") : t("fieldform.secret_unset")}
               </span>
             )}
           </label>
@@ -1431,7 +1433,7 @@ function FieldRow({
           <button
             type="button"
             onClick={onDelete}
-            title="Reset to default / unset"
+            title={t("fieldform.reset_to_default")}
             className="btn-icon flex-shrink-0"
           >
             <Trash2 className="h-4 w-4" />
@@ -1478,9 +1480,9 @@ function FieldRow({
             value={value}
             onChange={onChange}
             options={providerModels}
-            placeholder="Pick from list or type a model name"
-            emptyText="No matching model — your text is kept as-is"
-            aria-label="Model"
+            placeholder={t("fieldform.model_combo_placeholder")}
+            emptyText={t("fieldform.model_combo_empty")}
+            aria-label={t("fieldform.model_aria")}
           />
         ) : isProviderModelField && modelsFetchFailed ? (
           // Fetch failed — fall back to free text with explicit help.
@@ -1490,11 +1492,10 @@ function FieldRow({
               value={value}
               onChange={(e) => onChange(e.target.value)}
               className="input-electric w-full px-3 py-2 text-sm"
-              placeholder="Type a model identifier (catalog unreachable)"
+              placeholder={t("fieldform.model_input_unreachable_placeholder")}
             />
             <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-              Could not fetch model catalog for this provider. Type the
-              identifier from your provider's docs (e.g.{" "}
+              {t("fieldform.model_catalog_unreachable_help")}{" "}
               <code>{modelFallbackExample(entry.path)}</code>).
             </p>
           </>
@@ -1506,11 +1507,11 @@ function FieldRow({
               value={value}
               onChange={(e) => onChange(e.target.value)}
               className="input-electric w-full px-3 py-2 text-sm"
-              placeholder="Fetching models…"
+              placeholder={t("fieldform.fetching_models_placeholder")}
               disabled
             />
             <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-              Fetching available models from the provider's catalog…
+              {t("fieldform.fetching_models_help")}
             </p>
           </>
         ) : isAgentSystemPrompt ? (
@@ -1520,7 +1521,7 @@ function FieldRow({
             value={value}
             onChange={(e) => onChange(e.target.value)}
             className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
-            placeholder="Optional. Prefer placing prose in agents/<alias>/AGENTS.md."
+            placeholder={t("fieldform.system_prompt_placeholder")}
           />
         ) : agentSingleAliasKind && agentOptions ? (
           (agentOptions[agentSingleAliasKind] ?? []).length === 0 ? (
@@ -1533,7 +1534,7 @@ function FieldRow({
                 onChange={(e) => onChange(e.target.value)}
                 className="input-electric flex-1 px-3 py-2 text-sm appearance-none cursor-pointer"
               >
-                <option value="">— (none)</option>
+                <option value="">{t("fieldform.option_none")}</option>
                 {(agentOptions[agentSingleAliasKind] ?? []).map((a) => (
                   <option key={a} value={a}>
                     {a}
@@ -1543,7 +1544,7 @@ function FieldRow({
               {value && (
                 <Link
                   to={agentAliasJumpPath(agentSingleAliasKind, value)}
-                  title={`Edit ${value} in its source section`}
+                  title={`${t("fieldform.edit_in_source_prefix")}${value}${t("fieldform.edit_in_source_suffix")}`}
                   className="btn-icon flex-shrink-0"
                 >
                   <ExternalLink className="h-4 w-4" />
@@ -1619,8 +1620,8 @@ function FieldRow({
                 className="input-electric flex-1 px-3 py-2 text-sm"
                 placeholder={
                   skillBundleAlias
-                    ? `shared/skills/${skillBundleAlias}/ (default — leave empty)`
-                    : "shared/… (leave empty to use the schema default)"
+                    ? `shared/skills/${skillBundleAlias}/ ${t("fieldform.dir_default_leave_empty")}`
+                    : t("fieldform.dir_shared_placeholder")
                 }
               />
               <button
@@ -1628,11 +1629,11 @@ function FieldRow({
                 data-dirpicker-trigger
                 onClick={() => setPickerOpen((open) => !open)}
                 className="btn-secondary inline-flex items-center gap-1.5 text-sm px-3 py-2 flex-shrink-0"
-                title="Browse shared/ for a directory"
+                title={t("fieldform.browse_shared_title")}
                 aria-expanded={pickerOpen}
               >
                 <FolderOpen className="h-4 w-4" />
-                Browse
+                {t("fieldform.browse")}
               </button>
             </div>
             {pickerOpen && (
@@ -1658,8 +1659,8 @@ function FieldRow({
             placeholder={
               renderer === "secret"
                 ? entry.populated
-                  ? "Leave blank to keep current value"
-                  : "Enter value"
+                  ? t("fieldform.secret_keep_placeholder")
+                  : t("fieldform.secret_enter_placeholder")
                 : ""
             }
           />
@@ -1765,8 +1766,13 @@ function ArrayFieldEditor({
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: "var(--pc-text-faint)" }}>
-          {rows.length} {rows.length === 1 ? "entry" : "entries"}
-          {isOptional && rows.length === 0 ? " — saves as null" : null}
+          {rows.length}{" "}
+          {rows.length === 1
+            ? t("fieldform.entry")
+            : t("fieldform.entries")}
+          {isOptional && rows.length === 0
+            ? t("fieldform.saves_as_null")
+            : null}
         </span>
         <div
           className="inline-flex rounded-md overflow-hidden border text-xs"
@@ -1788,7 +1794,7 @@ function ArrayFieldEditor({
             }}
             aria-pressed={mode === "rows"}
           >
-            <ListIcon className="h-3 w-3" /> Rows
+            <ListIcon className="h-3 w-3" /> {t("fieldform.mode_rows")}
           </button>
           <button
             type="button"
@@ -1806,7 +1812,7 @@ function ArrayFieldEditor({
             }}
             aria-pressed={mode === "text"}
           >
-            <TypeIcon className="h-3 w-3" /> Text
+            <TypeIcon className="h-3 w-3" /> {t("fieldform.mode_text")}
           </button>
         </div>
       </div>
@@ -1818,7 +1824,7 @@ function ArrayFieldEditor({
               className="text-xs italic px-1 py-2"
               style={{ color: "var(--pc-text-faint)" }}
             >
-              No entries. Click "+ Add" to add one.
+              {t("fieldform.no_entries_add_one")}
             </p>
           ) : (
             <ul className="space-y-1.5" id={inputId}>
@@ -1833,8 +1839,8 @@ function ArrayFieldEditor({
                       value={row}
                       onChange={(v) => setRow(i, v)}
                       options={suggestions}
-                      placeholder="pick from list or type a value"
-                      emptyText="No match — your text is kept as-is"
+                      placeholder={t("fieldform.value_combo_placeholder")}
+                      emptyText={t("fieldform.value_combo_empty")}
                     />
                   ) : (
                     <input
@@ -1842,13 +1848,13 @@ function ArrayFieldEditor({
                       value={row}
                       onChange={(e) => setRow(i, e.target.value)}
                       className="input-electric flex-1 px-3 py-1.5 text-sm"
-                      placeholder="empty"
+                      placeholder={t("fieldform.empty")}
                     />
                   )}
                   <button
                     type="button"
                     onClick={() => removeRow(i)}
-                    title="Remove this entry"
+                    title={t("fieldform.remove_entry")}
                     className="btn-icon flex-shrink-0"
                   >
                     <Trash2 className="h-4 w-4" />
@@ -1862,7 +1868,7 @@ function ArrayFieldEditor({
             onClick={addRow}
             className="btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1"
           >
-            <Plus className="h-3 w-3" /> Add
+            <Plus className="h-3 w-3" /> {t("fieldform.add")}
           </button>
         </>
       ) : (
@@ -1948,7 +1954,7 @@ function ObjectArrayEditor({
     return (
       <div className="space-y-1.5">
         <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-          Element shape unavailable from schema; edit raw JSON below.
+          {t("fieldform.element_shape_unavailable")}
         </p>
         <textarea
           id={inputId}
@@ -1966,14 +1972,15 @@ function ObjectArrayEditor({
     <div className="space-y-2" id={inputId}>
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: "var(--pc-text-faint)" }}>
-          {rows.length} {rows.length === 1 ? "entry" : "entries"}
+          {rows.length}{" "}
+          {rows.length === 1 ? t("fieldform.entry") : t("fieldform.entries")}
         </span>
         <button
           type="button"
           onClick={addRow}
           className="btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1"
         >
-          <Plus className="h-3 w-3" /> Add
+          <Plus className="h-3 w-3" /> {t("fieldform.add")}
         </button>
       </div>
       {rows.length === 0 ? (
@@ -1981,7 +1988,7 @@ function ObjectArrayEditor({
           className="text-xs italic px-1 py-2"
           style={{ color: "var(--pc-text-faint)" }}
         >
-          No entries. Click "+ Add" to create one.
+          {t("fieldform.no_entries_create_one")}
         </p>
       ) : (
         <ul className="space-y-3">
@@ -2012,7 +2019,7 @@ function ObjectArrayEditor({
                 <button
                   type="button"
                   onClick={() => removeRow(rowIdx)}
-                  title="Remove this entry"
+                  title={t("fieldform.remove_entry")}
                   className="btn-icon"
                 >
                   <Trash2 className="h-4 w-4" />
@@ -2062,7 +2069,7 @@ function ObjectArrayField({
             className="ml-1.5 text-[10px]"
             style={{ color: "var(--pc-text-faint)" }}
           >
-            optional
+            {t("fieldform.optional_label")}
           </span>
         )}
       </label>
@@ -2205,7 +2212,8 @@ function KeyValueChipEditor({
     <div className="space-y-1.5 mt-1">
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: "var(--pc-text-faint)" }}>
-          {pairs.length} {pairs.length === 1 ? "entry" : "entries"}
+          {pairs.length}{" "}
+          {pairs.length === 1 ? t("fieldform.entry") : t("fieldform.entries")}
         </span>
         <div
           className="inline-flex rounded-md overflow-hidden border text-xs"
@@ -2227,7 +2235,7 @@ function KeyValueChipEditor({
             }}
             aria-pressed={mode === "rows"}
           >
-            <ListIcon className="h-3 w-3" /> Rows
+            <ListIcon className="h-3 w-3" /> {t("fieldform.mode_rows")}
           </button>
           <button
             type="button"
@@ -2245,7 +2253,7 @@ function KeyValueChipEditor({
             }}
             aria-pressed={mode === "text"}
           >
-            <TypeIcon className="h-3 w-3" /> Text
+            <TypeIcon className="h-3 w-3" /> {t("fieldform.mode_text")}
           </button>
         </div>
       </div>
@@ -2290,7 +2298,7 @@ function KeyValueChipEditor({
               className="text-[11px] italic"
               style={{ color: "var(--pc-text-faint)" }}
             >
-              No entries.
+              {t("fieldform.no_entries")}
             </p>
           ) : (
             <ul className="space-y-1">
@@ -2301,7 +2309,7 @@ function KeyValueChipEditor({
                     value={k}
                     onChange={(e) => setKey(i, e.target.value)}
                     className="input-electric flex-1 px-2 py-1 text-sm font-mono"
-                    placeholder="key"
+                    placeholder={t("fieldform.key_placeholder")}
                   />
                   <span style={{ color: "var(--pc-text-faint)" }}>=</span>
                   <input
@@ -2309,12 +2317,12 @@ function KeyValueChipEditor({
                     value={v}
                     onChange={(e) => setValue(i, e.target.value)}
                     className="input-electric flex-1 px-2 py-1 text-sm"
-                    placeholder="value"
+                    placeholder={t("fieldform.value_placeholder")}
                   />
                   <button
                     type="button"
                     onClick={() => removeAt(i)}
-                    title="Remove this entry"
+                    title={t("fieldform.remove_entry")}
                     className="btn-icon flex-shrink-0"
                   >
                     <Trash2 className="h-4 w-4" />
@@ -2328,7 +2336,7 @@ function KeyValueChipEditor({
             onClick={() => onChange([...pairs, ["", ""]])}
             className="btn-secondary text-xs px-2.5 py-1 inline-flex items-center gap-1"
           >
-            <Plus className="h-3 w-3" /> Add
+            <Plus className="h-3 w-3" /> {t("fieldform.add")}
           </button>
         </>
       )}
@@ -2347,7 +2355,7 @@ function DriftDiff({ drift }: { drift: DriftEntry }) {
         className="text-xs mt-1 inline-flex items-center gap-1"
         style={{ color: "var(--color-status-warning, #f5b400)" }}
       >
-        ⚠ secret value differs from on-disk
+        ⚠ {t("fieldform.drift_secret_differs")}
       </p>
     );
   }
@@ -2359,11 +2367,11 @@ function DriftDiff({ drift }: { drift: DriftEntry }) {
       style={{ color: "var(--color-status-warning, #f5b400)" }}
     >
       <span>
-        in-memory:{" "}
+        {t("fieldform.drift_in_memory")}{" "}
         <code style={{ color: "var(--pc-text-secondary)" }}>{inMem}</code>
       </span>
       <span>
-        on-disk:{" "}
+        {t("fieldform.drift_on_disk")}{" "}
         <code style={{ color: "var(--pc-text-secondary)" }}>{onDisk}</code>
       </span>
     </div>

@@ -89,7 +89,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             variant="ghost"
             onClick={onMenuToggle}
             className="md:hidden h-9 w-9 -ml-1.5 border-transparent px-0 shrink-0"
-            aria-label="Open menu"
+            aria-label={t('header.open_menu')}
           >
             <Menu className="h-5 w-5 shrink-0" />
           </Button>

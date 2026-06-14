@@ -128,7 +128,7 @@ export default function Config() {
           setError(`[${e.envelope.code}] ${e.envelope.message}`);
         } else {
           setError(
-            `Couldn't load sections: ${e instanceof Error ? e.message : String(e)}`,
+            `${t("config.load_sections_error")}${e instanceof Error ? e.message : String(e)}`,
           );
         }
       })
@@ -261,7 +261,7 @@ export default function Config() {
             className="self-start"
           >
             <ArrowLeft className="h-4 w-4" />
-            Back
+            {t("common.back")}
           </Button>
           <WireTabForm
             key={`${reloadKey}-${fieldsPrefix}`}
@@ -288,7 +288,7 @@ export default function Config() {
         extraTabs.push(
           {
             key: "peer_groups",
-            label: "Peer Groups",
+            label: t("config.tab_peer_groups"),
             render: () => (
               <AgentPeerGroupsTab
                 key={`${reloadKey}-${typeParam}-peer_groups`}
@@ -299,7 +299,7 @@ export default function Config() {
           },
           {
             key: "personality",
-            label: "Personality",
+            label: t("config.tab_personality"),
             render: () => (
               <PersonalityEditor
                 key={`${reloadKey}-${typeParam}-personality`}
@@ -311,7 +311,7 @@ export default function Config() {
       } else if (isSkillBundle) {
         extraTabs.push({
           key: "skills",
-          label: "Skills",
+          label: t("config.tab_skills"),
           render: () => (
             <SkillsBundleEditor
               key={`${reloadKey}-${typeParam}-skills`}
@@ -333,13 +333,13 @@ export default function Config() {
               className="self-start"
             >
               <ArrowLeft className="h-4 w-4" />
-              Back to {activeSection.label}
+              {t("config.back_to")}{activeSection.label}
             </Button>
             {isAgent && (
               <Link to={`/agent/${encodeURIComponent(typeParam)}`}>
                 <Button variant="ghost" size="sm">
                   <MessageSquare className="h-4 w-4" />
-                  Open chat
+                  {t("config.open_chat")}
                 </Button>
               </Link>
             )}
@@ -380,10 +380,10 @@ export default function Config() {
         return (
           <SectionTabs
             tabs={[
-              { key: "aliases", label: "Aliases", render: () => aliasListPane },
+              { key: "aliases", label: t("config.tab_aliases"), render: () => aliasListPane },
               {
                 key: "costs",
-                label: "Costs",
+                label: t("config.tab_costs"),
                 render: () => (
                   <CostRatesEditor
                     category={costsCategory}
@@ -413,7 +413,7 @@ export default function Config() {
             className="self-start"
           >
             <ArrowLeft className="h-4 w-4" />
-            Back to {activeSection.label}
+            {t("config.back_to")}{activeSection.label}
           </Button>
           <FieldForm
             key={`${reloadKey}-${typeParam}`}
@@ -492,7 +492,7 @@ export default function Config() {
 
   // Breadcrumb segments
   const crumbs: Array<{ label: string; url?: string }> = [
-    { label: "Config", url: "/config" },
+    { label: t("config.breadcrumb"), url: "/config" },
     {
       label: activeSection?.label ?? "",
       url: activeSection
@@ -563,11 +563,10 @@ export default function Config() {
                   the proposed new keys cfg.empty.title / cfg.empty.body
                   (reported back to the owner of i18n.ts). */}
               <p className="text-sm font-medium text-pc-text-secondary">
-                Select a setting
+                {t("config.empty_title")}
               </p>
               <p className="text-xs mt-1 text-pc-text-muted">
-                Pick a section or entry from the navigator to view and edit it
-                here.
+                {t("config.empty_body")}
               </p>
             </div>
           </div>
@@ -582,7 +581,7 @@ export default function Config() {
               onClick={() => navigate("/config")}
             >
               <ArrowLeft className="h-4 w-4" />
-              All settings
+              {t("config.all_settings")}
             </Button>
             {/* Layout note: every wrapper between <main> (the scroll
                 container) and FieldForm's save bar uses flex-1 + min-h-0
@@ -664,21 +663,19 @@ function ConfigAliasHelpBox() {
       style={{ background: "var(--pc-bg-surface-subtle)" }}
     >
       <p className="mb-1">
-        <strong>Alias.</strong> A short stable name you’ll use everywhere else
-        in config to point at this entry (agents, routes, and per-channel
-        bindings reference it as{" "}
+        <strong>{t("config.alias_help_term")}</strong>{" "}
+        {t("config.alias_help_intro")}{" "}
         <code>
           {"<type>"}.{"<alias>"}
         </code>
-        ). Aliases let you have several entries of the same type — a{" "}
-        <code>work</code> credential and a <code>personal</code> one, for
-        example.
+        {t("config.alias_help_examples_pre")}{" "}
+        <code>work</code> {t("config.alias_help_examples_mid")}{" "}
+        <code>personal</code> {t("config.alias_help_examples_post")}
       </p>
       <p className="mb-0">
-        Rules: lowercase letters, digits, single underscores; 1–63 chars; no
-        leading/trailing/double underscores, no dots, hyphens, or spaces.{" "}
-        <strong>Aliases can’t be renamed in v0.8.0</strong> — pick something
-        you’ll keep, or delete and recreate.
+        {t("config.alias_help_rules")}{" "}
+        <strong>{t("config.alias_help_no_rename")}</strong>{" "}
+        {t("config.alias_help_rename_advice")}
       </p>
     </div>
   );
@@ -696,7 +693,7 @@ function suggestConfigAlias(aliases: string[]): string {
 
 function validateConfigAlias(alias: string): string | null {
   if (/^(?!_)(?!.*__)(?!.*_$)[a-z0-9_]{1,63}$/.test(alias)) return null;
-  return "Alias must use lowercase letters, digits, or single underscores only; no hyphens, dots, spaces, leading/trailing underscores, or double underscores.";
+  return t("config.alias_validation_error");
 }
 
 function AliasListView({
@@ -779,7 +776,7 @@ function AliasListView({
         className="self-start"
       >
         <ArrowLeft className="h-4 w-4" />
-        Back
+        {t("common.back")}
       </Button>
 
       {sectionHelp && (
@@ -853,7 +850,7 @@ function AliasListView({
                 onClick={() => void submit()}
                 className="flex-shrink-0"
               >
-                Add
+                {t("config.add")}
               </Button>
             </div>
             {aliasError && (
@@ -1095,7 +1092,7 @@ function AgentPeerGroupsTab({
   if (loading) {
     return (
       <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
-        Loading peer groups…
+        {t("config.loading_peer_groups")}
       </p>
     );
   }
@@ -1120,7 +1117,7 @@ function AgentPeerGroupsTab({
         style={{ background: "var(--pc-bg-elevated)" }}
       >
         <span className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-          Add this agent to:
+          {t("config.add_agent_to")}
         </span>
         <select
           value={pickerValue}
@@ -1129,7 +1126,9 @@ function AgentPeerGroupsTab({
           className="input-electric text-xs px-2 py-1 appearance-none cursor-pointer"
         >
           <option value="">
-            {nonMembers.length === 0 ? "no other groups" : "select a group…"}
+            {nonMembers.length === 0
+              ? t("config.no_other_groups")
+              : t("config.select_a_group")}
           </option>
           {nonMembers.map((g) => (
             <option key={g} value={g}>
@@ -1143,14 +1142,14 @@ function AgentPeerGroupsTab({
           disabled={!pickerValue || adding}
           className="btn-electric text-xs px-3 py-1 rounded-lg disabled:opacity-50"
         >
-          {adding ? "Adding…" : "Add"}
+          {adding ? t("config.adding") : t("config.add")}
         </button>
         <Link
           to="/config/peer_groups"
           className="text-xs ml-auto hover:underline"
           style={{ color: "var(--pc-text-muted)" }}
         >
-          Create new →
+          {t("config.create_new")}
         </Link>
       </div>
 
@@ -1162,7 +1161,8 @@ function AgentPeerGroupsTab({
             background: "var(--pc-bg-elevated)",
           }}
         >
-          {agentAlias} is not a member of any peer group.
+          {agentAlias}
+          {t("config.not_member_suffix")}
         </p>
       ) : (
         memberOf.map((pg) => (
@@ -1187,9 +1187,9 @@ function AgentPeerGroupsTab({
                 onClick={() => removeFromGroup(pg)}
                 className="text-xs hover:underline"
                 style={{ color: "var(--color-status-error)" }}
-                title={`Remove ${agentAlias} from peer_groups.${pg}`}
+                title={`${t("config.remove_member_prefix")}${agentAlias}${t("config.remove_member_mid")}peer_groups.${pg}`}
               >
-                Remove from group
+                {t("config.remove_from_group")}
               </button>
             </div>
             <div className="p-4">
@@ -1292,14 +1292,14 @@ function AliasRow({
         type="button"
         onClick={onTrashClick}
         disabled={deleting}
-        title={armed ? "Click again to confirm delete" : "Delete this alias"}
+        title={armed ? t("config.confirm_delete_title") : t("config.delete_alias_title")}
         className={[
           "btn-icon flex-shrink-0",
           armed ? "text-status-error border-status-error/40" : "",
         ].join(" ")}
       >
         {armed ? (
-          <span className="text-xs px-1">Confirm</span>
+          <span className="text-xs px-1">{t("common.confirm")}</span>
         ) : (
           <Trash2 className="h-4 w-4" />
         )}
@@ -1348,7 +1348,7 @@ function SectionOverview({
         <FieldForm
           key={`${section.key}-fields`}
           prefix={section.key}
-          title={`${section.label} settings`}
+          title={`${section.label}${t("config.settings_suffix")}`}
           includePath={excludePicker}
         />
       </div>
@@ -1365,7 +1365,7 @@ function SectionOverview({
           className="self-start"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back to {section.label}
+          {t("config.back_to")}{section.label}
         </Button>
         <SectionPicker
           sectionKey={section.key}
@@ -1391,7 +1391,7 @@ function SectionOverview({
           className="flex-shrink-0"
         >
           <Plus className="h-4 w-4" />
-          Add
+          {t("config.add")}
         </Button>
       </div>
       <ConfiguredOnlyPicker
@@ -1439,7 +1439,7 @@ function ConfiguredOnlyPicker({
             setError(`[${e.envelope.code}] ${e.envelope.message}`);
           } else {
             setError(
-              `Couldn't load configured items: ${e instanceof Error ? e.message : String(e)}`,
+              `${t("config.load_items_error")}${e instanceof Error ? e.message : String(e)}`,
             );
           }
         })
@@ -1475,8 +1475,10 @@ function ConfiguredOnlyPicker({
   if (items.length === 0) {
     return (
       <Card className="p-8 text-center text-sm text-pc-text-muted">
-        Nothing configured under <strong>{section.label}</strong> yet. Click{" "}
-        <strong>+ Add</strong> to get started.
+        {t("config.nothing_configured_pre")} <strong>{section.label}</strong>{" "}
+        {t("config.nothing_configured_mid")}{" "}
+        <strong>{t("config.add_with_plus")}</strong>{" "}
+        {t("config.nothing_configured_post")}
       </Card>
     );
   }
