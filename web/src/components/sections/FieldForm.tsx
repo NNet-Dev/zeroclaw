@@ -427,7 +427,17 @@ function isRequiredField(typeHint: string): boolean {
 // inline via the `.path`-bound `ConfigApiError`. Scope is deliberately narrow:
 // only constraints we can read locally (a required scalar left empty; a
 // non-numeric value in an integer/float field).
-function validationHint(entry: ListResponseEntry, raw: string): string | null {
+function validationHint(
+  entry: ListResponseEntry,
+  raw: string,
+  // When the field's badge says it's optional, don't also flag an empty value
+  // as "required". `isRequiredField` keys off `Option<…>`, but reference types
+  // (e.g. `TtsProviderRef`, `TranscriptionProviderRef`) aren't `Option` yet are
+  // legitimately empty ("= none"), so without this a field shows BOTH an
+  // "Optional" badge and a red "required" hint. The server's
+  // `Config::validate()` stays authoritative.
+  treatAsOptional = false,
+): string | null {
   // Secrets: an empty box means "keep the stored value", never "cleared" —
   // so emptiness is never an error here.
   if (entry.is_secret) return null;
@@ -449,6 +459,7 @@ function validationHint(entry: ListResponseEntry, raw: string): string | null {
   // Required scalar left empty. Arrays/object-arrays carry their own three-state
   // semantics (empty list vs none) handled at save time, so we don't flag them.
   if (
+    !treatAsOptional &&
     isRequiredField(entry.type_hint) &&
     renderer !== "array" &&
     renderer !== "object-array" &&
@@ -1172,7 +1183,13 @@ function FieldRow({
   const requirement = setupRequirement(entry);
   // Display-only inline validation derived from this entry's schema metadata.
   // Pure read of `value` — it does not feed the save/PATCH path in any way.
-  const validationMessage = validationHint(entry, value);
+  // If the badge marks the field optional, don't also flag empty as required
+  // (keeps the "Optional" badge and the validation hint from contradicting).
+  const validationMessage = validationHint(
+    entry,
+    value,
+    requirement != null && requirement.tone !== "required",
+  );
   // Suppress the local hint while a server-side error is already bound to this
   // field so the two don't stack; the authoritative server message wins.
   const showValidation = validationMessage !== null && !error;
