@@ -133,10 +133,47 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
 // Pairing
 // ---------------------------------------------------------------------------
 
+/** Best-effort human label for the paired device, shown in the device list. */
+function pairingDeviceName(): string {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  const browser = /Edg/.test(ua)
+    ? "Edge"
+    : /OPR|Opera/.test(ua)
+      ? "Opera"
+      : /Chrome/.test(ua)
+        ? "Chrome"
+        : /Firefox/.test(ua)
+          ? "Firefox"
+          : /Safari/.test(ua)
+            ? "Safari"
+            : "Browser";
+  const os = /Windows/.test(ua)
+    ? "Windows"
+    : /Android/.test(ua)
+      ? "Android"
+      : /iPhone|iPad|iOS/.test(ua)
+        ? "iOS"
+        : /Mac/.test(ua)
+          ? "macOS"
+          : /Linux/.test(ua)
+            ? "Linux"
+            : "";
+  return os ? `${browser} on ${os}` : browser;
+}
+
 export async function pair(code: string): Promise<{ token: string }> {
-  const response = await fetch(`${basePath}/pair`, {
+  // Use the enhanced /api/pair endpoint (not legacy /pair): it registers the
+  // device in the device_registry so it shows up in the paired-devices list and
+  // can be revoked. /pair only persists the bearer token, leaving the device
+  // invisible/unmanageable in the UI. Both are unauthenticated (code-gated).
+  const response = await fetch(`${basePath}/api/pair`, {
     method: "POST",
-    headers: { "X-Pairing-Code": code },
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code,
+      device_name: pairingDeviceName(),
+      device_type: "browser",
+    }),
   });
 
   if (!response.ok) {
