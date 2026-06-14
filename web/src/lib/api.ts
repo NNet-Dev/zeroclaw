@@ -50,68 +50,109 @@ export class ApiError extends Error {
   }
 }
 
+// A response reduced to the plain data the downstream logic needs, so it can be
+// shared between coalesced callers (a Response body can only be read once).
+interface RawResult {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  text: string;
+}
+
+// In-flight GET coalescer. Concurrent identical GETs (same URL + token, no body)
+// share a single network request instead of each firing their own — this folds
+// away the duplicate fetches from React StrictMode's double-invoked effects and
+// from sibling components polling the same endpoint. Each caller re-parses the
+// shared response TEXT below, so no two callers ever share a mutable object.
+// Keyed entries are removed as soon as the request settles, so this only merges
+// genuinely-overlapping requests, never caches stale data.
+const inFlightGets = new Map<string, Promise<RawResult>>();
+
 export async function apiFetch<T = unknown>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
   const token = getToken();
-  const headers = new Headers(options.headers);
+  const url = `${apiOrigin}${basePath}${path}`;
+  const method = (options.method ?? "GET").toUpperCase();
+  // Only idempotent, body-less GETs are safe to coalesce.
+  const coalesceKey =
+    method === "GET" && !options.body ? `${token ?? ""} ${url}` : null;
 
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+  const doFetch = async (): Promise<RawResult> => {
+    const headers = new Headers(options.headers);
+    if (token) {
+      headers.set("Authorization", `Bearer ${token}`);
+    }
+    if (
+      options.body &&
+      typeof options.body === "string" &&
+      !headers.has("Content-Type")
+    ) {
+      headers.set("Content-Type", "application/json");
+    }
+    const response = await fetch(url, { ...options, headers });
+    const text =
+      response.status === 204 ? "" : await response.text().catch(() => "");
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      text,
+    };
+  };
+
+  let result: RawResult;
+  if (coalesceKey) {
+    const existing = inFlightGets.get(coalesceKey);
+    if (existing) {
+      result = await existing;
+    } else {
+      const pending = doFetch().finally(() => inFlightGets.delete(coalesceKey));
+      inFlightGets.set(coalesceKey, pending);
+      result = await pending;
+    }
+  } else {
+    result = await doFetch();
   }
 
-  if (
-    options.body &&
-    typeof options.body === "string" &&
-    !headers.has("Content-Type")
-  ) {
-    headers.set("Content-Type", "application/json");
-  }
-
-  const response = await fetch(`${apiOrigin}${basePath}${path}`, {
-    ...options,
-    headers,
-  });
-
-  if (response.status === 401) {
+  if (result.status === 401) {
     clearToken();
     window.dispatchEvent(new Event("zeroclaw-unauthorized"));
     throw new UnauthorizedError();
   }
 
-  if (!response.ok) {
+  if (!result.ok) {
     // Try to parse a structured ConfigApiError envelope. Falls back to a
     // plain Error when the body is non-JSON or doesn't match the shape.
     // Centralises the parsing so callers (including the Quickstart flow)
     // never have to regex-match `error.message` to recover the structured
     // code — they just `instanceof ApiError` and read `.envelope.code`.
-    const text = await response.text().catch(() => "");
-    if (text) {
+    if (result.text) {
       try {
-        const parsed = JSON.parse(text);
+        const parsed = JSON.parse(result.text);
         if (
           parsed &&
           typeof parsed === "object" &&
           typeof parsed.code === "string" &&
           typeof parsed.message === "string"
         ) {
-          throw new ApiError(response.status, parsed);
+          throw new ApiError(result.status, parsed);
         }
       } catch (e) {
         if (e instanceof ApiError) throw e;
         // JSON.parse failure → fall through to the plain Error path.
       }
     }
-    throw new Error(`API ${response.status}: ${text || response.statusText}`);
+    throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
   }
 
-  // Some endpoints may return 204 No Content
-  if (response.status === 204) {
+  // Some endpoints may return 204 No Content (or an otherwise empty body).
+  if (result.status === 204 || result.text === "") {
     return undefined as unknown as T;
   }
 
-  return response.json() as Promise<T>;
+  return JSON.parse(result.text) as T;
 }
 
 function unwrapField<T>(value: T | Record<string, T>, key: string): T {
