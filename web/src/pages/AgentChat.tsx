@@ -1,6 +1,6 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench } from 'lucide-react';
+import { Link, Navigate, useParams } from 'react-router-dom';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, FolderOpen } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
@@ -254,6 +254,14 @@ export function AgentChatInner({
         <div className="flex items-center gap-2">
           <Bot className="h-4 w-4 text-pc-accent" />
           <span className="text-sm font-medium text-pc-text">{agentAlias}</span>
+          <Link
+            to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
+            className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+            title="Open agent file workspace"
+          >
+            <FolderOpen className="h-3.5 w-3.5" />
+            Files
+          </Link>
         </div>
 
         <div className="relative" ref={modelDropdownRef}>

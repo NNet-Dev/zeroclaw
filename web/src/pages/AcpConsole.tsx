@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { Link } from 'react-router-dom';
 import {
   AlertCircle,
   Check,
@@ -8,6 +9,7 @@ import {
   ShieldCheck,
   Square,
   Terminal,
+  Users,
   X,
 } from 'lucide-react';
 import { Badge, Button, Card, PageHeader, type BadgeTone } from '@/components/ui';
@@ -567,6 +569,22 @@ export default function AcpConsole() {
         <div className="rounded-[var(--radius-md)] border border-status-error/20 bg-status-error/10 px-4 py-3 flex items-start gap-2 text-sm text-status-error">
           <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
           <span>{error}</span>
+        </div>
+      )}
+
+      {!agentsLoading && !hasEnabledAgent && (
+        <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-surface px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-sm text-pc-text-secondary">
+          <span>
+            {agents.length === 0
+              ? t('acp.agent.none_configured')
+              : t('acp.agent.none_enabled')}
+          </span>
+          <Link to="/agents">
+            <Button variant="ghost" size="sm">
+              <Users className="h-4 w-4" />
+              Manage agents
+            </Button>
+          </Link>
         </div>
       )}
 

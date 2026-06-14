@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import {
   Wrench,
   Search,
@@ -6,6 +7,7 @@ import {
   ChevronRight,
   Terminal,
   Package,
+  ArrowRight,
 } from 'lucide-react';
 import type { ToolSpec, CliTool } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
@@ -61,16 +63,37 @@ export default function Tools() {
     <div className="p-6 space-y-6">
       <PageHeader
         title={t('tools.title')}
+        description={
+          <>
+            This catalog lists every tool the agent can call. Which tools an
+            agent may actually use is gated per risk profile via{' '}
+            <code className="rounded-[var(--radius-sm)] px-1 py-0.5 text-[0.85em] font-mono bg-pc-code text-pc-text-secondary">
+              risk_profiles.&lt;name&gt;.allowed_tools
+            </code>
+            .
+          </>
+        }
         actions={
-          <div className="relative w-64 max-w-full">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-pc-text-faint pointer-events-none" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder={t('tools.search')}
-              className="w-full h-9 pl-9 pr-3 text-sm rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30"
-            />
+          <div className="flex items-center gap-2 flex-wrap justify-end">
+            <div className="relative w-64 max-w-full">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-pc-text-faint pointer-events-none" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={t('tools.search')}
+                className="w-full h-9 pl-9 pr-3 text-sm rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30"
+              />
+            </div>
+            {/* Exit path: tool access is configured per risk profile, so send
+                the operator to the risk-profiles config section. */}
+            <Link
+              to="/config/risk_profiles"
+              className="inline-flex items-center justify-center gap-1.5 h-9 px-3.5 text-sm font-medium whitespace-nowrap rounded-[var(--radius-md)] border border-pc-border bg-transparent text-pc-text-secondary transition-colors duration-150 hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
+            >
+              Configure tool access
+              <ArrowRight className="h-3.5 w-3.5" />
+            </Link>
           </div>
         }
       />

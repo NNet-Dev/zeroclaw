@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   CheckCircle,
   AlertTriangle,
@@ -6,10 +7,12 @@ import {
   Loader2,
   Play,
   Stethoscope,
+  ArrowRight,
 } from 'lucide-react';
 import type { DiagResult } from '@/types/api';
 import { runDoctor } from '@/lib/api';
 import { Badge, Button, Card, PageHeader } from '@/components/ui';
+import ReloadDaemonButton from '@/components/sections/ReloadDaemonButton';
 import { t } from '@/lib/i18n';
 
 type Severity = DiagResult['severity'];
@@ -19,6 +22,27 @@ const SEVERITY_TONE: Record<Severity, 'ok' | 'warn' | 'error'> = {
   warn: 'warn',
   error: 'error',
 };
+
+/**
+ * Best-effort remediation route per diagnostic category. `DiagResult` carries
+ * no per-finding target, so this maps the coarse `category` to the closest
+ * page an operator can act on:
+ *  - `config`    → /config  (edit the offending config)
+ *  - `workspace` → /config  (closest actionable surface)
+ *  - `daemon`    → null     (covered by the "Reload daemon" header action)
+ *  - `environment`, `cli-tools` → null (system-level; nothing to open in the UI)
+ * Returns `[href, label]`, or `null` when no in-app link is sensible.
+ */
+function remediationLink(category: string): [string, string] | null {
+  switch (category) {
+    case 'config':
+      return ['/config', 'Open config'];
+    case 'workspace':
+      return ['/config', 'Open config'];
+    default:
+      return null;
+  }
+}
 
 function severityIcon(severity: Severity) {
   switch (severity) {
@@ -68,19 +92,24 @@ export default function Doctor() {
         title={t('doctor.diagnostics_title')}
         description={t('doctor.system_diagnostics')}
         actions={
-          <Button onClick={handleRun} disabled={loading}>
-            {loading ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                {t('doctor.running_btn')}
-              </>
-            ) : (
-              <>
-                <Play className="h-4 w-4" />
-                {t('doctor.run_diagnostics')}
-              </>
-            )}
-          </Button>
+          <>
+            {/* Many config/daemon findings only clear after the daemon
+                re-consumes config. Re-run diagnostics once it's back. */}
+            <ReloadDaemonButton onReloaded={() => void handleRun()} />
+            <Button onClick={handleRun} disabled={loading}>
+              {loading ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {t('doctor.running_btn')}
+                </>
+              ) : (
+                <>
+                  <Play className="h-4 w-4" />
+                  {t('doctor.run_diagnostics')}
+                </>
+              )}
+            </Button>
+          </>
         }
       />
 
@@ -153,20 +182,35 @@ export default function Doctor() {
                   {category}
                 </h3>
                 <div className="space-y-2">
-                  {items.map((result, idx) => (
-                    <Card
-                      key={`${category}-${idx}`}
-                      className="flex items-start gap-3 p-3"
-                    >
-                      {severityIcon(result.severity)}
-                      <div className="min-w-0 flex-1">
-                        <p className="text-sm text-pc-text">{result.message}</p>
-                      </div>
-                      <Badge tone={SEVERITY_TONE[result.severity]}>
-                        {result.severity}
-                      </Badge>
-                    </Card>
-                  ))}
+                  {items.map((result, idx) => {
+                    const link =
+                      result.severity !== 'ok'
+                        ? remediationLink(result.category)
+                        : null;
+                    return (
+                      <Card
+                        key={`${category}-${idx}`}
+                        className="flex items-start gap-3 p-3"
+                      >
+                        {severityIcon(result.severity)}
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm text-pc-text">{result.message}</p>
+                        </div>
+                        {link && (
+                          <Link
+                            to={link[0]}
+                            className="inline-flex h-7 flex-shrink-0 items-center gap-1 rounded-[var(--radius-md)] border border-pc-border bg-transparent px-2.5 text-[13px] font-medium text-pc-text-secondary transition-colors duration-150 hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
+                          >
+                            {link[1]}
+                            <ArrowRight className="h-3.5 w-3.5" />
+                          </Link>
+                        )}
+                        <Badge tone={SEVERITY_TONE[result.severity]}>
+                          {result.severity}
+                        </Badge>
+                      </Card>
+                    );
+                  })}
                 </div>
               </div>
             ))}

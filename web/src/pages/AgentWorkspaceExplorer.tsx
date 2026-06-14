@@ -171,10 +171,10 @@ export default function AgentWorkspaceExplorer() {
   return (
     <div className="p-6 space-y-4 animate-fade-in">
       <div className="flex items-center gap-3 flex-wrap">
-        <Link to={`/config/agents/${encodeURIComponent(alias)}`} className="inline-block">
+        <Link to={`/agent/${encodeURIComponent(alias)}`} className="inline-block">
           <Button variant="ghost" size="sm">
             <ArrowLeft className="h-4 w-4" />
-            {t('common.back')} to {alias}
+            {t('common.back')} to chat ({alias})
           </Button>
         </Link>
         <h1 className="text-lg font-semibold text-pc-text">

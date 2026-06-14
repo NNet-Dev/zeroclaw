@@ -14,7 +14,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, ChevronRight, Plus, Sparkles, Trash2 } from "lucide-react";
+import { ArrowLeft, ChevronRight, MessageSquare, Plus, Sparkles, Trash2 } from "lucide-react";
 import {
   ApiError,
   deleteMapKey,
@@ -323,17 +323,27 @@ export default function Config() {
 
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() =>
-              navigate(`/config/${encodeURIComponent(activeSection.key)}`)
-            }
-            className="self-start"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back to {activeSection.label}
-          </Button>
+          <div className="flex items-center justify-between gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                navigate(`/config/${encodeURIComponent(activeSection.key)}`)
+              }
+              className="self-start"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Back to {activeSection.label}
+            </Button>
+            {isAgent && (
+              <Link to={`/agent/${encodeURIComponent(typeParam)}`}>
+                <Button variant="ghost" size="sm">
+                  <MessageSquare className="h-4 w-4" />
+                  Open chat
+                </Button>
+              </Link>
+            )}
+          </div>
           <WireTabForm
             key={`${reloadKey}-${fieldsPrefix}`}
             prefix={fieldsPrefix}

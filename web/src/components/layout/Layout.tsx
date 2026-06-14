@@ -19,7 +19,7 @@ const TITLE_KEYS: Record<string, string> = {
   cron: 'nav.cron',
   logs: 'nav.logs',
   doctor: 'nav.doctor',
-  pairing: 'nav.doctor',
+  pairing: 'nav.pairing',
   canvas: 'nav.canvas',
   'acp-console': 'nav.acp',
   quickstart: 'nav.quickstart',

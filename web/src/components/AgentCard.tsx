@@ -7,6 +7,7 @@ import {
   Power,
   Wifi,
 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import type { AgentSummary } from '@/lib/agents';
 import { Badge } from '@/components/ui';
 import { t } from '@/lib/i18n';
@@ -57,7 +58,14 @@ function RowFact({
  * (Open chat, Edit, the per-entity config links) live in the drawer.
  */
 export default function AgentCard({ agent, onSelect, selected = false }: AgentCardProps) {
+  const navigate = useNavigate();
   const channelCount = agent.channels.length;
+  const chatHref = `/agent/${encodeURIComponent(agent.alias)}`;
+  const openChat = (e: { stopPropagation: () => void; preventDefault: () => void }) => {
+    e.stopPropagation();
+    e.preventDefault();
+    navigate(chatHref);
+  };
 
   return (
     <button
@@ -130,6 +138,23 @@ export default function AgentCard({ agent, onSelect, selected = false }: AgentCa
           }
         />
       </div>
+
+      {/* Primary action: one-click into the chat. The row itself opens the
+          detail drawer; this jumps straight to the conversation. */}
+      <span
+        role="button"
+        tabIndex={0}
+        aria-label={`${t('agent.open_chat')} · ${agent.alias}`}
+        title={t('agent.open_chat')}
+        onClick={openChat}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') openChat(e);
+        }}
+        className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[var(--radius-md)] flex-shrink-0 text-xs font-medium cursor-pointer bg-pc-accent/10 text-pc-accent hover:bg-pc-accent/20 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+      >
+        <MessageSquare className="h-3.5 w-3.5" />
+        <span className="hidden sm:inline">{t('agent.open_chat')}</span>
+      </span>
 
       <ChevronRight className="h-4 w-4 flex-shrink-0 text-pc-text-faint transition-colors group-hover:text-pc-text-muted" />
     </button>

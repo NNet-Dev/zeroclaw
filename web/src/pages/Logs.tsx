@@ -280,14 +280,22 @@ export default function Logs() {
     return () => window.clearTimeout(timer);
   }, [filterKey, initialLoad]);
 
-  const setFieldEq = (key: string, value: string) => {
+  const setFieldEq = useCallback((key: string, value: string) => {
     setFilter((prev) => {
       const next = { ...prev.fieldEq };
       if (value) next[key] = value;
       else delete next[key];
       return { ...prev, fieldEq: next };
     });
-  };
+  }, []);
+
+  // Click-to-filter from a log row's attribution chips. The dedicated
+  // event.action filter lives at the top level (`action`); every other
+  // attribution key is an exact match in `field_eq`. Setting either re-bases
+  // the stream via the existing filter-change effect — no special-casing here.
+  const setActionFilter = useCallback((value: string) => {
+    setFilter((prev) => ({ ...prev, action: value }));
+  }, []);
 
   const activeFieldKeys = Object.entries(filter.fieldEq)
     .filter(([, value]) => value !== '')
@@ -527,7 +535,14 @@ export default function Logs() {
             <p className="text-sm">No events match the current filters.</p>
           </div>
         ) : (
-          events.map((event) => <LogRow key={event.id} event={event} />)
+          events.map((event) => (
+            <LogRow
+              key={event.id}
+              event={event}
+              onFilterAction={setActionFilter}
+              onFilterField={setFieldEq}
+            />
+          ))
         )}
         {!atEnd && events.length > 0 && (
           <div className="flex justify-center pt-3">
@@ -546,7 +561,43 @@ export default function Logs() {
   );
 }
 
-function LogRow({ event }: { event: LogEvent }) {
+// A click-to-filter attribute value. Renders `key=value` where the value is a
+// button that sets the matching filter on click. Styled to read as plain text
+// until hovered/focused, so the affordance is discoverable without adding chrome
+// to every row. `title` spells out what the click does for pointer + AT users.
+function FilterableValue({
+  attrKey,
+  value,
+  onClick,
+}: {
+  attrKey: string;
+  value: string;
+  onClick: () => void;
+}) {
+  return (
+    <span>
+      <span className="text-pc-text-faint">{attrKey}=</span>
+      <button
+        type="button"
+        onClick={onClick}
+        title={`Filter logs where ${attrKey} = ${value}`}
+        className="rounded-[var(--radius-sm)] px-0.5 -mx-0.5 text-pc-text-muted transition-colors hover:bg-pc-accent/10 hover:text-pc-accent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-pc-accent cursor-pointer"
+      >
+        {value}
+      </button>
+    </span>
+  );
+}
+
+function LogRow({
+  event,
+  onFilterAction,
+  onFilterField,
+}: {
+  event: LogEvent;
+  onFilterAction: (value: string) => void;
+  onFilterField: (key: string, value: string) => void;
+}) {
   const level = severityClasses(event.severity_number);
   const attribution = event.zeroclaw ?? {};
   const attributionEntries = Object.entries(attribution).filter(
@@ -564,8 +615,19 @@ function LogRow({ event }: { event: LogEvent }) {
         >
           {event.severity_text}
         </span>
+        {/* category.action — the action segment is click-to-filter, populating
+            the dedicated event.action filter. Category stays plain to avoid
+            implying a filter that doesn't exist as a top-level control. */}
         <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] border border-pc-border bg-pc-base text-pc-text-muted flex-shrink-0">
-          {event.event.category}.{event.event.action}
+          {event.event.category}.
+          <button
+            type="button"
+            onClick={() => onFilterAction(event.event.action)}
+            title={`Filter logs where event.action = ${event.event.action}`}
+            className="rounded-[var(--radius-sm)] px-0.5 -mx-0.5 transition-colors hover:bg-pc-accent/10 hover:text-pc-accent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-pc-accent cursor-pointer"
+          >
+            {event.event.action}
+          </button>
         </span>
         <div className="flex-1 min-w-0">
           {hasMessage && (
@@ -578,10 +640,12 @@ function LogRow({ event }: { event: LogEvent }) {
               className={`${hasMessage ? 'mt-1' : ''} flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-pc-text-muted`}
             >
               {attributionEntries.map(([key, value]) => (
-                <span key={key}>
-                  <span className="text-pc-text-faint">{key}=</span>
-                  {String(value)}
-                </span>
+                <FilterableValue
+                  key={key}
+                  attrKey={key}
+                  value={String(value)}
+                  onClick={() => onFilterField(key, String(value))}
+                />
               ))}
               {typeof attribution.duration_ms === 'number' && (
                 <span>

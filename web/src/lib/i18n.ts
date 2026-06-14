@@ -423,6 +423,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.group.configure': 'Configure',
     'nav.group.operations': 'Operations',
     'nav.aria.primary': 'Primary navigation',
+    'nav.pairing': 'Pairing',
     'nav.cmdk.placeholder': 'Search…',
     'nav.cmdk.title': 'Command palette',
     'nav.cmdk.empty': 'No results',
