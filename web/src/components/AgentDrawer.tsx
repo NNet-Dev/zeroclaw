@@ -2,6 +2,10 @@ import { useEffect, useRef } from 'react';
 import type { ReactNode, ComponentType } from 'react';
 import { Link } from 'react-router-dom';
 import {
+  useFocusTrap,
+  FOCUSABLE_SELECTOR_FORM,
+} from '@/hooks/useFocusTrap';
+import {
   BookOpen,
   Bot,
   Brain,
@@ -23,6 +27,7 @@ import type { LucideProps } from 'lucide-react';
 import type { AgentSummary } from '@/lib/agents';
 import { Badge } from '@/components/ui';
 import { t } from '@/lib/i18n';
+import { formatRelative, formatUsd } from '@/lib/format';
 import EntityLink from './EntityLink';
 
 export interface AgentDrawerProps {
@@ -34,23 +39,6 @@ export interface AgentDrawerProps {
   onToggle: (agent: AgentSummary) => void;
   /** Whether this agent's toggle request is in flight. */
   toggling: boolean;
-}
-
-function formatRelative(iso: string | null): string {
-  if (!iso) return t('agent.no_sessions_yet');
-  const ts = Date.parse(iso);
-  if (Number.isNaN(ts)) return t('agent.no_sessions_yet');
-  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (diffSec < 60) return t('agent.just_now');
-  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
-  if (diffSec < 86_400) return `${Math.floor(diffSec / 3600)}h ago`;
-  return `${Math.floor(diffSec / 86_400)}d ago`;
-}
-
-function formatUsd(value: number | null): string {
-  if (value === null) return '—';
-  if (value < 0.01) return '<$0.01';
-  return `$${value.toFixed(2)}`;
 }
 
 // Calm chip mirroring the list-row treatment: a muted token surface that links
@@ -101,44 +89,23 @@ export default function AgentDrawer({
 
   const open = agent !== null;
 
-  // Focus the close button on open; restore focus to the previously-focused
-  // element (the row that opened the drawer) on close.
-  useEffect(() => {
-    if (!open) return;
-    const previouslyFocused = document.activeElement as HTMLElement | null;
-    closeBtnRef.current?.focus();
-    return () => previouslyFocused?.focus?.();
-  }, [open]);
+  // Esc closes; Tab is trapped inside the drawer panel; focus is restored to the
+  // opener (the row that opened the drawer) on close. Matches the prior
+  // hand-rolled effect (wide selector that includes select/textarea, no
+  // visibility filter, Esc does not preventDefault). Declared before the
+  // focus-on-open effect so the trap captures the opener as the restore target
+  // before focus moves into the panel.
+  useFocusTrap(panelRef, {
+    onClose,
+    enabled: open,
+    focusableSelector: FOCUSABLE_SELECTOR_FORM,
+  });
 
-  // Esc closes; Tab is trapped inside the drawer panel.
+  // Focus the close button on open. (Store/restore + Esc/Tab handled above.)
   useEffect(() => {
     if (!open) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-        return;
-      }
-      if (e.key !== 'Tab') return;
-      const panel = panelRef.current;
-      if (!panel) return;
-      const focusable = panel.querySelectorAll<HTMLElement>(
-        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      );
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (!first || !last) return;
-      const active = document.activeElement;
-      if (e.shiftKey && active === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && active === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [open, onClose]);
+    closeBtnRef.current?.focus();
+  }, [open]);
 
   if (!agent) return null;
 

@@ -96,7 +96,7 @@ import EntityEnabledToggle from "@/components/EntityEnabledToggle";
 import { useSSE } from "@/hooks/useSSE";
 import { usePolling } from "@/hooks/usePolling";
 import { t } from "@/lib/i18n";
-import { StatCard, PageHeader } from "@/components/ui";
+import { StatCard, PageHeader, ConfirmDialog } from "@/components/ui";
 
 type TabId =
   | "overview"
@@ -848,6 +848,8 @@ function SessionsTab() {
   } | null>(null);
   const [inspectNewestFirst, setInspectNewestFirst] = useState(true);
   const [deleting, setDeleting] = useState<string | null>(null);
+  // The session queued for deletion; non-null opens the confirm dialog.
+  const [pendingDelete, setPendingDelete] = useState<Session | null>(null);
 
   const { events } = useSSE({
     filterTypes: ["session_update", "session_created", "session_closed"],
@@ -946,15 +948,11 @@ function SessionsTab() {
       );
   };
 
+  // Runs once the operator confirms in the dialog; the destructive intent is
+  // gated by ConfirmDialog rather than the native window.confirm.
   const handleDelete = async (session: Session) => {
     if (deleting) return;
-    if (
-      !window.confirm(
-        `${t("dashboard.confirm_delete_session_prefix")} ${session.session_id}${t("dashboard.confirm_delete_suffix")}`,
-      )
-    ) {
-      return;
-    }
+    setPendingDelete(null);
     setDeleting(session.session_key);
     try {
       await deleteSession(session.session_key);
@@ -1181,7 +1179,7 @@ function SessionsTab() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleDelete(session)}
+                  onClick={() => setPendingDelete(session)}
                   disabled={deleting === session.session_key}
                   className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
                   title={t("dashboard.delete_session")}
@@ -1338,6 +1336,18 @@ function SessionsTab() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        title={t("common.delete")}
+        message={`${t("dashboard.confirm_delete_session_prefix")} ${pendingDelete?.session_id ?? ""}${t("dashboard.confirm_delete_suffix")}`}
+        confirmLabel={t("common.delete")}
+        onConfirm={() => {
+          if (pendingDelete) void handleDelete(pendingDelete);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </div>
   );
 }
@@ -2089,6 +2099,8 @@ function MemoriesTab() {
   }, [searchQuery]);
   const [knownAgents, setKnownAgents] = useState<string[]>([]);
   const [deleting, setDeleting] = useState<string | null>(null);
+  // The entry queued for deletion; non-null opens the confirm dialog.
+  const [pendingDelete, setPendingDelete] = useState<MemoryEntry | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showAddForm, setShowAddForm] = useState(false);
   const [formKey, setFormKey] = useState("");
@@ -2173,14 +2185,11 @@ function MemoriesTab() {
     return sorted;
   }, [entries, sortBy]);
 
+  // Runs once the operator confirms in the dialog; the destructive intent is
+  // gated by ConfirmDialog rather than the native window.confirm.
   const handleDelete = async (entry: MemoryEntry) => {
     if (deleting) return;
-    if (
-      !window.confirm(
-        `${t("dashboard.mem.confirm_delete_prefix")} ${entry.key}${t("dashboard.confirm_delete_suffix")}`,
-      )
-    )
-      return;
+    setPendingDelete(null);
     setDeleting(entry.id);
     try {
       // Per-agent rows resolve through the agent's own memory backend; the
@@ -2438,7 +2447,7 @@ function MemoriesTab() {
               </div>
               <button
                 type="button"
-                onClick={() => handleDelete(entry)}
+                onClick={() => setPendingDelete(entry)}
                 disabled={deleting === entry.id}
                 className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50 flex-shrink-0"
                 title={t("dashboard.mem.delete")}
@@ -2584,6 +2593,18 @@ function MemoriesTab() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        title={t("common.delete")}
+        message={`${t("dashboard.mem.confirm_delete_prefix")} ${pendingDelete?.key ?? ""}${t("dashboard.confirm_delete_suffix")}`}
+        confirmLabel={t("common.delete")}
+        onConfirm={() => {
+          if (pendingDelete) void handleDelete(pendingDelete);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </div>
   );
 }
@@ -2660,7 +2681,7 @@ function truncateForPreview(content: string): string {
 function formatMetricUsd(value: number): string {
   if (value <= 0) return "$0";
   if (value < 0.01) return "<$0.01";
-  if (value < 1) return `$${value.toFixed(2)}`;
+  // Below $100 keep cents; the prior `< 1` and `< 100` branches were identical.
   if (value < 100) return `$${value.toFixed(2)}`;
   return `$${Math.round(value).toLocaleString()}`;
 }

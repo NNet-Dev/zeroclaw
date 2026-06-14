@@ -3,6 +3,10 @@ import { Link } from 'react-router-dom';
 import { ExternalLink, X } from 'lucide-react';
 import { Button } from '@/components/ui';
 import FieldForm from '@/components/sections/FieldForm';
+import {
+  useFocusTrap,
+  FOCUSABLE_SELECTOR_FORM,
+} from '@/hooks/useFocusTrap';
 
 export interface DoctorFixModalProps {
   /** Whether the modal is mounted/visible. */
@@ -44,47 +48,24 @@ export default function DoctorFixModal({
   const closeRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
 
-  // Focus the close button on open; restore focus to the previously-focused
-  // element (the trigger) on close.
-  useEffect(() => {
-    if (!open) return;
-    const previouslyFocused = document.activeElement as HTMLElement | null;
-    closeRef.current?.focus();
-    return () => previouslyFocused?.focus?.();
-  }, [open]);
+  // Esc closes; Tab is trapped inside the dialog panel; focus is restored to the
+  // trigger on close. Matches the prior hand-rolled effect (wide selector that
+  // includes select/textarea, visible-only tab stops, Esc preventDefaults).
+  // Declared before the focus-on-open effect so the trap captures the trigger as
+  // the restore target before focus moves into the panel.
+  useFocusTrap(panelRef, {
+    onClose,
+    enabled: open,
+    focusableSelector: FOCUSABLE_SELECTOR_FORM,
+    filterVisible: true,
+    preventDefaultOnEscape: true,
+  });
 
-  // Esc closes; Tab is trapped inside the dialog panel.
+  // Focus the close button on open. (Store/restore + Esc/Tab handled above.)
   useEffect(() => {
     if (!open) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-        return;
-      }
-      if (e.key !== 'Tab') return;
-      const panel = panelRef.current;
-      if (!panel) return;
-      const focusable = Array.from(
-        panel.querySelectorAll<HTMLElement>(
-          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        ),
-      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (!first || !last) return;
-      const active = document.activeElement;
-      if (e.shiftKey && active === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && active === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [open, onClose]);
+    closeRef.current?.focus();
+  }, [open]);
 
   if (!open) return null;
 

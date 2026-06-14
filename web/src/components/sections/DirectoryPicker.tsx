@@ -8,7 +8,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { ArrowUp, FolderOpen, ChevronRight, RefreshCw, FolderPlus, Trash2 } from 'lucide-react';
-import { Button } from '@/components/ui';
+import { Button, ConfirmDialog } from '@/components/ui';
 import {
   ApiError,
   browseShared,
@@ -35,6 +35,8 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
   const [creating, setCreating] = useState(false);
   const [newDirName, setNewDirName] = useState('');
   const [busyDir, setBusyDir] = useState<string | null>(null);
+  // The directory name queued for deletion; non-null opens the confirm dialog.
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Restore focus to the trigger only on keyboard/explicit close — NOT when
@@ -54,11 +56,12 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
   }, []);
 
   // Esc dismisses the picker; outside (backdrop-equivalent) clicks dismiss it
-  // too. The inline "new folder" input owns Esc while open, so only close the
-  // whole picker from Esc when not mid-create.
+  // too. The inline "new folder" input owns Esc while open, and the delete
+  // confirm dialog owns it while open, so only close the whole picker from Esc
+  // when neither is active.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !creating) {
+      if (e.key === 'Escape' && !creating && pendingDelete === null) {
         e.stopPropagation();
         onClose();
       }
@@ -79,7 +82,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('pointerdown', onPointerDown);
     };
-  }, [onClose, creating]);
+  }, [onClose, creating, pendingDelete]);
 
   useEffect(() => {
     let cancelled = false;
@@ -133,11 +136,9 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
     }
   };
 
-  const handleDelete = async (name: string) => {
+  // Run the actual delete once the operator confirms via the dialog.
+  const confirmDelete = async (name: string) => {
     const target = cwd ? `${cwd}/${name}` : name;
-    if (!window.confirm(`Delete shared/${target}? This removes the directory and everything inside it.`)) {
-      return;
-    }
     setBusyDir(name);
     setError(null);
     try {
@@ -281,7 +282,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
                   </button>
                   <button
                     type="button"
-                    onClick={() => void handleDelete(entry.name)}
+                    onClick={() => setPendingDelete(entry.name)}
                     disabled={busyDir === entry.name}
                     title={`Delete shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
                     aria-label={`Delete shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
@@ -324,6 +325,24 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
           </Button>
         </div>
       </div>
+
+      {/* Themed confirm for the destructive directory delete. Rendered inside
+          the picker panel so its backdrop/clicks are treated as in-bounds by
+          the outside-click handler above and don't dismiss the picker. */}
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        title="Delete directory?"
+        message={`Delete shared/${
+          cwd ? `${cwd}/${pendingDelete}` : pendingDelete
+        }? This removes the directory and everything inside it.`}
+        confirmLabel="Delete"
+        onConfirm={() => {
+          if (pendingDelete !== null) void confirmDelete(pendingDelete);
+          setPendingDelete(null);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </div>
   );
 }

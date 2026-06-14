@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import { Button } from '@/components/ui';
+import { useFocusTrap } from '@/hooks/useFocusTrap';
 
 interface Props {
   label: string;
@@ -14,43 +15,19 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
   const inputRef = useRef<HTMLInputElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
-  // Focus the input on open; restore focus to the previously-focused element
-  // (the trigger) on close.
+  // Esc closes; Tab is trapped inside the dialog panel; focus is restored to the
+  // trigger on close. Matches the prior hand-rolled effect (default selector —
+  // no select/textarea, no visibility filter, Esc does not preventDefault).
+  // The dialog is mounted only while open, so the trap is always enabled.
+  // Declared before the focus-on-open effect so the trap captures the trigger as
+  // the restore target before focus moves into the input.
+  useFocusTrap(panelRef, { onClose: onCancel });
+
+  // Focus + select the input on open. (Store/restore + Esc/Tab handled above.)
   useEffect(() => {
-    const previouslyFocused = document.activeElement as HTMLElement | null;
     inputRef.current?.focus();
     inputRef.current?.select();
-    return () => previouslyFocused?.focus?.();
   }, []);
-
-  // Esc closes; Tab is trapped inside the dialog panel.
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onCancel();
-        return;
-      }
-      if (e.key !== 'Tab') return;
-      const panel = panelRef.current;
-      if (!panel) return;
-      const focusable = panel.querySelectorAll<HTMLElement>(
-        'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      );
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (!first || !last) return;
-      const active = document.activeElement;
-      if (e.shiftKey && active === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && active === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [onCancel]);
 
   const confirm = () => {
     const trimmed = value.trim();

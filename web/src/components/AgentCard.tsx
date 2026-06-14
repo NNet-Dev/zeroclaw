@@ -10,6 +10,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import type { AgentSummary } from '@/lib/agents';
 import { Badge } from '@/components/ui';
+import { formatUsd } from '@/lib/format';
 import { t } from '@/lib/i18n';
 
 export interface AgentCardProps {
@@ -18,12 +19,6 @@ export interface AgentCardProps {
   onSelect: () => void;
   /** Highlight when this row's agent is the one shown in the drawer. */
   selected?: boolean;
-}
-
-function formatUsd(value: number | null): string {
-  if (value === null) return '—';
-  if (value < 0.01) return '<$0.01';
-  return `$${value.toFixed(2)}`;
 }
 
 // A compact inline fact: icon + value, with a muted caption that collapses on

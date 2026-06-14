@@ -158,11 +158,27 @@ export default function SectionNavigator({
   // Track the latest request per section so a slow earlier fetch can't
   // clobber a newer one.
   const reqSeq = useRef<Record<string, number>>({});
+  // Track the refreshKey each section was last (re)loaded at, so we only
+  // fetch a section that's unloaded OR was loaded before the current
+  // refreshKey. This stops expanding/collapsing one section — or search
+  // expanding every match — from re-fetching the already-loaded ones, while
+  // still letting a refreshKey bump (after add/delete/reload) refetch every
+  // expanded section to pick up new/removed aliases.
+  const loadedAtRefresh = useRef<Record<string, number>>({});
   useEffect(() => {
     let cancelled = false;
     for (const key of expanded) {
       const section = sections.find((s) => s.key === key);
       if (!section || !sectionHasChildren(section)) continue;
+      // Skip sections already loaded at the current refreshKey — only fetch
+      // when this section has never loaded or refreshKey advanced since.
+      if (
+        entitiesBySection[key] !== undefined &&
+        loadedAtRefresh.current[key] === refreshKey
+      ) {
+        continue;
+      }
+      loadedAtRefresh.current[key] = refreshKey;
       const seq = (reqSeq.current[key] ?? 0) + 1;
       reqSeq.current[key] = seq;
       setEntitiesBySection((prev) => ({ ...prev, [key]: "loading" }));
