@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import {
   Wrench,
@@ -8,11 +8,64 @@ import {
   Terminal,
   Package,
   ArrowRight,
+  ShieldCheck,
+  ShieldX,
+  ExternalLink,
 } from 'lucide-react';
 import type { ToolSpec, CliTool } from '@/types/api';
-import { getTools, getCliTools } from '@/lib/api';
+import {
+  getTools,
+  getCliTools,
+  getMapKeys,
+  listProps,
+  patchConfig,
+  ApiError,
+} from '@/lib/api';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
+
+// ── Risk-profile tool access ────────────────────────────────────────────
+// Per-profile allow/exclude state for the tool-access matrix in each expanded
+// tool card. zeroclaw's gate (crates/zeroclaw-config policy + runtime):
+//   • allowed_tools EMPTY  → unrestricted (every tool allowed)
+//   • allowed_tools [list] → only those tools allowed
+//   • excluded_tools       → denylist, wins over allow
+// So we never silently convert an unrestricted profile into an allowlist:
+// BLOCK adds to excluded_tools (no side effects on other tools); ALLOW clears
+// the exclusion and, only when the profile is already an allowlist, adds the
+// tool to it.
+interface ProfileAccess {
+  allowed: string[];
+  excluded: string[];
+}
+
+function parseStrArray(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map(String);
+  if (typeof raw !== 'string' || raw.length === 0 || raw === '<unset>') return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.map(String);
+  } catch {
+    // fall through to lenient parse
+  }
+  return raw
+    .replace(/^\[|\]$/g, '')
+    .split(/[,\n]/)
+    .map((s) => s.trim().replace(/^"|"$/g, ''))
+    .filter(Boolean);
+}
+
+function isToolAllowed(tool: string, a: ProfileAccess): boolean {
+  if (a.excluded.includes(tool)) return false;
+  if (a.allowed.length === 0) return true; // unrestricted
+  return a.allowed.includes(tool);
+}
+
+function accessReason(tool: string, a: ProfileAccess): string {
+  if (a.excluded.includes(tool)) return 'excluded';
+  if (a.allowed.length === 0) return 'all tools allowed';
+  return a.allowed.includes(tool) ? 'in allowlist' : 'not in allowlist';
+}
 
 export default function Tools() {
   const [tools, setTools] = useState<ToolSpec[]>([]);
@@ -24,12 +77,90 @@ export default function Tools() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Risk-profile access, keyed by profile name. `null` until loaded.
+  const [access, setAccess] = useState<Record<string, ProfileAccess> | null>(null);
+  const [accessError, setAccessError] = useState<string | null>(null);
+
   useEffect(() => {
     Promise.all([getTools(), getCliTools()])
       .then(([t, c]) => { setTools(t); setCliTools(c); })
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
   }, []);
+
+  // Load every risk profile's allowed/excluded tool lists for the matrix.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { keys } = await getMapKeys('risk_profiles');
+        const entriesPerProfile = await Promise.all(
+          keys.map(async (name) => {
+            const { entries } = await listProps(`risk_profiles.${name}`);
+            const allowed = parseStrArray(
+              entries.find((e) => e.path === `risk_profiles.${name}.allowed_tools`)?.value,
+            );
+            const excluded = parseStrArray(
+              entries.find((e) => e.path === `risk_profiles.${name}.excluded_tools`)?.value,
+            );
+            return [name, { allowed, excluded }] as const;
+          }),
+        );
+        if (!cancelled) setAccess(Object.fromEntries(entriesPerProfile));
+      } catch (e) {
+        if (!cancelled) {
+          setAccessError(e instanceof Error ? e.message : String(e));
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Flip a tool's effective allow state in one profile, writing only the
+  // fields that actually change. Optimistic; reverts on failure.
+  const toggleAccess = useCallback(
+    async (profile: string, tool: string, makeAllowed: boolean) => {
+      const current = access?.[profile];
+      if (!current) return;
+      const allowed = [...current.allowed];
+      let excluded = [...current.excluded];
+      if (makeAllowed) {
+        excluded = excluded.filter((x) => x !== tool);
+        if (allowed.length > 0 && !allowed.includes(tool)) allowed.push(tool);
+      } else if (!excluded.includes(tool)) {
+        excluded.push(tool);
+      }
+      const ops: Parameters<typeof patchConfig>[0] = [];
+      if (JSON.stringify(allowed) !== JSON.stringify(current.allowed)) {
+        ops.push({ op: 'replace', path: `risk_profiles.${profile}.allowed_tools`, value: allowed });
+      }
+      if (JSON.stringify(excluded) !== JSON.stringify(current.excluded)) {
+        ops.push({
+          op: 'replace',
+          path: `risk_profiles.${profile}.excluded_tools`,
+          value: excluded.length > 0 ? excluded : null,
+        });
+      }
+      if (ops.length === 0) return;
+      const next = { allowed, excluded };
+      setAccess((prev) => (prev ? { ...prev, [profile]: next } : prev));
+      setAccessError(null);
+      try {
+        await patchConfig(ops);
+      } catch (e) {
+        // Revert on failure.
+        setAccess((prev) => (prev ? { ...prev, [profile]: current } : prev));
+        setAccessError(
+          e instanceof ApiError
+            ? `[${e.envelope.code}] ${e.envelope.message}`
+            : e instanceof Error
+              ? e.message
+              : String(e),
+        );
+      }
+    },
+    [access],
+  );
 
   const filtered = tools.filter((t) =>
     t.name.toLowerCase().includes(search.toLowerCase()) ||
@@ -65,12 +196,12 @@ export default function Tools() {
         title={t('tools.title')}
         description={
           <>
-            This catalog lists every tool the agent can call. Which tools an
-            agent may actually use is gated per risk profile via{' '}
+            This catalog lists every tool the agent can call. Expand a tool to
+            allow or block it per risk profile (gated via{' '}
             <code className="rounded-[var(--radius-sm)] px-1 py-0.5 text-[0.85em] font-mono bg-pc-code text-pc-text-secondary">
               risk_profiles.&lt;name&gt;.allowed_tools
             </code>
-            .
+            ).
           </>
         }
         actions={
@@ -130,7 +261,7 @@ export default function Tools() {
                     <button
                       onClick={() => setExpandedTool(isExpanded ? null : tool.name)}
                       type="button"
-                      className="w-full text-left p-4 h-full transition-colors hover:bg-pc-elevated/50 cursor-pointer"
+                      className="w-full text-left p-4 transition-colors hover:bg-pc-elevated/50 cursor-pointer"
                     >
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex items-center gap-2 min-w-0">
@@ -147,14 +278,25 @@ export default function Tools() {
                       </p>
                     </button>
 
-                    {isExpanded && tool.parameters && (
-                      <div className="border-t border-pc-border p-4">
-                        <p className="text-[10px] font-semibold uppercase tracking-wider mb-2 text-pc-text-faint">
-                          {t('tools.parameter_schema')}
-                        </p>
-                        <pre className="text-xs rounded-[var(--radius-md)] p-3 overflow-x-auto max-h-64 overflow-y-auto font-mono bg-pc-code text-pc-text-secondary">
-                          {JSON.stringify(tool.parameters, null, 2)}
-                        </pre>
+                    {isExpanded && (
+                      <div className="border-t border-pc-border p-4 space-y-4">
+                        <ToolAccessMatrix
+                          tool={tool.name}
+                          access={access}
+                          accessError={accessError}
+                          onToggle={toggleAccess}
+                        />
+                        {tool.parameters && (
+                          <details className="group/schema">
+                            <summary className="cursor-pointer list-none text-[10px] font-semibold uppercase tracking-wider text-pc-text-faint hover:text-pc-text-muted flex items-center gap-1">
+                              <ChevronRight className="h-3 w-3 transition-transform group-open/schema:rotate-90" />
+                              {t('tools.parameter_schema')}
+                            </summary>
+                            <pre className="mt-2 text-xs rounded-[var(--radius-md)] p-3 overflow-x-auto max-h-64 overflow-y-auto font-mono bg-pc-code text-pc-text-secondary">
+                              {JSON.stringify(tool.parameters, null, 2)}
+                            </pre>
+                          </details>
+                        )}
                       </div>
                     )}
                   </Card>
@@ -224,6 +366,95 @@ export default function Tools() {
           </div>
         </section>
       )}
+    </div>
+  );
+}
+
+// Per-tool risk-profile access matrix shown inside an expanded tool card.
+// One row per profile: effective Allowed/Blocked state (+ the reason), a
+// toggle that flips it, and a jump-link to the profile's full config.
+function ToolAccessMatrix({
+  tool,
+  access,
+  accessError,
+  onToggle,
+}: {
+  tool: string;
+  access: Record<string, ProfileAccess> | null;
+  accessError: string | null;
+  onToggle: (profile: string, tool: string, makeAllowed: boolean) => void;
+}) {
+  if (access === null && accessError === null) {
+    return (
+      <p className="text-xs text-pc-text-faint">Loading risk profiles…</p>
+    );
+  }
+  if (accessError && !access) {
+    return (
+      <p className="text-xs text-status-error">
+        Couldn't load risk profiles: {accessError}
+      </p>
+    );
+  }
+  const profiles = Object.keys(access ?? {}).sort();
+  return (
+    <div className="space-y-2">
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-pc-text-faint">
+        Tool access by risk profile
+      </p>
+      {accessError && (
+        <p className="text-xs text-status-error">{accessError}</p>
+      )}
+      <ul className="space-y-1">
+        {profiles.map((profile) => {
+          const a = access![profile]!;
+          const allowed = isToolAllowed(tool, a);
+          return (
+            <li
+              key={profile}
+              className="flex items-center justify-between gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 hover:bg-pc-elevated/40"
+            >
+              <div className="min-w-0 flex items-center gap-2">
+                <Link
+                  to={`/config/risk_profiles/${encodeURIComponent(profile)}`}
+                  className="text-sm font-mono text-pc-text-secondary hover:text-pc-accent truncate inline-flex items-center gap-1"
+                  title={`Open ${profile} in config`}
+                >
+                  {profile}
+                  <ExternalLink className="h-3 w-3 flex-shrink-0 opacity-60" />
+                </Link>
+                <span className="text-[11px] text-pc-text-faint truncate">
+                  {accessReason(tool, a)}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => onToggle(profile, tool, !allowed)}
+                aria-pressed={allowed}
+                title={allowed ? `Block ${tool} in ${profile}` : `Allow ${tool} in ${profile}`}
+                className={[
+                  'flex-shrink-0 inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors',
+                  allowed
+                    ? 'bg-status-success/10 text-status-success hover:bg-status-success/20'
+                    : 'bg-pc-elevated text-pc-text-muted hover:bg-pc-elevated/70',
+                ].join(' ')}
+              >
+                {allowed ? (
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                ) : (
+                  <ShieldX className="h-3.5 w-3.5" />
+                )}
+                {allowed ? 'Allowed' : 'Blocked'}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="text-[11px] text-pc-text-faint">
+        Changes edit <code className="font-mono">allowed_tools</code> /{' '}
+        <code className="font-mono">excluded_tools</code> and apply on the next
+        daemon reload.
+      </p>
     </div>
   );
 }
