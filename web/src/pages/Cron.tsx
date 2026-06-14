@@ -461,12 +461,24 @@ export default function Cron() {
   // Pause/resume a job without deleting it — toggles the existing `enabled`
   // flag the scheduler already honours.
   const handleToggleEnabled = async (job: CronJob) => {
+    const desired = !job.enabled;
     try {
       const updated = await patchCronJob(job.id, {
         agent: job.agent_alias,
-        enabled: !job.enabled,
+        enabled: desired,
       });
       setJobs((prev) => prev.map((j) => (j.id === job.id ? updated : j)));
+      // The gateway echoes the stored job. If `enabled` didn't move, this
+      // daemon build predates pause/resume on the cron PATCH endpoint
+      // (CronPatchBody has no `enabled` field, so the flag is silently
+      // ignored). Say so rather than leaving the button looking broken.
+      if (updated.enabled !== desired) {
+        setError(
+          'This daemon build can’t pause/resume jobs from the web yet — the cron API accepted the request but ignored the enabled change. Update the gateway (add `enabled` to CronPatchBody) and reload to enable it.',
+        );
+      } else {
+        setError(null);
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t('cron.edit_error'));
     }
