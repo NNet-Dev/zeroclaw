@@ -82,25 +82,28 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
   return (
     <>
       <header className="h-14 flex items-center justify-between px-6 border-b animate-fade-in relative" style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', backdropFilter: 'blur(12px)', zIndex: 100 }}>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 min-w-0">
           {/* Hamburger — opens the mobile drawer; hidden on desktop where the
               slim rail is always present. */}
           <Button
             variant="ghost"
             onClick={onMenuToggle}
-            className="md:hidden h-9 w-9 -ml-1.5 border-transparent px-0"
+            className="md:hidden h-9 w-9 -ml-1.5 border-transparent px-0 shrink-0"
             aria-label="Open menu"
           >
-            <Menu className="h-5 w-5" />
+            <Menu className="h-5 w-5 shrink-0" />
           </Button>
 
           {/* Page title — the primary on-screen label for the current section
-              now that the rail is icon-only. */}
-          <h1 className="h-9 leading-9 text-lg font-semibold tracking-tight" style={{ color: 'var(--pc-text-primary)' }}>{pageTitle}</h1>
+              now that the rail is icon-only. Truncates (rather than pushing the
+              action cluster) so the right-side icons never get squeezed. */}
+          <h1 className="h-9 leading-9 text-lg font-semibold tracking-tight truncate min-w-0" style={{ color: 'var(--pc-text-primary)' }}>{pageTitle}</h1>
         </div>
 
-        {/* Right-side controls */}
-        <div className="flex items-center gap-2 h-9">
+        {/* Right-side controls. shrink-0 so the title yields first and these
+            keep their size (icons here are flex items that would otherwise
+            collapse in a tight row). */}
+        <div className="flex items-center gap-2 h-9 shrink-0">
           {/* Command-palette trigger — styled like a search field. Opens the
               palette; the same action is bound globally to ⌘K / Ctrl+K, shown
               as a hint chip on the right. */}
@@ -124,7 +127,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             className="sm:hidden h-9 w-9 border-transparent px-0"
             aria-label={t('nav.cmdk.placeholder')}
           >
-            <Search className="h-[20px] w-[20px]" />
+            <Search className="h-[20px] w-[20px] shrink-0" />
           </Button>
 
           {/* Settings */}
@@ -134,7 +137,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             className="h-9 w-9 border-transparent px-0"
             aria-label={t('settings.title')}
           >
-            <Settings className="h-[20px] w-[20px]" />
+            <Settings className="h-[20px] w-[20px] shrink-0" />
           </Button>
 
           {/* Language switcher dropdown */}
@@ -147,9 +150,9 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
               className="h-9 px-3 text-xs font-semibold gap-1.5"
               style={{ background: 'var(--pc-bg-elevated)' }}
             >
-              <Globe className="h-[20px] w-[20px]" />
+              <Globe className="h-[20px] w-[20px] shrink-0" />
               {locale.toUpperCase()}
-              <ChevronDown className="h-3 w-3" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
+              <ChevronDown className="h-3 w-3 shrink-0" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
             </Button>
 
             {langOpen && (
@@ -206,7 +209,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             className="h-9 px-3 text-xs gap-1.5 hover:text-status-error hover:border-status-error/25 hover:bg-status-error/10"
             aria-label={t('auth.logout')}
           >
-            <LogOut className="h-[20px] w-[20px]" />
+            <LogOut className="h-[20px] w-[20px] shrink-0" />
             <span className="hidden sm:inline">{t('auth.logout')}</span>
           </Button>
         </div>
