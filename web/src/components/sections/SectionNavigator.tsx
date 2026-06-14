@@ -492,9 +492,15 @@ export default function SectionNavigator({
                         role="treeitem"
                         data-nav-row
                         aria-expanded={hasKids ? isOpen : undefined}
-                        onClick={() =>
-                          hasKids ? toggle(s.key) : onSelectSection(s.key)
-                        }
+                        // The label always NAVIGATES to the section's own page
+                        // (its overview / alias list, which carries the +Add
+                        // affordance — the only way to add the first entry to an
+                        // empty section). The chevron handles inline expand /
+                        // collapse. Before, a section with children only toggled
+                        // inline and never navigated, so on mobile (where the
+                        // navigator hides once something is selected) there was
+                        // no way to reach the section page or add to an empty one.
+                        onClick={() => onSelectSection(s.key)}
                         aria-current={
                           active || sectionSelected ? "page" : undefined
                         }
@@ -514,7 +520,10 @@ export default function SectionNavigator({
                           onClick={() => onAddToSection(s)}
                           title={`Add to ${s.label}`}
                           aria-label={`Add to ${s.label}`}
-                          className="flex-shrink-0 p-1.5 mr-0.5 rounded-[var(--radius-sm)] text-pc-text-faint opacity-0 group-hover:opacity-100 hover:text-pc-accent hover:bg-pc-accent/10 transition-opacity"
+                          // Always visible on touch (no hover); hover-reveal on
+                          // desktop only. Was opacity-0 unconditionally, so the
+                          // add affordance never appeared on mobile.
+                          className="flex-shrink-0 p-1.5 mr-0.5 rounded-[var(--radius-sm)] text-pc-text-faint opacity-100 md:opacity-0 md:group-hover:opacity-100 hover:text-pc-accent hover:bg-pc-accent/10 transition-opacity"
                         >
                           <Plus className="h-3.5 w-3.5" />
                         </button>
