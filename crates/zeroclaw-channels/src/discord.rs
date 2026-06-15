@@ -97,6 +97,14 @@ pub struct DiscordChannel {
     /// rows. Keyed by interaction id; swept on insert; entries expire with
     /// Discord's 15-minute followup window.
     pending_interactions: Arc<Mutex<HashMap<String, PendingInteraction>>>,
+    /// Resolves skill-derived commands to register alongside `/ask`.
+    /// `None` (or an empty resolution) = `/ask` only.
+    slash_command_resolver: Option<DiscordSlashCommandResolver>,
+    /// Fingerprint of the last *successfully* reconciled command set —
+    /// READYs with an unchanged set skip the REST round-trip; failures
+    /// reset it so the next READY retries instead of wedging. Arc'd
+    /// because reconciliation runs in a spawned task.
+    registered_commands_hash: Arc<Mutex<Option<u64>>>,
 }
 
 /// Credentials needed to answer a deferred interaction later: the followup
@@ -177,7 +185,16 @@ impl DiscordChannel {
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
             slash_commands: false,
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
+            slash_command_resolver: None,
+            registered_commands_hash: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Provide the resolver for skill-derived slash commands. Only consulted
+    /// when `slash_commands` is enabled.
+    pub fn with_slash_command_resolver(mut self, resolver: DiscordSlashCommandResolver) -> Self {
+        self.slash_command_resolver = Some(resolver);
+        self
     }
 
     /// Enable Discord slash commands (register + serve over the Gateway).
@@ -1570,18 +1587,139 @@ pub(crate) fn parse_discord_interaction_target(target: &str) -> Option<&str> {
     Some(id)
 }
 
-/// Register the prototype `/ask` global command. POST upserts by name and
-/// leaves any other global commands the application owner registered
-/// through other tooling untouched (PUT to this endpoint would bulk
-/// overwrite the entire set). Global commands can take up to an hour to
-/// propagate the first time.
-async fn register_slash_commands(
-    client: &reqwest::Client,
-    bot_token: &str,
-    app_id: &str,
-) -> anyhow::Result<()> {
-    let url = format!("https://discord.com/api/v10/applications/{app_id}/commands");
-    let body = json!({
+/// A slash command derived from an installed skill. `slug` is the Discord
+/// command name; `skill_name` is the skill's manifest name (sanitized of
+/// quotes and newlines at spec-build time, since it is interpolated into
+/// the synthesized agent prompt); `description` is truncated to Discord's
+/// 100-char limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordSlashCommandSpec {
+    pub skill_name: String,
+    pub slug: String,
+    pub description: String,
+}
+
+/// Resolves the current skill-derived command set from canonical state at
+/// READY/interaction time. No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE
+/// SOURCE OF TRUTH") — skills install/uninstall at runtime. The loader does
+/// blocking file IO, so callers must run it via `spawn_blocking`, never on
+/// the gateway listen loop.
+pub type DiscordSlashCommandResolver = Arc<dyn Fn() -> Vec<DiscordSlashCommandSpec> + Send + Sync>;
+
+/// Discord caps an application at 100 global commands; stay under it with
+/// headroom for `/ask` and future built-ins.
+const MAX_SKILL_SLASH_COMMANDS: usize = 90;
+
+/// Squeeze a skill name into Discord's command-name charset
+/// (`^[a-z0-9_-]{1,32}$`): ASCII-lowercase, runs of anything else collapse
+/// to a single `-`. Deliberately stricter than Discord's full unicode
+/// charset — an all-non-ASCII name slugs to empty and is dropped (with a
+/// WARN naming the skill), which is a documented limitation.
+fn discord_command_slug(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = true; // suppress leading '-'
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            slug.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+        if slug.len() == 32 {
+            break;
+        }
+    }
+    slug.trim_end_matches('-').to_string()
+}
+
+/// Map installed skills to slash-command specs. Exposure rules:
+/// - opt-in via the `slash` tag — skills run shell/HTTP tools, so surfacing
+///   one to a whole guild must be a deliberate per-skill decision;
+/// - community-synced skills (tag `open-skills`) are excluded even when
+///   tagged: their manifests are third-party-controlled, and a remote
+///   commit must not be able to surface new commands (name + description
+///   render in every guild's Discord UI) without operator action.
+///
+/// Specs are sorted by slug so the output (and everything derived from it:
+/// the registration fingerprint, collision winners, the cap cutoff) is
+/// deterministic regardless of filesystem iteration order. Reserved names,
+/// empty slugs, and collisions are dropped with a WARN; the set caps at
+/// `MAX_SKILL_SLASH_COMMANDS` with dropped names logged (no silent caps).
+pub fn discord_slash_specs_from_skills(
+    skills: &[zeroclaw_runtime::skills::Skill],
+) -> Vec<DiscordSlashCommandSpec> {
+    let mut candidates: Vec<&zeroclaw_runtime::skills::Skill> = skills
+        .iter()
+        .filter(|s| s.tags.iter().any(|t| t == "slash"))
+        .filter(|s| !s.tags.iter().any(|t| t == "open-skills"))
+        .collect();
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut seen = std::collections::HashSet::new();
+    seen.insert("ask".to_string());
+    let mut specs = Vec::new();
+    for skill in candidates {
+        let slug = discord_command_slug(&skill.name);
+        if slug.is_empty() || !seen.insert(slug.clone()) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "skill": skill.name,
+                        "slug": slug,
+                    })),
+                "skipping skill slash command (reserved, empty, or colliding slug)"
+            );
+            continue;
+        }
+        let description = if skill.description.is_empty() {
+            format!("Run the {} skill", skill.name)
+        } else {
+            skill.description.clone()
+        };
+        let skill_name: String = skill
+            .name
+            .chars()
+            .map(|c| {
+                if c == '\n' || c == '\r' || c == '\'' {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        specs.push(DiscordSlashCommandSpec {
+            skill_name,
+            slug,
+            description: description.chars().take(100).collect(),
+        });
+    }
+    specs.sort_by(|a, b| a.slug.cmp(&b.slug));
+    if specs.len() > MAX_SKILL_SLASH_COMMANDS {
+        let dropped: Vec<&str> = specs[MAX_SKILL_SLASH_COMMANDS..]
+            .iter()
+            .map(|s| s.slug.as_str())
+            .collect();
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"dropped": dropped})),
+            "too many skill slash commands; truncating to the registration cap"
+        );
+        specs.truncate(MAX_SKILL_SLASH_COMMANDS);
+    }
+    specs
+}
+
+/// The desired global-command set: `/ask` plus one command per skill spec,
+/// each taking a single required string `input`. Also the registration
+/// fingerprint input — its JSON string hashes into the skip-if-unchanged
+/// gate.
+fn slash_command_registration_body(specs: &[DiscordSlashCommandSpec]) -> serde_json::Value {
+    let mut commands = vec![json!({
         "name": "ask",
         "description": "Ask the agent a question",
         "type": 1, // CHAT_INPUT
@@ -1591,18 +1729,209 @@ async fn register_slash_commands(
             "type": 3, // STRING
             "required": true
         }]
-    });
+    })];
+    for spec in specs {
+        commands.push(json!({
+            "name": spec.slug,
+            "description": spec.description,
+            "type": 1, // CHAT_INPUT
+            "options": [{
+                "name": "input",
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION,
+                "type": 3, // STRING
+                "required": true
+            }]
+        }));
+    }
+    serde_json::Value::Array(commands)
+}
+
+/// The option description this feature writes on every skill command. It
+/// doubles as the ownership marker for stale-command reaping: Discord has
+/// no durable "registered by" field, and a structural shape alone (one
+/// required string option named `input`) is generic enough that foreign
+/// tooling could collide with it.
+const SKILL_COMMAND_OPTION_DESCRIPTION: &str = "What to send to the skill";
+
+/// Ownership fingerprint for commands this feature owns: exactly one
+/// required string option named `input` carrying this feature's exact
+/// option description. Used to reap commands for uninstalled skills across
+/// restarts; commands registered by other tooling must never be touched —
+/// the description match makes accidental collision with a foreign
+/// `/x <input>` command effectively impossible.
+///
+/// Limitation: two slash-enabled aliases sharing one bot token would see
+/// each other's commands as reap candidates (commands are
+/// application-global, desired sets are per-alias). Enable slash commands
+/// on at most one alias per bot application.
+fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
+    let Some(opts) = cmd.get("options").and_then(|o| o.as_array()) else {
+        return false;
+    };
+    if opts.len() != 1 {
+        return false;
+    }
+    let o = &opts[0];
+    o.get("name").and_then(|n| n.as_str()) == Some("input")
+        && o.get("type").and_then(serde_json::Value::as_u64) == Some(3)
+        && o.get("required").and_then(serde_json::Value::as_bool) == Some(true)
+        && o.get("description").and_then(|d| d.as_str()) == Some(SKILL_COMMAND_OPTION_DESCRIPTION)
+}
+
+/// Comparable projection of a command for change detection: description plus
+/// (name, type, required, description) per option. Discord decorates listed
+/// commands with server-side fields (id, version, default_member_permissions,
+/// …) that must not defeat the comparison.
+fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "description": cmd.get("description").cloned().unwrap_or_default(),
+        "options": cmd
+            .get("options")
+            .and_then(|o| o.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|o| {
+                        json!({
+                            "name": o.get("name").cloned().unwrap_or_default(),
+                            "type": o.get("type").cloned().unwrap_or_default(),
+                            "required": o.get("required").cloned().unwrap_or(json!(false)),
+                            "description": o.get("description").cloned().unwrap_or_default(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// Discord REST base; injectable in `reconcile_slash_commands` for tests.
+const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+
+/// Reconcile the application's global commands with the desired set:
+/// upsert each desired command (POST upserts by name) and delete stale
+/// skill-shaped commands left over from uninstalled skills. Commands
+/// registered by other tooling are never touched — this deliberately
+/// avoids the bulk-overwrite PUT. Global commands can take up to an hour
+/// to propagate the first time.
+///
+/// Returns `Err` when any owned stale command could not be deleted (other
+/// than a 404, which means it is already gone): the caller's fingerprint
+/// must not record such a pass as successful, or the stale command would
+/// never be retried while the desired set stays unchanged. Upserts for the
+/// desired set are still attempted first so a delete failure cannot block
+/// new registrations.
+async fn reconcile_slash_commands(
+    client: &reqwest::Client,
+    bot_token: &str,
+    app_id: &str,
+    desired: &serde_json::Value,
+    api_base: &str,
+) -> anyhow::Result<()> {
+    let base = format!("{api_base}/applications/{app_id}/commands");
+    let auth = format!("Bot {bot_token}");
+    let Some(desired) = desired.as_array() else {
+        anyhow::bail!("desired command set is not an array");
+    };
+    let desired_names: std::collections::HashSet<&str> = desired
+        .iter()
+        .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+        .collect();
+
+    // Reap stale skill commands first so the 100-command cap never blocks
+    // the upserts that follow. Delete failures are counted, not fatal
+    // mid-pass: the upserts still run, but the pass reports Err at the end
+    // so the fingerprint is not recorded and the next READY retries.
+    let mut failed_deletes = 0usize;
     let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bot {bot_token}"))
-        .json(&body)
+        .get(&base)
+        .header("Authorization", &auth)
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
     if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("slash command registration failed ({status}): {err}");
+        anyhow::bail!("listing global commands failed ({})", resp.status());
+    }
+    let existing: Vec<serde_json::Value> = resp.json().await?;
+    for cmd in &existing {
+        let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if name == "ask" || desired_names.contains(name) || !is_skill_command_shape(cmd) {
+            continue;
+        }
+        let Some(id) = cmd.get("id").and_then(|i| i.as_str()) else {
+            continue;
+        };
+        let del = client
+            .delete(format!("{base}/{id}"))
+            .header("Authorization", &auth)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        if del.status().is_success() || del.status() == reqwest::StatusCode::NOT_FOUND {
+            // 404 = already gone (raced another reconcile or manual
+            // cleanup) — the desired end state holds either way.
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"command": name})),
+                "deregistered stale skill slash command"
+            );
+        } else {
+            failed_deletes += 1;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "command": name,
+                        "status": del.status().as_u16(),
+                    })),
+                "failed to deregister stale skill slash command"
+            );
+        }
+    }
+
+    let existing_by_name: std::collections::HashMap<&str, &serde_json::Value> = existing
+        .iter()
+        .filter_map(|c| c.get("name").and_then(|n| n.as_str()).map(|n| (n, c)))
+        .collect();
+    let mut upserted = 0usize;
+    for cmd in desired {
+        let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        // Steady-state restarts should be ~zero writes: Discord's daily
+        // command-create budget is finite, and the existing list is already
+        // in hand.
+        if let Some(current) = existing_by_name.get(name)
+            && command_projection(current) == command_projection(cmd)
+        {
+            continue;
+        }
+        let resp = client
+            .post(&base)
+            .header("Authorization", &auth)
+            .json(cmd)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("slash command registration failed for '{name}' ({status}): {err}");
+        }
+        upserted += 1;
+    }
+    if upserted > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"upserted": upserted})),
+            "discord slash commands upserted"
+        );
+    }
+    if failed_deletes > 0 {
+        anyhow::bail!(
+            "{failed_deletes} stale skill command delete(s) failed; \
+             reconcile not recorded, next READY retries"
+        );
     }
     Ok(())
 }
@@ -1633,6 +1962,22 @@ async fn discord_defer_interaction(
         anyhow::bail!("interaction defer failed ({status}): {err}");
     }
     Ok(())
+}
+
+/// Extract a string option (`d.data.options[name].value`) from an
+/// APPLICATION_COMMAND interaction payload. Empty string when absent.
+fn interaction_string_option(d: &serde_json::Value, name: &str) -> String {
+    d.get("data")
+        .and_then(|x| x.get("options"))
+        .and_then(|o| o.as_array())
+        .and_then(|opts| {
+            opts.iter()
+                .find(|o| o.get("name").and_then(|n| n.as_str()) == Some(name))
+        })
+        .and_then(|o| o.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Why a slash-command interaction was refused. Drives the WARN log and the
@@ -2638,12 +2983,57 @@ impl Channel for DiscordChannel {
                                     .and_then(serde_json::Value::as_str)
                                     .map(ToString::to_string);
                                 if let Some(app_id) = app_id {
+                                    // Resolve + reconcile entirely in a
+                                    // spawned task: the skills loader does
+                                    // blocking file IO (spawn_blocking) and
+                                    // the reconcile is several REST calls —
+                                    // none of it may run on the listen loop.
                                     let client = self.http_client();
                                     let bot_token = self.bot_token.clone();
+                                    let resolver = self.slash_command_resolver.clone();
+                                    let hash_store = Arc::clone(&self.registered_commands_hash);
                                     zeroclaw_spawn::spawn!(async move {
-                                        match register_slash_commands(&client, &bot_token, &app_id).await {
-                                            Ok(()) => ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "discord slash commands registered"),
-                                            Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord slash command registration failed"),
+                                        let specs = match resolver {
+                                            Some(resolve) => {
+                                                match tokio::task::spawn_blocking(move || resolve()).await {
+                                                    Ok(specs) => specs,
+                                                    Err(e) => {
+                                                        // A resolver panic must not be
+                                                        // mistaken for "no skills" — that
+                                                        // would reconcile every skill
+                                                        // command away and commit it as
+                                                        // success. Skip; next READY retries.
+                                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "skills resolver panicked; skipping slash command reconcile");
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            None => Vec::new(),
+                                        };
+                                        let body = slash_command_registration_body(&specs);
+                                        let fingerprint = {
+                                            use std::hash::{Hash, Hasher};
+                                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                                            body.to_string().hash(&mut h);
+                                            h.finish()
+                                        };
+                                        // Skip only when the set matches the
+                                        // last *successful* reconcile —
+                                        // failures reset the fingerprint so
+                                        // the next READY retries.
+                                        if *hash_store.lock() == Some(fingerprint) {
+                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
+                                            return;
+                                        }
+                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE).await {
+                                            Ok(()) => {
+                                                *hash_store.lock() = Some(fingerprint);
+                                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
+                                            }
+                                            Err(e) => {
+                                                *hash_store.lock() = None;
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord slash command registration failed");
+                                            }
                                         }
                                     });
                                 } else {
@@ -2721,20 +3111,11 @@ impl Channel for DiscordChannel {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                // Reconstruct the prompt from the `prompt` option.
-                                let prompt = d
-                                    .get("data")
-                                    .and_then(|x| x.get("options"))
-                                    .and_then(|o| o.as_array())
-                                    .and_then(|opts| {
-                                        opts.iter().find(|o| {
-                                            o.get("name").and_then(|n| n.as_str()) == Some("prompt")
-                                        })
-                                    })
-                                    .and_then(|o| o.get("value"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                // `/ask` carries a `prompt` option; skill
+                                // commands carry `input`. Extract both —
+                                // routing happens in the spawned task.
+                                let prompt = interaction_string_option(d, "prompt");
+                                let input = interaction_string_option(d, "input");
                                 let interaction_guild = d
                                     .get("guild_id")
                                     .and_then(serde_json::Value::as_str)
@@ -2760,12 +3141,16 @@ impl Channel for DiscordChannel {
                                     let pending = Arc::clone(&self.pending_interactions);
                                     let alias = self.alias.clone();
                                     let tx = tx.clone();
+                                    let resolver = self.slash_command_resolver.clone();
 
                                     zeroclaw_spawn::spawn!(async move {
-                                        // Unknown command or missing prompt:
-                                        // answer ephemerally instead of leaving
+                                        // /ask with no prompt: answer
+                                        // ephemerally instead of leaving
                                         // Discord's "did not respond" timeout.
-                                        if command != "ask" || prompt.is_empty() {
+                                        // (Skill commands are validated after
+                                        // the defer — the skill set can't be
+                                        // resolved inside the 3s window.)
+                                        if command == "ask" && prompt.is_empty() {
                                             let msg = i18n::get_required_cli_string(
                                                 "channel-discord-interaction-malformed",
                                             );
@@ -2859,11 +3244,58 @@ impl Channel for DiscordChannel {
                                             return;
                                         }
 
+                                        // Route to agent-bound content. /ask
+                                        // passes its prompt verbatim; a skill
+                                        // command resolves the live skill set
+                                        // (blocking IO — spawn_blocking) and
+                                        // wraps its input in a prompt that
+                                        // addresses the skill by name. The
+                                        // skill is already in the owning
+                                        // agent's system prompt and tool set.
+                                        let content = if command == "ask" {
+                                            Some(prompt)
+                                        } else {
+                                            let specs = match resolver {
+                                                Some(resolve) => {
+                                                    match tokio::task::spawn_blocking(move || resolve()).await {
+                                                        Ok(specs) => specs,
+                                                        Err(e) => {
+                                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "skills resolver panicked; treating command as unavailable");
+                                                            Vec::new()
+                                                        }
+                                                    }
+                                                }
+                                                None => Vec::new(),
+                                            };
+                                            match specs.into_iter().find(|spec| spec.slug == command) {
+                                                Some(spec) if !input.is_empty() => Some(format!(
+                                                    "Use the '{}' skill for this request: {input}",
+                                                    spec.skill_name
+                                                )),
+                                                Some(_) => None, // known command, empty input
+                                                None => None,    // stale or foreign command
+                                            }
+                                        };
+                                        let Some(content) = content else {
+                                            // Already deferred — clear the
+                                            // "thinking…" state with a visible
+                                            // explanation instead of letting
+                                            // it hang, then drop the creds.
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unavailable",
+                                            );
+                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction unavailable-notice failed");
+                                            }
+                                            pending.lock().remove(&interaction_id);
+                                            return;
+                                        };
+
                                         let channel_msg = ChannelMessage {
                                             id: format!("discord_interaction_{interaction_id}"),
                                             sender: user_id,
                                             reply_target: discord_interaction_reply_target(&interaction_id),
-                                            content: prompt,
+                                            content,
                                             channel: "discord".to_string(),
                                             channel_alias: Some(alias),
                                             timestamp: std::time::SystemTime::now()
@@ -3837,6 +4269,336 @@ mod tests {
         };
         let err = ch.send(&msg).await.unwrap_err();
         assert!(err.to_string().contains("unknown or expired"));
+    }
+
+    fn skill(name: &str, description: &str, tags: &[&str]) -> zeroclaw_runtime::skills::Skill {
+        zeroclaw_runtime::skills::Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            tools: vec![],
+            prompts: vec![],
+            location: None,
+        }
+    }
+
+    #[test]
+    fn command_slug_fits_discord_charset() {
+        assert_eq!(discord_command_slug("Deploy Status"), "deploy-status");
+        assert_eq!(discord_command_slug("summarize_pdf"), "summarize_pdf");
+        assert_eq!(discord_command_slug("a  b!!c"), "a-b-c");
+        assert_eq!(discord_command_slug("--weird--"), "weird");
+        assert_eq!(discord_command_slug(""), "");
+        // All-non-ASCII names slug to empty (documented limitation).
+        assert_eq!(discord_command_slug("日本語スキル"), "");
+        // 32-char cap, with a trailing dash at the boundary trimmed.
+        assert_eq!(discord_command_slug(&"x".repeat(50)).len(), 32);
+        let boundary = format!("{} tail", "y".repeat(31));
+        let slug = discord_command_slug(&boundary);
+        assert!(slug.len() <= 32 && !slug.ends_with('-'));
+    }
+
+    #[test]
+    fn specs_require_the_slash_tag_and_unique_slugs() {
+        let skills = vec![
+            skill("deploy status", "Check deploy state", &["slash"]),
+            skill("not exposed", "No tag, no command", &[]),
+            skill("Deploy Status", "Colliding slug", &["slash"]),
+            skill("ask", "Reserved name", &["slash"]),
+            skill("no-desc", "", &["slash"]),
+            skill(
+                "community",
+                "Synced from a remote repo",
+                &["slash", "open-skills"],
+            ),
+        ];
+        let specs = discord_slash_specs_from_skills(&skills);
+        let slugs: Vec<&str> = specs.iter().map(|s| s.slug.as_str()).collect();
+        // Sorted, deduped, reserved + untagged + open-skills excluded.
+        assert_eq!(slugs, vec!["deploy-status", "no-desc"]);
+        assert_eq!(specs[1].description, "Run the no-desc skill");
+    }
+
+    #[test]
+    fn specs_are_deterministic_regardless_of_input_order() {
+        let a = vec![
+            skill("bravo", "b", &["slash"]),
+            skill("alpha", "a", &["slash"]),
+        ];
+        let b = vec![
+            skill("alpha", "a", &["slash"]),
+            skill("bravo", "b", &["slash"]),
+        ];
+        assert_eq!(
+            discord_slash_specs_from_skills(&a),
+            discord_slash_specs_from_skills(&b)
+        );
+    }
+
+    #[test]
+    fn specs_cap_at_the_registration_limit() {
+        let many: Vec<_> = (0..95)
+            .map(|i| skill(&format!("skill-{i:03}"), "d", &["slash"]))
+            .collect();
+        let specs = discord_slash_specs_from_skills(&many);
+        assert_eq!(specs.len(), MAX_SKILL_SLASH_COMMANDS);
+    }
+
+    #[test]
+    fn specs_sanitize_names_that_enter_the_synthesized_prompt() {
+        let skills = vec![skill("evil'\nname", "d", &["slash"])];
+        let specs = discord_slash_specs_from_skills(&skills);
+        assert!(!specs[0].skill_name.contains('\''));
+        assert!(!specs[0].skill_name.contains('\n'));
+    }
+
+    #[test]
+    fn registration_body_contains_ask_plus_skill_commands() {
+        let specs = vec![DiscordSlashCommandSpec {
+            skill_name: "deploy status".to_string(),
+            slug: "deploy-status".to_string(),
+            description: "Check deploy state".to_string(),
+        }];
+        let body = slash_command_registration_body(&specs);
+        let commands = body.as_array().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["name"], "ask");
+        assert_eq!(commands[1]["name"], "deploy-status");
+        assert_eq!(commands[1]["options"][0]["name"], "input");
+        assert_eq!(commands[1]["options"][0]["required"], true);
+        // Every desired command matches the ownership fingerprint except
+        // /ask (whose option is `prompt`) — exactly the reaping contract.
+        assert!(!is_skill_command_shape(&commands[0]));
+        assert!(is_skill_command_shape(&commands[1]));
+    }
+
+    #[test]
+    fn foreign_commands_do_not_match_the_skill_shape() {
+        // No options at all.
+        assert!(!is_skill_command_shape(&serde_json::json!({"name": "x"})));
+        // Multiple options.
+        assert!(!is_skill_command_shape(&serde_json::json!({
+            "name": "x",
+            "options": [
+                {"name": "input", "type": 3, "required": true},
+                {"name": "more", "type": 3, "required": false}
+            ]
+        })));
+        // Right shape, wrong option name.
+        assert!(!is_skill_command_shape(&serde_json::json!({
+            "name": "x",
+            "options": [{"name": "query", "type": 3, "required": true}]
+        })));
+        // The critical foreign-collision case: a generic `/x <input>`
+        // command registered by other tooling. Structure matches, but the
+        // ownership marker (our exact option description) does not — it
+        // must never be reaped.
+        assert!(!is_skill_command_shape(&serde_json::json!({
+            "name": "x",
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": "what to run"
+            }]
+        })));
+        // Our own marker matches.
+        assert!(is_skill_command_shape(&serde_json::json!({
+            "name": "x",
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION
+            }]
+        })));
+    }
+
+    fn stale_skill_command(id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": name, "description": "d", "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_when_a_stale_delete_fails() {
+        // A transiently failing DELETE of an owned stale command must make
+        // the whole reconcile report Err — otherwise the caller records the
+        // fingerprint as successful and the stale command is never retried
+        // while the desired set stays unchanged.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        // Desired set: /ask only (the upsert must still be attempted and
+        // succeed even though the delete fails).
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        let err = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("stale skill command delete"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_treats_delete_404_as_already_gone() {
+        // 404 means the command is already gone (raced cleanup) — the
+        // desired end state holds, so the pass records as successful.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_unchanged_and_spares_foreign_commands() {
+        // Steady state: existing /ask matches the desired projection (no
+        // POST), and a foreign command with a generic input option is left
+        // alone. Zero writes.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let existing_ask = serde_json::json!({
+            "id": "a1", "name": "ask",
+            "description": "Ask the agent a question", "type": 1,
+            "options": [{
+                "name": "prompt", "description": "What to ask",
+                "type": 3, "required": true
+            }]
+        });
+        let foreign = serde_json::json!({
+            "id": "f1", "name": "run",
+            "description": "external tool", "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": "what to run"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([existing_ask, foreign])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No DELETE and no POST expectations mounted: any write request
+        // would 404 the mock server and fail the reconcile.
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn command_projection_ignores_server_side_decorations() {
+        // Discord's GET response decorates commands with id/version/etc.;
+        // change detection must compare only what we author.
+        let ours = serde_json::json!({
+            "name": "deploy-status",
+            "description": "Check deploy state",
+            "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION
+            }]
+        });
+        let theirs = serde_json::json!({
+            "id": "1234", "version": "5678", "application_id": "42",
+            "default_member_permissions": serde_json::Value::Null,
+            "name": "deploy-status",
+            "description": "Check deploy state",
+            "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION
+            }]
+        });
+        assert_eq!(command_projection(&ours), command_projection(&theirs));
+
+        let changed = serde_json::json!({
+            "name": "deploy-status",
+            "description": "A different description",
+            "type": 1,
+            "options": ours["options"].clone()
+        });
+        assert_ne!(command_projection(&ours), command_projection(&changed));
+    }
+
+    #[test]
+    fn string_options_extract_by_name() {
+        let d = serde_json::json!({
+            "data": {
+                "options": [
+                    {"name": "input", "value": "check prod"},
+                    {"name": "other", "value": "x"}
+                ]
+            }
+        });
+        assert_eq!(interaction_string_option(&d, "input"), "check prod");
+        assert_eq!(interaction_string_option(&d, "missing"), "");
+    }
+
+    #[test]
+    fn channel_resolves_skill_commands_through_resolver() {
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_slash_command_resolver(Arc::new(|| {
+            discord_slash_specs_from_skills(&[skill("deploy status", "Check", &["slash"])])
+        }));
+        let specs = ch.slash_command_resolver.as_ref().map(|r| r()).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].slug, "deploy-status");
     }
 
     #[test]
