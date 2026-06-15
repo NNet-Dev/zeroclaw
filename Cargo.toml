@@ -92,6 +92,10 @@ zeroclaw-gateway = { workspace = true, optional = true }
 zeroclaw-hardware = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-macros.workspace = true
+# Document extraction for `zeroclaw docs ingest` (behind `docs-extract`).
+# office_oxide parses DOCX/XLSX/PPTX natively; pdf-extract pulls text from PDFs.
+office_oxide = { version = "0.1", optional = true }
+pdf-extract = { version = "0.10", optional = true }
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -391,6 +395,11 @@ sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
+# Native text extraction for `zeroclaw docs ingest`: PDF + Office (DOCX/XLSX/PPTX).
+# Without it, ingest handles only .md/.txt and reports richer formats as skipped.
+# NOTE: `rag-pdf` was removed upstream (#8547, RUSTSEC-2026-0192/ttf-parser); do
+# not re-add it — the sub-features no longer exist in zeroclaw-tools/-runtime.
+docs-extract = ["dep:office_oxide", "dep:pdf-extract"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
 embedded-web = ["zeroclaw-gateway/embedded-web"]
 
@@ -436,6 +445,7 @@ ci-all = [
     "sandbox-landlock", "sandbox-bubblewrap",
     "browser-native", "probe",
     "plugins-wasm", "plugins-wasm-cranelift",
+    "docs-extract",
     "webauthn", "memory-postgres",
 ]
 
