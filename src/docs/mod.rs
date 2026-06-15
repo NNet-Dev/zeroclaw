@@ -7,3 +7,4 @@
 //! auto-injected into per-turn conversational context.
 
 pub mod cli;
+pub mod extract;

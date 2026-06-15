@@ -1,5 +1,6 @@
 //! Handlers for `zeroclaw docs <subcommand>`.
 
+use super::extract::{self, Extracted};
 use crate::config::Config;
 use crate::memory::traits::{Memory, MemoryCategory};
 use anyhow::{Context, Result, bail};
@@ -12,8 +13,6 @@ use zeroclaw_memory::{chunker, docs};
 const CHUNK_MAX_TOKENS: usize = 512;
 /// Baseline importance stamped on ingested document chunks.
 const DOC_IMPORTANCE: f64 = 0.5;
-/// File extensions we can currently extract text from.
-const SUPPORTED_EXTS: &[&str] = &["md", "txt", "markdown", "text"];
 
 /// Dispatch `zeroclaw docs <subcommand>`.
 pub async fn handle_command(command: crate::DocsCommands, config: &Config) -> Result<()> {
@@ -81,9 +80,9 @@ async fn handle_ingest(
 
     if files.is_empty() {
         println!(
-            "No supported documents found under {} (looking for: {}).",
+            "No documents found under {} (supported: {}).",
             root.display(),
-            SUPPORTED_EXTS.join(", ")
+            extract::supported_summary()
         );
         return Ok(());
     }
@@ -105,6 +104,7 @@ async fn handle_ingest(
     let mut skipped = 0usize;
     let mut chunks_total = 0usize;
     let mut failed = 0usize;
+    let mut needs_feature = 0usize;
 
     for file in &files {
         let rel = file.strip_prefix(&base_dir).unwrap_or(file);
@@ -132,8 +132,13 @@ async fn handle_ingest(
             continue;
         }
 
-        let text = match std::fs::read_to_string(file) {
-            Ok(t) => t,
+        let text = match extract::extract(file) {
+            Ok(Extracted::Text(t)) => t,
+            Ok(Extracted::NeedsFeature) => {
+                needs_feature += 1;
+                continue;
+            }
+            Ok(Extracted::Unsupported) => continue,
             Err(e) => {
                 eprintln!("  {} {}: {e}", style("skip").yellow(), rel_str);
                 failed += 1;
@@ -186,6 +191,13 @@ async fn handle_ingest(
             String::new()
         }
     );
+    if needs_feature > 0 {
+        println!(
+            "{} {needs_feature} file(s) (PDF/Office) were skipped — rebuild with \
+             `--features docs-extract` to ingest them.",
+            style("note:").yellow()
+        );
+    }
     Ok(())
 }
 
@@ -284,17 +296,10 @@ fn collect_supported(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
             if recursive {
                 collect_supported(&path, recursive, out);
             }
-        } else if path.is_file() && is_supported(&path) {
+        } else if path.is_file() && extract::is_known_doc(&path) {
             out.push(path);
         }
     }
-}
-
-fn is_supported(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| SUPPORTED_EXTS.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -307,13 +312,5 @@ mod tests {
         assert_eq!(join_taxonomy("teaching", ""), "teaching");
         assert_eq!(join_taxonomy("", "scripts"), "scripts");
         assert_eq!(join_taxonomy("", ""), "");
-    }
-
-    #[test]
-    fn is_supported_matches_known_extensions() {
-        assert!(is_supported(Path::new("a/b/notes.md")));
-        assert!(is_supported(Path::new("a/b/notes.TXT")));
-        assert!(!is_supported(Path::new("a/b/sheet.xlsx")));
-        assert!(!is_supported(Path::new("a/b/noext")));
     }
 }
