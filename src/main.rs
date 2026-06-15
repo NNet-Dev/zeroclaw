@@ -2714,6 +2714,16 @@ enum DocsCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Ingest configured corpora from their `[knowledge_bundles.*]` sources.
+    ///
+    /// Each bundle's documents land under `docs/<bundle>/...`. Agents subscribe
+    /// to corpora via `knowledge_bundles = [...]` in `[agents.<alias>]`, which
+    /// is a hard boundary on what their `docs_search` tool can retrieve.
+    Sync {
+        /// Sync only this bundle (default: all configured bundles).
+        #[arg(long)]
+        bundle: Option<String>,
+    },
     /// Search the document corpus, optionally scoped to a taxonomy path.
     Search {
         /// Query keywords or phrase.

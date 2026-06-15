@@ -23,6 +23,7 @@ pub async fn handle_command(command: crate::DocsCommands, config: &Config) -> Re
             recursive,
             force,
         } => handle_ingest(config, &path, collection, recursive, force).await,
+        crate::DocsCommands::Sync { bundle } => handle_sync(config, bundle).await,
         crate::DocsCommands::Search {
             query,
             scope,
@@ -32,7 +33,41 @@ pub async fn handle_command(command: crate::DocsCommands, config: &Config) -> Re
     }
 }
 
-/// Ingest a file or directory tree into the `docs/` namespace.
+/// Running totals across one or more ingested trees.
+#[derive(Default)]
+struct IngestStats {
+    ingested: usize,
+    skipped: usize,
+    chunks_total: usize,
+    failed: usize,
+    needs_feature: usize,
+}
+
+impl IngestStats {
+    fn print_summary(&self) {
+        println!(
+            "\nDone: {} ingested, {} skipped (already present), {} chunk(s) stored{}.",
+            self.ingested,
+            self.skipped,
+            self.chunks_total,
+            if self.failed > 0 {
+                format!(", {} error(s)", self.failed)
+            } else {
+                String::new()
+            }
+        );
+        if self.needs_feature > 0 {
+            println!(
+                "{} {} file(s) (PDF/Office) were skipped — rebuild with \
+                 `--features docs-extract` to ingest them.",
+                style("note:").yellow(),
+                self.needs_feature
+            );
+        }
+    }
+}
+
+/// Ingest a file or directory tree into the `docs/` namespace (CLI entrypoint).
 async fn handle_ingest(
     config: &Config,
     path: &str,
@@ -45,11 +80,103 @@ async fn handle_ingest(
         bail!("path does not exist: {}", root.display());
     }
 
+    // Default the collection name to the ingested directory's name so files land
+    // under e.g. `docs/teaching/...` when ingesting a `teaching/` folder.
+    let collection = collection.unwrap_or_else(|| {
+        if root.is_dir() {
+            root.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    });
+
+    let memory = crate::memory::cli::create_memory_with_embedder(config)?;
+    let mut stats = IngestStats::default();
+    ingest_tree(memory.as_ref(), &root, &collection, recursive, force, &mut stats).await?;
+    stats.print_summary();
+    Ok(())
+}
+
+/// Ingest configured corpora (`knowledge_bundles`) from their `sources`.
+/// Each bundle's documents land under `docs/<bundle>/...`. With `only` set,
+/// ingest just that one bundle.
+async fn handle_sync(config: &Config, only: Option<String>) -> Result<()> {
+    let bundles = &config.knowledge_bundles;
+    if bundles.is_empty() {
+        println!("No [knowledge_bundles.*] configured. Define a corpus, e.g.:\n");
+        println!("  [knowledge_bundles.prior_art]");
+        println!("  sources = [\"~/work/prior-art\"]");
+        return Ok(());
+    }
+    if let Some(name) = &only
+        && !bundles.contains_key(name)
+    {
+        bail!("no knowledge bundle named '{name}'");
+    }
+
+    let memory = crate::memory::cli::create_memory_with_embedder(config)?;
+    let mut stats = IngestStats::default();
+
+    for (name, bundle) in bundles {
+        if only.as_ref().is_some_and(|o| o != name) {
+            continue;
+        }
+        if bundle.sources.is_empty() {
+            println!(
+                "{} bundle '{name}' has no sources — skipping.",
+                style("note:").yellow()
+            );
+            continue;
+        }
+        println!("{} corpus '{name}'", style("syncing").bold());
+        for source in &bundle.sources {
+            let expanded = expand_source(source);
+            let root = PathBuf::from(&expanded);
+            if !root.exists() {
+                eprintln!("  {} source not found: {source}", style("skip").yellow());
+                stats.failed += 1;
+                continue;
+            }
+            // The bundle name is the collection root, so all of a bundle's
+            // sources merge into one `docs/<bundle>` taxonomy.
+            ingest_tree(memory.as_ref(), &root, name, true, false, &mut stats).await?;
+        }
+    }
+    stats.print_summary();
+    Ok(())
+}
+
+/// Expand a leading `~` and strip a `file://` scheme from a source path.
+/// Remote schemes (http/s3/…) are not yet supported and pass through unchanged
+/// so the caller's existence check reports them as missing.
+fn expand_source(source: &str) -> String {
+    let s = source.strip_prefix("file://").unwrap_or(source);
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return format!("{}/{}", home.to_string_lossy(), rest);
+        }
+    }
+    s.to_string()
+}
+
+/// Walk a tree (or single file) and ingest every supported document into
+/// `docs/<collection>/...`, accumulating into `stats`. Shared by `ingest` and
+/// `sync`.
+async fn ingest_tree(
+    memory: &dyn Memory,
+    root: &Path,
+    collection: &str,
+    recursive: bool,
+    force: bool,
+    stats: &mut IngestStats,
+) -> Result<()> {
     // The base directory is what taxonomy paths are computed relative to. For a
-    // single-file ingest the base is the file's parent so the file itself maps
-    // to the collection root.
+    // single-file ingest the base is the file's parent so the file maps to the
+    // collection root.
     let (base_dir, is_single_file) = if root.is_dir() {
-        (root.clone(), false)
+        (root.to_path_buf(), false)
     } else {
         (
             root.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf),
@@ -57,54 +184,22 @@ async fn handle_ingest(
         )
     };
 
-    // Default the collection name to the ingested directory's name so files
-    // land under e.g. `docs/teaching/...` when ingesting a `teaching/` folder.
-    let collection = collection.unwrap_or_else(|| {
-        if is_single_file {
-            String::new()
-        } else {
-            base_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        }
-    });
-
     let mut files = Vec::new();
     if is_single_file {
-        files.push(root.clone());
+        files.push(root.to_path_buf());
     } else {
-        collect_supported(&root, recursive, &mut files);
+        collect_supported(root, recursive, &mut files);
     }
     files.sort();
 
     if files.is_empty() {
         println!(
-            "No documents found under {} (supported: {}).",
+            "  no documents under {} (supported: {})",
             root.display(),
             extract::supported_summary()
         );
         return Ok(());
     }
-
-    let memory = crate::memory::cli::create_memory_with_embedder(config)?;
-
-    println!(
-        "Ingesting {} document(s) from {} into collection '{}'…",
-        files.len(),
-        root.display(),
-        if collection.is_empty() {
-            docs::DOCS_NAMESPACE_ROOT
-        } else {
-            &collection
-        }
-    );
-
-    let mut ingested = 0usize;
-    let mut skipped = 0usize;
-    let mut chunks_total = 0usize;
-    let mut failed = 0usize;
-    let mut needs_feature = 0usize;
 
     for file in &files {
         let rel = file.strip_prefix(&base_dir).unwrap_or(file);
@@ -116,32 +211,28 @@ async fn handle_ingest(
             .parent()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
-        let taxonomy = join_taxonomy(&collection, &parent_rel);
+        let taxonomy = join_taxonomy(collection, &parent_rel);
         let namespace = docs::namespace_for_path(&taxonomy);
 
-        let first_key = format!("{rel_str}#0");
-        if !force
-            && memory
-                .get(&first_key)
-                .await
-                .ok()
-                .flatten()
-                .is_some()
-        {
-            skipped += 1;
+        // Key includes the collection so the same relative path under different
+        // corpora doesn't collide.
+        let key_base = join_taxonomy(collection, &rel_str);
+        let first_key = format!("{key_base}#0");
+        if !force && memory.get(&first_key).await.ok().flatten().is_some() {
+            stats.skipped += 1;
             continue;
         }
 
         let text = match extract::extract(file) {
             Ok(Extracted::Text(t)) => t,
             Ok(Extracted::NeedsFeature) => {
-                needs_feature += 1;
+                stats.needs_feature += 1;
                 continue;
             }
             Ok(Extracted::Unsupported) => continue,
             Err(e) => {
                 eprintln!("  {} {}: {e}", style("skip").yellow(), rel_str);
-                failed += 1;
+                stats.failed += 1;
                 continue;
             }
         };
@@ -153,7 +244,7 @@ async fn handle_ingest(
 
         let mut stored = 0usize;
         for chunk in &chunks {
-            let key = format!("{rel_str}#{}", chunk.index);
+            let key = format!("{key_base}#{}", chunk.index);
             if let Err(e) = memory
                 .store_with_metadata(
                     &key,
@@ -166,36 +257,17 @@ async fn handle_ingest(
                 .await
             {
                 eprintln!("  {} {key}: {e}", style("error").red());
-                failed += 1;
+                stats.failed += 1;
                 continue;
             }
             stored += 1;
         }
-        chunks_total += stored;
-        ingested += 1;
+        stats.chunks_total += stored;
+        stats.ingested += 1;
         println!(
             "  {} {rel_str} → {} ({stored} chunk(s))",
             style("ok").green(),
             namespace
-        );
-    }
-
-    println!(
-        "\nDone: {} ingested, {} skipped (already present), {} chunk(s) stored{}.",
-        ingested,
-        skipped,
-        chunks_total,
-        if failed > 0 {
-            format!(", {failed} error(s)")
-        } else {
-            String::new()
-        }
-    );
-    if needs_feature > 0 {
-        println!(
-            "{} {needs_feature} file(s) (PDF/Office) were skipped — rebuild with \
-             `--features docs-extract` to ingest them.",
-            style("note:").yellow()
         );
     }
     Ok(())
