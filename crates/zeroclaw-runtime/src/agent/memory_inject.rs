@@ -243,6 +243,13 @@ pub async fn render_memory_context(
         if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
             continue;
         }
+        // Document-corpus chunks (the `docs/` namespace) are reached only on
+        // demand via the `docs_search` tool — never auto-injected here, so a
+        // large ingested corpus cannot crowd out conversational memory in the
+        // per-turn context.
+        if zeroclaw_memory::is_docs_namespace(&entry.namespace) {
+            continue;
+        }
         if should_skip_entry(&entry.key, &entry.content) {
             continue;
         }

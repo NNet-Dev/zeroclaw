@@ -64,7 +64,7 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
 /// applies. Removed `model_providers.fallback`; the embedder API key falls
 /// back to the first configured model provider, matching how the gateway
 /// resolves it (`crates/zeroclaw-gateway/src/lib.rs` `fallback`).
-fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
+pub(crate) fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         bail!("Memory backend is 'none' (disabled). No entries to manage.");

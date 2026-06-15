@@ -488,6 +488,37 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         Ok(filtered)
     }
 
+    /// Recall memories whose `namespace` equals `prefix` or is a descendant
+    /// taxonomy path (`<prefix>/...`). Enables hierarchical drill-down over a
+    /// document corpus without a schema migration.
+    ///
+    /// Default implementation over-fetches from `recall()` and filters by
+    /// prefix in memory, so it never leaks rows outside the requested subtree.
+    /// The trade-off is recall quality when the matching subtree is a small
+    /// slice of the whole store: candidates can be crowded out before the
+    /// filter runs. Backends should override with a pushed-down
+    /// `WHERE namespace = ?1 OR namespace LIKE ?1 || '/%'` for correctness at
+    /// scale.
+    async fn recall_namespace_prefix(
+        &self,
+        prefix: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let over = limit.saturating_mul(20).max(100);
+        let entries = self.recall(query, over, session_id, since, until).await?;
+        let child_prefix = format!("{prefix}/");
+        let filtered: Vec<MemoryEntry> = entries
+            .into_iter()
+            .filter(|e| e.namespace == prefix || e.namespace.starts_with(&child_prefix))
+            .take(limit)
+            .collect();
+        Ok(filtered)
+    }
+
     /// Bulk-export memories matching the given filter criteria.
     ///
     /// Intended for GDPR Art. 20 data portability. Returns entries ordered by
