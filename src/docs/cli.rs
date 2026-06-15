@@ -132,16 +132,28 @@ async fn handle_sync(config: &Config, only: Option<String>) -> Result<()> {
         }
         println!("{} corpus '{name}'", style("syncing").bold());
         for source in &bundle.sources {
-            let expanded = expand_source(source);
-            let root = PathBuf::from(&expanded);
-            if !root.exists() {
-                eprintln!("  {} source not found: {source}", style("skip").yellow());
-                stats.failed += 1;
-                continue;
+            match docs::classify_source(source) {
+                // RAG-index sources are federated at query time, never ingested.
+                docs::DocSource::Index(idx) => {
+                    println!(
+                        "  {} {} (federated at query time)",
+                        style("index").cyan(),
+                        idx.label()
+                    );
+                }
+                docs::DocSource::Folder(path) => {
+                    let expanded = expand_source(&path);
+                    let root = PathBuf::from(&expanded);
+                    if !root.exists() {
+                        eprintln!("  {} source not found: {source}", style("skip").yellow());
+                        stats.failed += 1;
+                        continue;
+                    }
+                    // The bundle name is the collection root, so all of a
+                    // bundle's folder sources merge into one `docs/<bundle>`.
+                    ingest_tree(memory.as_ref(), &root, name, true, false, &mut stats).await?;
+                }
             }
-            // The bundle name is the collection root, so all of a bundle's
-            // sources merge into one `docs/<bundle>` taxonomy.
-            ingest_tree(memory.as_ref(), &root, name, true, false, &mut stats).await?;
         }
     }
     stats.print_summary();

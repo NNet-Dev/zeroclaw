@@ -66,7 +66,7 @@ pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
-pub use zeroclaw_tools::docs_search::DocsSearchTool;
+pub use zeroclaw_tools::docs_search::{DocsSearchTool, FederatedIndex};
 pub use zeroclaw_tools::email_read::EmailReadTool;
 pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
@@ -619,6 +619,61 @@ pub fn all_tools_with_runtime(
                 .collect()
         })
         .unwrap_or_default();
+    // Resolve the "RAG index" intent: any subscribed bundle source that is an
+    // external vector index (e.g. `qdrant://…`) becomes a federated index that
+    // `docs_search` queries live. Only subscribed bundles contribute, so the
+    // hard boundary holds for federated indexes too.
+    let doc_federated: Vec<FederatedIndex> = {
+        let index_refs: Vec<zeroclaw_memory::docs::IndexRef> = root_config
+            .agents
+            .get(agent_alias)
+            .map(|agent| {
+                agent
+                    .knowledge_bundles
+                    .iter()
+                    .filter_map(|b| root_config.knowledge_bundles.get(b))
+                    .flat_map(|cfg| cfg.sources.iter())
+                    .filter_map(|s| match zeroclaw_memory::docs::classify_source(s) {
+                        zeroclaw_memory::docs::DocSource::Index(idx) => Some(idx),
+                        zeroclaw_memory::docs::DocSource::Folder(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if index_refs.is_empty() {
+            Vec::new()
+        } else {
+            // Build a query embedder from the agent's memory embedding settings,
+            // reused across all of this agent's federated indexes.
+            let embedder: Arc<dyn zeroclaw_memory::embeddings::EmbeddingProvider> = Arc::from(
+                zeroclaw_memory::embeddings::create_embedding_provider(
+                    &root_config.memory.embedding_provider,
+                    fallback_api_key,
+                    &root_config.memory.embedding_model,
+                    root_config.memory.embedding_dimensions,
+                ),
+            );
+            index_refs
+                .into_iter()
+                .map(|idx| {
+                    let label = idx.label();
+                    match idx {
+                        zeroclaw_memory::docs::IndexRef::Qdrant {
+                            url,
+                            collection,
+                            api_key,
+                        } => FederatedIndex::qdrant(
+                            label,
+                            &url,
+                            &collection,
+                            api_key,
+                            embedder.clone(),
+                        ),
+                    }
+                })
+                .collect()
+        }
+    };
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
@@ -683,9 +738,10 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(DocsSearchTool::with_corpora(
+        Arc::new(DocsSearchTool::with_corpora_and_indexes(
             memory.clone(),
             doc_corpus_roots.clone(),
+            doc_federated,
         )),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
