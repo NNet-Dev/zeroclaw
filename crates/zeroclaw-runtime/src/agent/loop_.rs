@@ -564,6 +564,13 @@ async fn build_context(
                 if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
                     continue;
                 }
+                // Document-corpus chunks (the `docs/` namespace) are reached
+                // only on demand via the `docs_search` tool — never auto-injected
+                // here, so a large ingested corpus cannot crowd out conversational
+                // memory in the per-turn context.
+                if zeroclaw_memory::is_docs_namespace(&entry.namespace) {
+                    continue;
+                }
                 if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }

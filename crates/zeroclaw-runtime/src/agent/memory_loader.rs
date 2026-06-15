@@ -56,6 +56,12 @@ impl MemoryLoader for DefaultMemoryLoader {
         let mut context = String::new();
         let mut included = false;
         for entry in entries {
+            // Document-corpus chunks (the `docs/` namespace) are reached only
+            // on demand via `docs_search`, never auto-injected into per-turn
+            // context. Keeps a large ingested corpus from polluting recall.
+            if zeroclaw_memory::is_docs_namespace(&entry.namespace) {
+                continue;
+            }
             if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                 continue;
             }

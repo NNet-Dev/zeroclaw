@@ -254,6 +254,7 @@ mod i18n;
 mod identity;
 #[cfg(feature = "agent-runtime")]
 mod integrations;
+mod docs;
 mod memory;
 #[cfg(feature = "agent-runtime")]
 mod migration;
@@ -794,6 +795,28 @@ Examples:
     Memory {
         #[command(subcommand)]
         memory_command: MemoryCommands,
+    },
+
+    /// Ingest and search a document corpus (RAG over past work / reference files)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Ingest documents into a tool-gated knowledge corpus and search them.
+
+Documents are chunked, embedded, and stored under a reserved `docs/` \
+namespace, isolated from conversational memory. The folder structure becomes \
+the taxonomy: ingesting a directory maps its subfolders to hierarchical \
+categories (e.g. teaching/mathematics/year-9). The agent reaches this corpus \
+only on demand via the `docs_search` tool, so it never pollutes per-turn \
+context.
+
+Examples:
+  zeroclaw docs ingest ~/work/prior-art
+  zeroclaw docs ingest ~/teaching --collection teaching
+  zeroclaw docs search \"quadratic equations\" --scope teaching/mathematics
+  zeroclaw docs list")]
+    Docs {
+        #[command(subcommand)]
+        docs_command: DocsCommands,
     },
 
     /// Manage configuration
@@ -2671,6 +2694,41 @@ enum MemoryCommands {
     Reindex,
 }
 
+#[derive(Subcommand, Debug)]
+enum DocsCommands {
+    /// Ingest a file or directory of documents into the knowledge corpus.
+    ///
+    /// The directory tree becomes the taxonomy: each subfolder is a category
+    /// level. Supported formats: .md, .txt (PDF/DOCX/XLSX coming next).
+    Ingest {
+        /// File or directory to ingest.
+        path: String,
+        /// Top-level collection name prepended to the derived taxonomy path.
+        /// Defaults to the ingested directory's name.
+        #[arg(long)]
+        collection: Option<String>,
+        /// Recurse into subdirectories (default: true).
+        #[arg(long, default_value = "true")]
+        recursive: bool,
+        /// Re-ingest even if a document's chunks already exist (replaces them).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Search the document corpus, optionally scoped to a taxonomy path.
+    Search {
+        /// Query keywords or phrase.
+        query: String,
+        /// Restrict to a taxonomy path, e.g. teaching/mathematics/year-9.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Max snippets to return.
+        #[arg(long, default_value = "5")]
+        limit: usize,
+    },
+    /// List ingested taxonomy categories and their document counts.
+    List,
+}
+
 fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
     #[cfg(feature = "agent-runtime")]
     {
@@ -4226,6 +4284,8 @@ async fn main() -> Result<()> {
         Commands::Memory { memory_command } => {
             memory::cli::handle_command(memory_command, &config).await
         }
+
+        Commands::Docs { docs_command } => docs::cli::handle_command(docs_command, &config).await,
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
 

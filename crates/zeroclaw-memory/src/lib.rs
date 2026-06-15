@@ -30,6 +30,7 @@ pub mod chunker;
 pub mod conflict;
 pub mod consolidation;
 pub mod decay;
+pub mod docs;
 pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
@@ -59,6 +60,7 @@ pub use backend::{
     MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
     memory_backend_profile, selectable_memory_backends,
 };
+pub use docs::{DOCS_NAMESPACE_ROOT, is_docs_namespace, namespace_for_path};
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
