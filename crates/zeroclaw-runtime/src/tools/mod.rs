@@ -603,6 +603,22 @@ pub fn all_tools_with_runtime(
     // Independent agentic delegates use it later to build the target-owned tool
     // registry; bounded delegates continue to use the parent `tool_arcs`
     // snapshot below.
+    // Resolve this agent's subscribed document corpora (the `knowledge_bundles`
+    // it lists) into `docs/<bundle>` namespace roots. `docs_search` is then a
+    // hard boundary over exactly these corpora — an agent subscribed to none
+    // can retrieve no documents. Mirrors the cross-agent `read_memory_from`
+    // allowlist resolution.
+    let doc_corpus_roots: Vec<String> = root_config
+        .agents
+        .get(agent_alias)
+        .map(|agent| {
+            agent
+                .knowledge_bundles
+                .iter()
+                .map(|bundle| zeroclaw_memory::docs::namespace_for_path(bundle))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
@@ -667,7 +683,10 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(DocsSearchTool::new(memory.clone())),
+        Arc::new(DocsSearchTool::with_corpora(
+            memory.clone(),
+            doc_corpus_roots.clone(),
+        )),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
