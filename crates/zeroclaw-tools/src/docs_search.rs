@@ -438,6 +438,74 @@ mod tests {
         assert!(!res.output.contains("index:qdrant:legal"), "got: {}", res.output);
     }
 
+    /// Live federation smoke test against a real Qdrant collection.
+    ///
+    /// Gated on `QDRANT_URL` + `EMBED_URL` (an OpenAI-compatible embeddings
+    /// endpoint) and `#[ignore]`d so normal `cargo test` and CI skip it. Run:
+    ///   QDRANT_URL=http://127.0.0.1:6333 EMBED_URL=http://127.0.0.1:8099 \
+    ///     cargo test -p zeroclaw-tools federated_qdrant_live_smoke -- --ignored
+    #[tokio::test]
+    #[ignore = "requires live Qdrant (QDRANT_URL) + embeddings (EMBED_URL)"]
+    async fn federated_qdrant_live_smoke() {
+        let (Ok(qurl), Ok(eurl)) = (std::env::var("QDRANT_URL"), std::env::var("EMBED_URL"))
+        else {
+            eprintln!("skipping: set QDRANT_URL and EMBED_URL");
+            return;
+        };
+        let collection = format!("docs_smoke_{}", std::process::id());
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::from(
+            zeroclaw_memory::embeddings::create_embedding_provider(
+                &format!("custom:{eurl}"),
+                None,
+                "fake",
+                16,
+            ),
+        );
+        let fed = FederatedIndex::qdrant("qdrant:smoke", &qurl, &collection, None, embedder);
+
+        // Populate the external collection through the same handle the tool
+        // federates, then query it via docs_search.
+        let store = fed.memory.clone();
+        store
+            .store(
+                "refund.pdf#0",
+                "Refund policy: returns accepted within 30 days of purchase.",
+                MemoryCategory::Custom("document".into()),
+                None,
+            )
+            .await
+            .expect("store refund doc");
+        store
+            .store(
+                "shipping.pdf#0",
+                "Shipping is free on orders over fifty dollars.",
+                MemoryCategory::Custom("document".into()),
+                None,
+            )
+            .await
+            .expect("store shipping doc");
+
+        let itmp = TempDir::new().unwrap();
+        let internal: Arc<dyn Memory> = Arc::new(SqliteMemory::new("int", itmp.path()).unwrap());
+        let tool = DocsSearchTool::with_corpora_and_indexes(internal, vec![], vec![fed]);
+
+        let res = tool
+            .execute(json!({"query": "refund policy returns accepted"}))
+            .await
+            .unwrap();
+        assert!(res.success, "{res:?}");
+        assert!(
+            res.output.contains("refund.pdf#0"),
+            "expected the refund doc from live Qdrant, got: {}",
+            res.output
+        );
+        assert!(
+            res.output.contains("[index:qdrant:smoke]"),
+            "expected the federated index label, got: {}",
+            res.output
+        );
+    }
+
     #[test]
     fn name_and_schema() {
         let tmp = TempDir::new().unwrap();
