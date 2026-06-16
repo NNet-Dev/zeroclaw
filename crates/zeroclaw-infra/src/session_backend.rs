@@ -177,6 +177,16 @@ pub trait SessionBackend: Send + Sync {
         Ok(0)
     }
 
+    /// Re-point session attribution (`agent_alias` `from` → `to`) on every
+    /// session owned by `from`, returning the number of rows updated. Used by
+    /// the agent-rename cascade (#7468): the conversation history is kept and
+    /// its attribution follows the renamed agent (contrast
+    /// [`Self::clear_agent_attribution`], which drops it on delete). No-op for
+    /// backends without per-agent metadata.
+    fn rename_agent_attribution(&self, _from: &str, _to: &str) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
     /// Quick existence check used by the gateway to avoid resurrecting a
     /// session that the user just deleted (#7126). The default impl falls
     /// back to `get_session_metadata`; production backends should override

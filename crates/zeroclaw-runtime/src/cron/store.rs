@@ -263,6 +263,21 @@ pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize>
     Ok(changed)
 }
 
+/// Re-point every cron job owned by `from` to `to`, returning the row count.
+/// Called by the agent-rename cascade (#7468): the job keeps running, just
+/// under the renamed owner. `agent_alias` is plain TEXT (not a UUID), so this
+/// is a direct column update.
+pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usize> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET agent_alias = ?2 WHERE agent_alias = ?1",
+            params![from, to],
+        )
+        .context("Failed to rename cron job owner")
+    })?;
+    Ok(changed)
+}
+
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let lim = i64::try_from(config.scheduler.max_tasks.max(1))
         .context("Scheduler max_tasks overflows i64")?;
