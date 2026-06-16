@@ -124,6 +124,13 @@ fn delete_config(
         println!("\nNo changes made. Re-run with --yes to apply (or --dry-run to preview).");
         return Ok(());
     }
+    apply_delete(config, kind, alias)
+}
+
+/// Apply the config-layer delete (scrub refs + remove entry) and mark the dirty
+/// paths. Bails on a hard-ref refusal or a missing alias. The caller persists.
+fn apply_delete(config: &mut Config, kind: &AliasKind, alias: &str) -> Result<()> {
+    let section = section_path(kind);
     match alias_refs::delete_with_cascade(config, kind, alias, CascadePolicy::RefuseOnHard) {
         Ok(report) => {
             for path in report.dirty_paths() {
@@ -187,8 +194,11 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             save(config).await
         }
         AgentsCommands::Rename { from, to } => {
+            // Capture the workspace path while the `from` entry still exists
+            // (custom paths are read off the entry, which the rename moves).
+            let old_ws = config.agent_workspace_dir(&from);
             rename_config(config, &AliasKind::Agent, &from, &to)?;
-            warn_agent_owned_state();
+            agent_rename_owned_state(config, &from, &to, &old_ws).await?;
             save(config).await
         }
         AgentsCommands::Delete {
@@ -199,16 +209,183 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             if alias == RESERVED_DEFAULT_AGENT {
                 bail!("the `default` agent is reserved and cannot be deleted");
             }
-            delete_config(config, &AliasKind::Agent, &alias, dry_run, yes)?;
-            if yes && !dry_run {
-                warn_agent_owned_state();
-                save(config).await?;
+            if dry_run {
+                print_impact(&AliasKind::Agent, &alias, config);
+                return Ok(());
             }
-            Ok(())
+            if !yes {
+                print_impact(&AliasKind::Agent, &alias, config);
+                println!(
+                    "\nNo changes made. Re-run with --yes to apply (or --dry-run to preview)."
+                );
+                return Ok(());
+            }
+            // Owned-state HARD gate (live ACP sessions) runs BEFORE the config
+            // cascade so a refusal mutates nothing.
+            agent_delete_precheck(config, &alias)?;
+            apply_delete(config, &AliasKind::Agent, &alias)?;
+            agent_delete_owned_state(config, &alias).await?;
+            save(config).await
         }
     }
 }
 
+// ── agent owned-state cascade (feature-gated) ─────────────────────────────────
+// Memory / cron / acp / session rows + the workspace dir live in infra crates
+// the gateway owns; the CLI opens them from `data_dir` and reuses the gateway's
+// cascade coordinators. A `--no-default-features` build (no gateway/runtime)
+// falls back to a config-only cascade + a warning.
+
+/// Memory + optional session-backend handles opened from `data_dir` for the
+/// owned-state cascade.
+#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+type OwnedStateHandles = (
+    std::sync::Arc<dyn zeroclaw_memory::Memory>,
+    Option<std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+);
+
+#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
+    use std::sync::Arc;
+    let mem: Arc<dyn zeroclaw_memory::Memory> = if config.agents.is_empty() {
+        Arc::new(zeroclaw_memory::NoneMemory::new("none"))
+    } else {
+        Arc::from(
+            zeroclaw_memory::create_memory_with_storage_and_routes(
+                &config.memory,
+                &config.embedding_routes,
+                config.resolve_active_storage(),
+                &config.data_dir,
+                None,
+            )
+            .context("open memory backend for the owned-state cascade")?,
+        )
+    };
+    let session_backend = if config.gateway.session_persistence {
+        Some(
+            zeroclaw_infra::make_session_backend(
+                &config.data_dir,
+                &config.channels.session_backend,
+            )
+            .context("open session backend for the owned-state cascade")?,
+        )
+    } else {
+        None
+    };
+    Ok((mem, session_backend))
+}
+
+#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+fn agent_delete_precheck(config: &Config, alias: &str) -> Result<()> {
+    // Fail closed: refuse if live ACP sessions exist, or if the store can't be
+    // read to verify (mirrors the gateway delete gate).
+    let live = crate::gateway::agent_owned_state::live_acp_session_count(config, alias)
+        .context("could not verify live ACP sessions")?;
+    if live > 0 {
+        bail!("{live} live ACP session(s) for `{alias}` — end them first");
+    }
+    Ok(())
+}
+
+#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+fn agent_delete_precheck(_config: &Config, _alias: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+async fn agent_delete_owned_state(config: &Config, alias: &str) -> Result<()> {
+    let (mem, session_backend) = build_owned_state_handles(config)?;
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let archive_dir = config
+        .data_dir
+        .join("agents")
+        .join("_deleted")
+        .join(format!("{alias}-{ts}"));
+    tokio::fs::create_dir_all(&archive_dir).await.ok();
+    // Archive the workspace dir alongside the owned-state exports.
+    let workspace = config.agent_workspace_dir(alias);
+    if workspace.exists() {
+        if let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await {
+            eprintln!("warning: workspace archive failed: {e}");
+        }
+    }
+    let report = crate::gateway::agent_owned_state::cascade_owned_state(
+        config,
+        &mem,
+        session_backend.as_ref(),
+        alias,
+        &archive_dir,
+    )
+    .await;
+    println!(
+        "owned-state cascaded: memory {} · cron {} · acp {} · sessions {} → {}",
+        report.memory_purged,
+        report.cron_removed,
+        report.acp_removed,
+        report.sessions_cleared,
+        archive_dir.display()
+    );
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(())
+}
+
+#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+async fn agent_delete_owned_state(_config: &Config, _alias: &str) -> Result<()> {
+    warn_agent_owned_state();
+    Ok(())
+}
+
+#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+async fn agent_rename_owned_state(
+    config: &Config,
+    from: &str,
+    to: &str,
+    old_ws: &std::path::Path,
+) -> Result<()> {
+    // Move the workspace dir (default per-alias location only; a custom path is
+    // alias-independent → old_ws == new_ws → skip).
+    let new_ws = config.agent_workspace_dir(to);
+    if old_ws != new_ws && old_ws.exists() {
+        if let Some(parent) = new_ws.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        if let Err(e) = tokio::fs::rename(old_ws, &new_ws).await {
+            eprintln!("warning: workspace move failed: {e}");
+        }
+    }
+    let (mem, session_backend) = build_owned_state_handles(config)?;
+    let report = crate::gateway::agent_owned_state::cascade_rename_agent(
+        config,
+        &mem,
+        session_backend.as_ref(),
+        from,
+        to,
+    )
+    .await;
+    println!(
+        "owned-state re-pointed: memory {} · cron {} · acp {} · sessions {}",
+        report.memory_rows, report.cron_jobs, report.acp_sessions, report.sessions_repointed
+    );
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(())
+}
+
+#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+async fn agent_rename_owned_state(
+    _config: &Config,
+    _from: &str,
+    _to: &str,
+    _old_ws: &std::path::Path,
+) -> Result<()> {
+    warn_agent_owned_state();
+    Ok(())
+}
+
+#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
 fn warn_agent_owned_state() {
     eprintln!(
         "note: config references were updated, but the agent's owned state \
