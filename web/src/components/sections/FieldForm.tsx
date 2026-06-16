@@ -952,8 +952,10 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     }, [unsavedCount]);
 
     if (loading) {
+      // Label the spinner: a bare spinner in a tall detail pane reads as a
+      // blank/broken page during the multi-second prop fetch (#7665 review).
       return (
-        <div className="flex items-center justify-center py-12">
+        <div className="flex flex-col items-center justify-center gap-3 py-12 text-pc-text-muted">
           <div
             className="h-8 w-8 border-2 rounded-full animate-spin"
             style={{
@@ -961,6 +963,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
               borderTopColor: "var(--pc-accent)",
             }}
           />
+          <p className="text-sm">{t("fieldform.loading_details")}</p>
         </div>
       );
     }

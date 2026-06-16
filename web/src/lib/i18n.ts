@@ -630,6 +630,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'fieldform.drift_secret_differs': "secret value differs from on-disk",
     'fieldform.edit_in_source_prefix': "Edit ",
     'fieldform.edit_in_source_suffix': " in its source section",
+    'fieldform.loading_details': "Loading details…",
     'fieldform.element_shape_unavailable': "Element shape unavailable from schema; edit raw JSON below.",
     'fieldform.empty': "empty",
     'fieldform.entries': "entries",
