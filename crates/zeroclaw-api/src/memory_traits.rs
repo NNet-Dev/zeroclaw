@@ -256,6 +256,14 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("purge_agent not supported by this memory backend")
     }
 
+    /// Export every memory row attributed to `agent_alias`, for the agent-
+    /// deletion archive (export-then-delete, #7175). Pairs with
+    /// [`Self::purge_agent`]: the surface exports these rows to the archive,
+    /// then purges. Default: empty (backends without per-agent export).
+    async fn export_agent(&self, _agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+
     /// Count total memories
     async fn count(&self) -> anyhow::Result<usize>;
 

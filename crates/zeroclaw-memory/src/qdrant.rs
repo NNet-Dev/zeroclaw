@@ -789,6 +789,24 @@ impl Memory for QdrantMemory {
         Ok(matches)
     }
 
+    async fn purge_agent(&self, agent_alias: &str) -> Result<usize> {
+        // Qdrant stores the agent alias in the `agent_id` payload field.
+        let matches = self
+            .list_for_agents(&[agent_alias], None, None)
+            .await?
+            .len();
+        if matches == 0 {
+            return Ok(0);
+        }
+        self.delete_points_matching(&[("agent_id", agent_alias)])
+            .await?;
+        Ok(matches)
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> Result<Vec<MemoryEntry>> {
+        self.list_for_agents(&[agent_alias], None, None).await
+    }
+
     async fn count(&self) -> Result<usize> {
         self.ensure_initialized().await?;
 

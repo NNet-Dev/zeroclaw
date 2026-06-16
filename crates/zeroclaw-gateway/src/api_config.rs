@@ -997,7 +997,15 @@ pub async fn handle_delete_map_key(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let mut working = state.config.read().clone();
+    let working = state.config.read().clone();
+    // Agent deletion is special: it must scrub config references (heartbeat,
+    // peer-groups, delegates, workspace.access, …) via `delete_with_cascade`
+    // and cascade owned non-config state (memory / cron / acp / session). The
+    // generic map-key delete below handles every other section unchanged.
+    if q.path == "agents" {
+        return delete_agent_cascade(&state, working, &q.key).await;
+    }
+    let mut working = working;
     let removed = match working.delete_map_key(&q.path, &q.key) {
         Ok(b) => b,
         Err(msg) => {
@@ -1007,45 +1015,6 @@ pub async fn handle_delete_map_key(
         }
     };
     if removed {
-        // Agent alias removal archives `agents/<alias>/workspace/` to
-        // `agents/_deleted/<alias>-<ts>/` rather than rm -rf. The
-        // workspace may contain operator notes, IDENTITY.md edits, etc.
-        // Memory database rows for the alias are also purged through
-        // the storage adapter so a future reuse of the same alias
-        // doesn't inherit stale rows.
-        if q.path == "agents" {
-            let workspace = working.agent_workspace_dir(&q.key);
-            if workspace.exists()
-                && let Some(parent) = workspace.parent()
-            {
-                let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-                let archive_root = parent.join("_deleted");
-                let archive_dir = archive_root.join(format!("{}-{ts}", q.key));
-                if let Err(err) = tokio::fs::create_dir_all(&archive_root).await {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": q.key, "archive": archive_root.display().to_string(), "err": err.to_string()})), "agent alias removed from config but archive dir creation failed");
-                } else if let Err(err) = tokio::fs::rename(&workspace, &archive_dir).await {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": q.key, "from": workspace.display().to_string(), "to": archive_dir.display().to_string(), "err": err.to_string()})), "agent alias removed from config but workspace archive failed");
-                } else {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": q.key, "archive": archive_dir.display().to_string()})), "agent workspace archived after alias removal");
-                }
-            }
-            match state.mem.purge_agent(&q.key).await {
-                Ok(rows) if rows > 0 => ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"agent": q.key, "rows": rows})),
-                    "agent memory rows purged after alias removal"
-                ),
-                Ok(_) => {}
-                Err(err) => ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"agent": q.key, "err": err.to_string()})),
-                    "purge_agent failed (backend may not support it)"
-                ),
-            }
-        }
         working.mark_dirty(&format!("{}.{}", q.path, q.key));
         if let Err(e) = persist_and_swap(&state, working).await {
             return error_response(e);
@@ -1057,6 +1026,180 @@ pub async fn handle_delete_map_key(
         created: false,
     })
     .into_response()
+}
+
+/// Agent-deletion cascade: refuse on HARD references (enabled `heartbeat.agent`
+/// or live ACP sessions), else scrub config refs + remove the entry via
+/// `delete_with_cascade`, archive the workspace, run the owned-state cascade
+/// (export-then-delete memory/cron/acp + clear session attribution), and persist.
+async fn delete_agent_cascade(
+    state: &AppState,
+    mut working: zeroclaw_config::schema::Config,
+    alias: &str,
+) -> Response {
+    use zeroclaw_config::alias_refs::{self, AliasKind, CascadePolicy};
+
+    if !working.agents.contains_key(alias) {
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::PathNotFound,
+                format!("agents.{alias} is not configured"),
+            )
+            .with_path("agents"),
+        );
+    }
+
+    // Refuse on HARD: config blockers (e.g. enabled heartbeat.agent) OR live ACP
+    // sessions (the operator must end those first). The ACP gate FAILS CLOSED:
+    // if the session store can't be read we refuse rather than risk orphaning
+    // live sessions.
+    let plan = alias_refs::plan_delete(&working, &AliasKind::Agent, alias);
+    let live_acp = match crate::agent_owned_state::live_acp_session_count(&working, alias) {
+        Ok(n) => n,
+        Err(e) => {
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::ValidationFailed,
+                    format!(
+                        "cannot delete agent `{alias}`: could not verify live ACP sessions ({e}); refusing to avoid orphaning active sessions"
+                    ),
+                )
+                .with_path(format!("agents.{alias}")),
+            );
+        }
+    };
+    if !plan.allowed || live_acp > 0 {
+        let mut reasons: Vec<String> = plan
+            .blockers
+            .iter()
+            .map(|b| format!("{} (hard config reference)", b.path))
+            .collect();
+        if live_acp > 0 {
+            reasons.push(format!("{live_acp} live ACP session(s) — end them first"));
+        }
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!("cannot delete agent `{alias}`: {}", reasons.join("; ")),
+            )
+            .with_path(format!("agents.{alias}")),
+        );
+    }
+
+    // Config cascade: scrub soft refs + remove the agents entry.
+    let cascade = match alias_refs::delete_with_cascade(
+        &mut working,
+        &AliasKind::Agent,
+        alias,
+        CascadePolicy::RefuseOnHard,
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::ValidationFailed,
+                    format!("agent config cascade failed: {e}"),
+                )
+                .with_path(format!("agents.{alias}")),
+            );
+        }
+    };
+
+    // Archive into the shared graveyard `<data_dir>/agents/_deleted/<alias>-<ts>/`
+    // (not inside the deleted agent's own dir), and give the owned-state exports
+    // a home there even if the agent had no workspace dir.
+    let workspace = working.agent_workspace_dir(alias);
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let archive_dir = working
+        .data_dir
+        .join("agents")
+        .join("_deleted")
+        .join(format!("{alias}-{ts}"));
+    if let Err(err) = tokio::fs::create_dir_all(&archive_dir).await {
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": alias, "archive": archive_dir.display().to_string(), "err": err.to_string()})), "agent delete: archive dir creation failed");
+    }
+    if workspace.exists() {
+        let dest = archive_dir.join("workspace");
+        if let Err(err) = tokio::fs::rename(&workspace, &dest).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"agent": alias, "err": err.to_string()})),
+                "agent delete: workspace archive failed"
+            );
+        }
+    }
+
+    // Owned-state cascade (export-then-delete memory/cron/acp + clear sessions).
+    let owned = crate::agent_owned_state::cascade_owned_state(
+        &working,
+        &state.mem,
+        state.session_backend.as_ref(),
+        alias,
+        &archive_dir,
+    )
+    .await;
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": alias, "memory": owned.memory_purged, "cron": owned.cron_removed, "acp": owned.acp_removed, "sessions_cleared": owned.sessions_cleared, "archive": archive_dir.display().to_string()})), "agent deleted with owned-state cascade");
+
+    // Persist: mark EVERY entry the cascade touched dirty — the removed agent
+    // entry AND each other entry whose soft-ref was scrubbed. `save_dirty` writes
+    // only marked paths, so marking just `agents.<alias>` would leave a scrubbed
+    // referrer (another agent's `delegates`, a peer group's `agents`) correct in
+    // memory but STALE on disk, reappearing as a dangling reference on the next
+    // config reload (which `validate()` then rejects). Mirrors rename's
+    // `RenameReport.dirty_paths`.
+    for path in delete_cascade_dirty_paths(&cascade) {
+        working.mark_dirty(&path);
+    }
+    if let Err(e) = persist_and_swap(state, working).await {
+        return error_response(e);
+    }
+    axum::Json(MapKeyResponse {
+        path: "agents".to_string(),
+        key: alias.to_string(),
+        created: false,
+    })
+    .into_response()
+}
+
+/// Derive the entry/section config paths a delete cascade mutated, so the
+/// persisting surface can mark each dirty. Includes the removed entry
+/// (`deleted_entry`) and the entry of every scrubbed soft reference
+/// (`applied`). Mirrors how rename marks `RenameReport.dirty_paths`.
+fn delete_cascade_dirty_paths(report: &zeroclaw_config::alias_refs::CascadeReport) -> Vec<String> {
+    let mut paths: Vec<String> = report
+        .applied
+        .iter()
+        .map(|site| dirty_entry_for(&site.path))
+        .collect();
+    if let Some(entry) = &report.deleted_entry {
+        paths.push(entry.clone());
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Truncate a `RefSite` dotted path to the entry/section path that
+/// `apply_dirty_path` re-serialises wholesale, so a nested change (a dropped
+/// vec element or a removed map key) persists with the whole entry rather than
+/// requiring a leaf-precise dirty path.
+fn dirty_entry_for(refsite_path: &str) -> String {
+    let segs: Vec<&str> = refsite_path.split('.').collect();
+    match segs.first().copied() {
+        // agents.<name>.* and peer_groups.<g>.* → the entry root.
+        Some("agents" | "peer_groups") if segs.len() >= 2 => format!("{}.{}", segs[0], segs[1]),
+        // providers.<cat>.<fam>.<alias>.* → the provider entry.
+        Some("providers") if segs.len() >= 4 => segs[..4].join("."),
+        // Scalars / whole-vector fields (heartbeat.agent, acp.default_agent,
+        // escalation.alert_channels[i], model_routes[i]…) → strip any index.
+        _ => refsite_path
+            .split('[')
+            .next()
+            .unwrap_or(refsite_path)
+            .to_string(),
+    }
 }
 
 /// `POST /api/config/map-key?path=<section>&key=<name>` — instantiate a new
@@ -1857,6 +2000,40 @@ mod tests {
     //
     // build_comment_prefix tests live in zeroclaw_config::comment_writer
     // — same reason.
+
+    #[test]
+    fn dirty_entry_for_truncates_ref_paths_to_persistable_entries() {
+        // agent / peer-group referrer sites → the entry root (whole subtree).
+        assert_eq!(dirty_entry_for("agents.lead.delegates[0]"), "agents.lead");
+        assert_eq!(
+            dirty_entry_for("agents.lead.workspace.access.bot"),
+            "agents.lead"
+        );
+        assert_eq!(
+            dirty_entry_for("agents.lead.workspace.read_memory_from[2]"),
+            "agents.lead"
+        );
+        assert_eq!(
+            dirty_entry_for("peer_groups.crew.agents[1]"),
+            "peer_groups.crew"
+        );
+        // scalars / whole-vector fields → the field/section, index stripped.
+        assert_eq!(dirty_entry_for("heartbeat.agent"), "heartbeat.agent");
+        assert_eq!(dirty_entry_for("acp.default_agent"), "acp.default_agent");
+        assert_eq!(
+            dirty_entry_for("escalation.alert_channels[3]"),
+            "escalation.alert_channels"
+        );
+        assert_eq!(
+            dirty_entry_for("model_routes[0].model_provider"),
+            "model_routes"
+        );
+        // provider entry → the 4-segment entry path.
+        assert_eq!(
+            dirty_entry_for("providers.models.anthropic.default.fallback[0]"),
+            "providers.models.anthropic.default"
+        );
+    }
 
     #[test]
     fn map_prop_error_classifies_unknown_property() {

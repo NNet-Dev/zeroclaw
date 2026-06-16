@@ -1394,6 +1394,43 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let agent_alias = agent_alias.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+                 FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1) \
+                 ORDER BY m.created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![agent_alias], |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                    importance: row.get(7)?,
+                    superseded_by: row.get(8)?,
+                    agent_alias: row.get(9)?,
+                    agent_id: row.get(10)?,
+                })
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
     async fn recall_namespaced(
         &self,
         namespace: &str,
@@ -1746,6 +1783,45 @@ mod tests {
         let purged_ghost = mem.purge_agent("ghost").await.unwrap();
         assert_eq!(purged_ghost, 0);
         assert_eq!(mem.count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_export_agent_returns_only_that_agents_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        let rogue = mem.ensure_agent_uuid("rogue").await.unwrap();
+        for idx in 0..3 {
+            mem.store_with_agent(
+                &format!("alpha-{idx}"),
+                "alpha row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&alpha),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store_with_agent(
+            "rogue-0",
+            "rogue row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&rogue),
+        )
+        .await
+        .unwrap();
+
+        let exported = mem.export_agent("alpha").await.unwrap();
+        assert_eq!(exported.len(), 3, "export only alpha's rows");
+        assert!(exported.iter().all(|e| e.key.starts_with("alpha-")));
+        assert_eq!(mem.export_agent("rogue").await.unwrap().len(), 1);
+        assert!(mem.export_agent("ghost").await.unwrap().is_empty());
+        // export does NOT delete.
+        assert_eq!(mem.count().await.unwrap(), 4);
     }
 
     #[tokio::test]

@@ -432,6 +432,14 @@ impl Memory for LucidMemory {
             .await
     }
 
+    async fn purge_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        self.local.purge_agent(agent_alias).await
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.local.export_agent(agent_alias).await
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         self.local.count().await
     }
