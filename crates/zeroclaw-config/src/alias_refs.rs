@@ -11,8 +11,10 @@
 //! referrer-for-referrer, the dangling-reference walk in `Config::validate()`
 //! (`schema.rs` ~16245-17483) — the same containers in deterministic order — so
 //! the two cannot drift in which references they recognise. Anchors to the
-//! mirrored validation are cited per arm below. PR2+ adds `delete_with_cascade`,
-//! which applies the [`ScrubAction`]s and runs the owned-state cascade.
+//! mirrored validation are cited per arm below. `delete_with_cascade` (mutating)
+//! applies the soft-ref [`ScrubAction`]s and removes the entry; owned non-config
+//! state (memory rows, workspace dir, infra DB rows) is cascaded by the calling
+//! surface, which owns those stores.
 
 use crate::schema::Config;
 
@@ -101,8 +103,9 @@ impl RefSite {
 
 /// Non-config persisted state attributed to a deleted agent (ACP sessions,
 /// session metadata, memory rows, workspace dirs). Enumerated from infra
-/// stores, **not** from [`Config`], so PR1's pure config walk leaves
-/// [`ImpactReport::owned_state`] empty; PR3 populates it behind a probe trait.
+/// stores, **not** from [`Config`], so the pure config walk leaves
+/// [`ImpactReport::owned_state`] empty; the calling surface (which owns the infra
+/// stores) populates and cascades it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedArtifact {
     pub store: String,
@@ -121,7 +124,8 @@ pub struct ImpactReport {
     pub blockers: Vec<RefSite>,
     /// Soft references that would be scrubbed.
     pub scrubs: Vec<RefSite>,
-    /// Owned non-config state (empty in PR1; populated in PR3).
+    /// Owned non-config state — empty from the pure config walk; populated by
+    /// the surface cascade, which owns the infra stores.
     pub owned_state: Vec<OwnedArtifact>,
     /// `true` iff no hard reference (or hard owned artifact) blocks the delete.
     pub allowed: bool,
@@ -145,7 +149,7 @@ pub fn find_all_references(cfg: &Config, kind: &AliasKind, alias: &str) -> Vec<R
 }
 
 /// Build the dry-run [`ImpactReport`] for deleting `alias` of `kind`. Pure /
-/// read-only; owned-state is gathered separately by the cascade path (PR3).
+/// read-only; owned-state is gathered separately by the surface cascade.
 #[must_use]
 pub fn plan_delete(cfg: &Config, kind: &AliasKind, alias: &str) -> ImpactReport {
     let (blockers, scrubs): (Vec<_>, Vec<_>) = find_all_references(cfg, kind, alias)
@@ -232,9 +236,13 @@ impl std::error::Error for CascadeError {}
 /// reference to the alias remains. `DryRun` computes the plan and mutates
 /// nothing. [`plan_delete`] is the read-only sibling.
 ///
-/// Currently implements the **model-provider** kind
-/// (`providers.models.<family>.<alias>`); other kinds return
-/// [`CascadeError::NotImplemented`] until their follow-up lands (#7175).
+/// Implements the **model-provider** kind (`providers.models.<family>.<alias>`)
+/// and the **agent** kind (`agents.<alias>`). The agent arm cascades config
+/// references only; its owned non-config state (memory rows, workspace dir,
+/// cron/acp/session rows) is cascaded by the calling surface and is not yet
+/// reflected in `ImpactReport.owned_state`. TTS/transcription providers and
+/// channels return [`CascadeError::NotImplemented`] until their follow-up lands
+/// (#7175).
 pub fn delete_with_cascade(
     cfg: &mut Config,
     kind: &AliasKind,
@@ -249,9 +257,7 @@ pub fn delete_with_cascade(
         AliasKind::Provider { .. } => Err(CascadeError::NotImplemented(
             "TTS/transcription provider delete-with-cascade is not yet implemented".to_string(),
         )),
-        AliasKind::Agent => Err(CascadeError::NotImplemented(
-            "agent delete-with-cascade lands in a follow-up (#7175)".to_string(),
-        )),
+        AliasKind::Agent => delete_agent(cfg, alias, policy),
         AliasKind::Channel { .. } => Err(CascadeError::NotImplemented(
             "channel delete-with-cascade lands in a follow-up (#7175)".to_string(),
         )),
@@ -335,6 +341,91 @@ fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
         .retain(|r| r.model_provider.trim() != target);
     cfg.embedding_routes
         .retain(|r| r.model_provider.trim() != target);
+}
+
+fn delete_agent(
+    cfg: &mut Config,
+    alias: &str,
+    policy: CascadePolicy,
+) -> Result<CascadeReport, CascadeError> {
+    let entry_path = format!("agents.{alias}");
+    if !cfg.agents.contains_key(alias) {
+        return Err(CascadeError::NotFound(entry_path));
+    }
+
+    let kind = AliasKind::Agent;
+    let report = plan_delete(cfg, &kind, alias);
+
+    if policy == CascadePolicy::DryRun {
+        return Ok(CascadeReport {
+            plan: report,
+            applied: Vec::new(),
+            deleted_entry: None,
+        });
+    }
+    // Config-scoped gate. The only HARD agent ref is an enabled `heartbeat.agent`
+    // (see `collect_agent_refs`). Owned-state HARD refs (e.g. live ACP sessions)
+    // are enforced by the surface layer that owns the infra stores; the pure
+    // config walk does not see them.
+    if !report.allowed {
+        return Err(CascadeError::Refused(Box::new(report)));
+    }
+
+    let applied = report.scrubs.clone();
+    scrub_agent_refs(cfg, alias);
+    cfg.agents.remove(alias);
+
+    let remaining = find_all_references(cfg, &kind, alias);
+    if !remaining.is_empty() {
+        let paths: Vec<_> = remaining.iter().map(|s| s.path.as_str()).collect();
+        return Err(CascadeError::PostCondition(format!(
+            "{} dangling reference(s) to agent {alias} remain: {}",
+            remaining.len(),
+            paths.join(", ")
+        )));
+    }
+
+    Ok(CascadeReport {
+        plan: report,
+        applied,
+        deleted_entry: Some(entry_path),
+    })
+}
+
+/// Mutating mirror of [`collect_agent_refs`]: clear soft scalar refs and drop
+/// soft collection elements naming `alias`. Trims the same sites
+/// `collect_agent_refs` trims (heartbeat, acp.default_agent, delegates) and
+/// leaves the three `AgentAlias`-keyed sites raw (workspace.access,
+/// read_memory_from, peer_groups.agents) — both mirror `validate()` exactly.
+/// `heartbeat.agent` is cleared only when reached (an *enabled* heartbeat
+/// pointing at `alias` is a HARD ref, refused before this runs). `retain` is
+/// index-shift-safe. The loop over `cfg.agents.values_mut()` still includes the
+/// to-be-deleted agent, so a self-reference (e.g. `bot.delegates = ["bot"]`) is
+/// actively stripped by the `retain` here before the entry itself is removed.
+fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
+    if cfg.heartbeat.agent.trim() == alias {
+        cfg.heartbeat.agent.clear();
+    }
+    // Compute the match first so the immutable borrow ends before the assignment.
+    let clear_acp = cfg
+        .acp
+        .default_agent
+        .as_deref()
+        .is_some_and(|da| da.trim() == alias);
+    if clear_acp {
+        cfg.acp.default_agent = None;
+    }
+    for agent in cfg.agents.values_mut() {
+        agent.delegates.retain(|d| d.trim() != alias); // trimmed (validate trims)
+        agent.workspace.access.retain(|k, _| k.as_str() != alias); // raw
+        agent
+            .workspace
+            .read_memory_from
+            .retain(|m| m.as_str() != alias); // raw
+    }
+    for group in cfg.peer_groups.values_mut() {
+        group.agents.retain(|m| m.as_str() != alias); // raw
+    }
 }
 
 // ── deterministic iteration over the alias-keyed maps ───────────────────────
@@ -1373,5 +1464,167 @@ mod tests {
             delete_with_cascade(&mut cfg, &tts, "x", CascadePolicy::RefuseOnHard),
             Err(CascadeError::NotImplemented(_))
         ));
+    }
+
+    // ── delete_with_cascade (agents) ────────────────────────────────────────
+
+    #[test]
+    fn cascade_agent_refuses_when_heartbeat_enabled() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.heartbeat.enabled = true;
+        cfg.heartbeat.agent = "bot".to_string();
+        let err = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "bot",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap_err();
+        match err {
+            CascadeError::Refused(report) => {
+                assert_eq!(report.blockers.len(), 1);
+                assert_eq!(report.blockers[0].path, "heartbeat.agent");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(cfg.agents.contains_key("bot"));
+        assert_eq!(cfg.heartbeat.agent.as_str(), "bot");
+    }
+
+    #[test]
+    fn cascade_agent_scrubs_all_soft_refs_and_removes() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.heartbeat.enabled = false; // disabled → heartbeat.agent is a SOFT ref
+        cfg.heartbeat.agent = "bot".to_string();
+        cfg.acp.default_agent = Some("bot".to_string());
+        let mut lead = AliasedAgentConfig {
+            delegates: vec!["bot".to_string()],
+            ..Default::default()
+        };
+        lead.workspace
+            .access
+            .insert(AgentAlias::new("bot"), AccessMode::Read);
+        lead.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        cfg.agents.insert("lead".to_string(), lead);
+        cfg.peer_groups.insert(
+            "crew".to_string(),
+            PeerGroupConfig {
+                agents: vec![AgentAlias::new("bot")],
+                ..Default::default()
+            },
+        );
+
+        let report = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "bot",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("soft-only agent delete succeeds");
+        assert_eq!(report.applied.len(), 6);
+        assert_eq!(report.deleted_entry.as_deref(), Some("agents.bot"));
+        assert!(!cfg.agents.contains_key("bot"));
+        assert!(cfg.heartbeat.agent.is_empty());
+        assert!(cfg.acp.default_agent.is_none());
+        assert!(cfg.agents["lead"].delegates.is_empty());
+        assert!(cfg.agents["lead"].workspace.access.is_empty());
+        assert!(cfg.agents["lead"].workspace.read_memory_from.is_empty());
+        assert!(cfg.peer_groups["crew"].agents.is_empty());
+        assert!(find_all_references(&cfg, &AliasKind::Agent, "bot").is_empty());
+    }
+
+    #[test]
+    fn cascade_agent_scrub_trim_split_mirrors_find() {
+        // Trimmed sites (heartbeat/acp/delegates) scrub a padded ref; raw sites
+        // (read_memory_from) do not — exactly as find/validate.
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.heartbeat.enabled = false;
+        cfg.heartbeat.agent = "  bot  ".to_string();
+        cfg.acp.default_agent = Some(" bot ".to_string());
+        let mut lead = AliasedAgentConfig {
+            delegates: vec![" bot ".to_string()],
+            ..Default::default()
+        };
+        lead.workspace
+            .read_memory_from
+            .push(AgentAlias::new(" bot ")); // raw, must remain
+        cfg.agents.insert("lead".to_string(), lead);
+
+        let report = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "bot",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("padded trimmed refs scrubbed, post-condition passes");
+        assert_eq!(
+            report.applied.len(),
+            3,
+            "heartbeat + acp + delegates (trimmed)"
+        );
+        assert!(cfg.heartbeat.agent.is_empty());
+        assert!(cfg.acp.default_agent.is_none());
+        assert!(cfg.agents["lead"].delegates.is_empty());
+        // raw read_memory_from did not match " bot " != "bot" → untouched.
+        assert_eq!(cfg.agents["lead"].workspace.read_memory_from.len(), 1);
+    }
+
+    #[test]
+    fn cascade_agent_dry_run_mutates_nothing() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.acp.default_agent = Some("bot".to_string());
+        let report =
+            delete_with_cascade(&mut cfg, &AliasKind::Agent, "bot", CascadePolicy::DryRun).unwrap();
+        assert!(report.deleted_entry.is_none());
+        assert_eq!(report.plan.scrubs.len(), 1);
+        assert!(cfg.agents.contains_key("bot"));
+        assert_eq!(cfg.acp.default_agent.as_deref(), Some("bot"));
+    }
+
+    #[test]
+    fn cascade_agent_not_found() {
+        let mut cfg = empty_config();
+        let err = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "ghost",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CascadeError::NotFound(_)));
+    }
+
+    #[test]
+    fn cascade_agent_self_reference_is_scrubbed() {
+        // An agent that names ITSELF in delegates / read_memory_from: deleting it
+        // must succeed (the scrub loop processes the to-be-deleted agent and
+        // strips the self-refs before the entry is removed; the post-condition
+        // then confirms nothing dangles).
+        let mut cfg = empty_config();
+        let mut bot = AliasedAgentConfig {
+            delegates: vec!["bot".to_string()],
+            ..Default::default()
+        };
+        bot.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        cfg.agents.insert("bot".to_string(), bot);
+
+        let report = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "bot",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("self-referencing agent deletes cleanly");
+        assert_eq!(report.deleted_entry.as_deref(), Some("agents.bot"));
+        assert!(!cfg.agents.contains_key("bot"));
+        assert!(find_all_references(&cfg, &AliasKind::Agent, "bot").is_empty());
     }
 }
