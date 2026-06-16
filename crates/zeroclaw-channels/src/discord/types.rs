@@ -46,6 +46,16 @@ pub(crate) struct DiscordMessageFlags(pub(crate) u64);
 
 #[allow(dead_code)]
 impl DiscordOutgoing {
+    /// A content-only payload (no embeds/components/flags) — the shape every
+    /// channel-message builder produces today. EPIC C/B add embed/component
+    /// constructors alongside this one.
+    pub(crate) fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: Some(content.into()),
+            ..Default::default()
+        }
+    }
+
     /// Build the REST message JSON. Keys for `embeds`/`components`/`flags` are
     /// omitted while empty/zero, so a content-only payload serialises to exactly
     /// `{"content": <content>}` — the behaviour-neutrality invariant for EPIC A.

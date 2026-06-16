@@ -1005,7 +1005,7 @@ async fn send_discord_message_json(
     content: &str,
 ) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-    let body = json!({ "content": content });
+    let body = DiscordOutgoing::text(content).to_rest_json();
 
     let resp = client
         .post(&url)
@@ -1037,7 +1037,8 @@ async fn send_discord_message_with_files(
 ) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
 
-    let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
+    let mut form =
+        Form::new().text("payload_json", DiscordOutgoing::text(content).payload_json());
 
     for (idx, path) in files.iter().enumerate() {
         let bytes = tokio::fs::read(path).await.map_err(|error| {
@@ -1116,7 +1117,7 @@ async fn edit_discord_message(
     content: &str,
 ) -> anyhow::Result<()> {
     let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
-    let body = json!({ "content": content });
+    let body = DiscordOutgoing::text(content).to_rest_json();
 
     let resp = client
         .patch(&url)
@@ -1701,7 +1702,7 @@ async fn discord_edit_interaction_response(
     // without_url: transport errors embed the token-bearing URL.
     let resp = client
         .patch(&url)
-        .json(&json!({ "content": trimmed }))
+        .json(&DiscordOutgoing::text(trimmed).to_rest_json())
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
