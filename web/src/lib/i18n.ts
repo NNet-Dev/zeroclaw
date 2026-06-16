@@ -501,6 +501,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'config.confirm_delete_title': "Click again to confirm delete",
     'config.create_new': "Create new →",
     'config.delete_alias_title': "Delete this alias",
+    'config.created_banner': "Created and saved. Edit the fields below and Save to make further changes.",
     'config.empty_body': "Pick a section or entry from the navigator to view and edit it here.",
     'config.empty_title': "Select a setting",
     'config.load_items_error': "Couldn't load configured items: ",
