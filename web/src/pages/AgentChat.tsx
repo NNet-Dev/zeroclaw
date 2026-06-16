@@ -318,10 +318,11 @@ export function AgentChatInner({
             variant="ghost"
             size="sm"
             onClick={toggleCompact}
-            aria-label={t('agent.compact_mode')}
+            aria-label={compact ? t('agent.expand_mode') : t('agent.compact_mode')}
+            aria-pressed={compact}
           >
             {compact ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
-            {t('agent.compact_mode')}
+            {compact ? t('agent.expand_mode') : t('agent.compact_mode')}
           </Button>
           <Button
             variant="ghost"
