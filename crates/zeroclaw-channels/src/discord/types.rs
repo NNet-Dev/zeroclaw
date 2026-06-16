@@ -185,7 +185,10 @@ mod tests {
             ..Default::default()
         };
         // The historical builders emitted `json!({ "content": content })`.
-        assert_eq!(out.to_rest_json(), serde_json::json!({ "content": "hello" }));
+        assert_eq!(
+            out.to_rest_json(),
+            serde_json::json!({ "content": "hello" })
+        );
         assert_eq!(
             out.payload_json(),
             serde_json::json!({ "content": "hello" }).to_string()
@@ -203,7 +206,10 @@ mod tests {
 
     #[test]
     fn absent_content_omits_the_key() {
-        assert_eq!(DiscordOutgoing::default().to_rest_json(), serde_json::json!({}));
+        assert_eq!(
+            DiscordOutgoing::default().to_rest_json(),
+            serde_json::json!({})
+        );
     }
 
     #[test]
@@ -212,7 +218,10 @@ mod tests {
         assert_eq!(target, "interaction:abc123");
         assert_eq!(parse_discord_interaction_target(&target), Some("abc123"));
         // legacy app:token form and empty id must not round-trip
-        assert_eq!(parse_discord_interaction_target("interaction:app:tok"), None);
+        assert_eq!(
+            parse_discord_interaction_target("interaction:app:tok"),
+            None
+        );
         assert_eq!(parse_discord_interaction_target("interaction:"), None);
         assert_eq!(parse_discord_interaction_target("nope"), None);
     }

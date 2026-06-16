@@ -51,8 +51,10 @@ pub(crate) async fn send_discord_message_with_files(
 ) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
 
-    let mut form =
-        Form::new().text("payload_json", DiscordOutgoing::text(content).payload_json());
+    let mut form = Form::new().text(
+        "payload_json",
+        DiscordOutgoing::text(content).payload_json(),
+    );
 
     for (idx, path) in files.iter().enumerate() {
         let bytes = tokio::fs::read(path).await.map_err(|error| {
