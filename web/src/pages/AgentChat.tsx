@@ -58,6 +58,7 @@ export function AgentChatInner({
     sendMessage,
     connected,
     error,
+    errorDetail,
     typing,
     streamingContent,
     streamingThinking,
@@ -305,9 +306,21 @@ export function AgentChatInner({
 
       {/* Connection status bar */}
       {error && (
-        <div className="px-4 py-2 border-b border-status-error/20 bg-status-error/10 text-status-error flex items-center gap-2 text-sm animate-fade-in">
-          <AlertCircle className="h-4 w-4 shrink-0" />
-          {error}
+        <div className="px-4 py-2 border-b border-status-error/20 bg-status-error/10 text-status-error flex flex-col gap-1 text-sm animate-fade-in">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            {error}
+          </div>
+          {errorDetail && (
+            <details className="ml-6">
+              <summary className="cursor-pointer text-xs text-status-error/80 hover:text-status-error">
+                {t('agent.error_show_details')}
+              </summary>
+              <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-[var(--radius-sm)] border border-status-error/20 bg-pc-base/50 p-2 text-[11px] font-mono text-pc-text-muted">
+                {errorDetail}
+              </pre>
+            </details>
+          )}
         </div>
       )}
 
