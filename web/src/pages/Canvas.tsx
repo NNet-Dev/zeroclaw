@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { usePolling } from '@/hooks/usePolling';
-import { Monitor, Trash2, History, RefreshCw } from 'lucide-react';
+import { Monitor, Trash2, History, RefreshCw, WifiOff, Loader2 } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { basePath } from '@/lib/basePath';
 import { getToken } from '@/lib/auth';
@@ -25,7 +25,12 @@ export default function Canvas() {
   const [canvasIdInput, setCanvasIdInput] = useState('default');
   const [currentFrame, setCurrentFrame] = useState<CanvasFrame | null>(null);
   const [history, setHistory] = useState<CanvasFrame[]>([]);
-  const [connected, setConnected] = useState(false);
+  // Tri-state so the viewer can tell "connecting", "connected but no frame
+  // pushed yet", and "the socket dropped" apart — a flat boolean collapsed the
+  // first two into the same dead-looking "waiting for content" pane.
+  const [connState, setConnState] = useState<'connecting' | 'connected' | 'disconnected'>(
+    'connecting',
+  );
   const [showHistory, setShowHistory] = useState(false);
   const [canvasList, setCanvasList] = useState<string[]>([]);
   const [clearArmed, setClearArmed] = useState(false);
@@ -68,16 +73,24 @@ export default function Canvas() {
   // Connect to canvas WebSocket
   const connectWs = useCallback((id: string) => {
     if (wsRef.current) {
+      // Detach the old socket's handlers before closing it: otherwise its late
+      // onclose fires *after* we set 'connecting' below and clobbers it back to
+      // 'disconnected', flashing a false drop on every reconnect/switch.
+      wsRef.current.onopen = null;
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      wsRef.current.onmessage = null;
       wsRef.current.close();
     }
 
+    setConnState('connecting');
     const token = getToken();
     const protocols = token ? ['zeroclaw.v1', `bearer.${token}`] : ['zeroclaw.v1'];
     const ws = new WebSocket(getWsUrl(id), protocols);
 
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => setConnected(false);
-    ws.onerror = () => setConnected(false);
+    ws.onopen = () => setConnState('connected');
+    ws.onclose = () => setConnState('disconnected');
+    ws.onerror = () => setConnState('disconnected');
 
     ws.onmessage = (event) => {
       try {
@@ -256,8 +269,16 @@ export default function Canvas() {
           <span className="inline-flex items-center gap-2.5">
             <Monitor className="h-5 w-5 text-pc-accent" />
             {t('canvas.title')}
-            <Badge tone={connected ? 'ok' : 'error'}>
-              {connected ? t('canvas.connected') : t('canvas.disconnected')}
+            <Badge
+              tone={
+                connState === 'connected' ? 'ok' : connState === 'connecting' ? 'neutral' : 'error'
+              }
+            >
+              {connState === 'connected'
+                ? t('canvas.connected')
+                : connState === 'connecting'
+                  ? t('canvas.connecting')
+                  : t('canvas.disconnected')}
             </Badge>
           </span>
         }
@@ -359,7 +380,34 @@ export default function Canvas() {
               title={`${t('canvas.iframe_title_prefix')}${canvasId}`}
               style={{ background: 'var(--pc-bg-base)' }}
             />
+          ) : connState === 'disconnected' ? (
+            // The socket dropped (or never opened). Distinct from "no frames
+            // yet" — name it and offer a reconnect.
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center">
+                <WifiOff className="h-12 w-12 mx-auto mb-3 text-status-error" />
+                <p className="text-sm text-pc-text-muted">
+                  {t('canvas.disconnected_prefix')} <span className="font-mono text-pc-text-secondary">"{canvasId}"</span>
+                </p>
+                <p className="text-xs mt-1 text-pc-text-faint">
+                  {t('canvas.disconnected_hint')}
+                </p>
+                <Button variant="ghost" size="sm" className="mt-3" onClick={handleReconnect}>
+                  <RefreshCw className="h-3.5 w-3.5" /> {t('canvas.reconnect')}
+                </Button>
+              </div>
+            </div>
+          ) : connState === 'connecting' ? (
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center">
+                <Loader2 className="h-12 w-12 mx-auto mb-3 text-pc-text-faint animate-spin" />
+                <p className="text-sm text-pc-text-muted">
+                  {t('canvas.connecting_prefix')} <span className="font-mono text-pc-text-secondary">"{canvasId}"</span>
+                </p>
+              </div>
+            </div>
           ) : (
+            // Connected, but no frame pushed yet — the expected idle state.
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
                 <Monitor className="h-12 w-12 mx-auto mb-3 text-pc-text-faint" />
