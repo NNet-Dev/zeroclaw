@@ -14,7 +14,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, ChevronRight, MessageSquare, Plus, Sparkles, Trash2 } from "lucide-react";
+import { ArrowLeft, CheckCircle2, ChevronRight, MessageSquare, Plus, Sparkles, Trash2, X } from "lucide-react";
 import {
   ApiError,
   deleteMapKey,
@@ -87,6 +87,19 @@ export default function Config() {
   } = useParams<{ section?: string; type?: string; alias?: string }>();
   const location = useLocation();
   const navigate = useNavigate();
+
+  // A freshly-created entity lands here via `justCreated` nav-state. The detail
+  // form opens with a disabled Save + "No unsaved changes", which reads as "did
+  // it save?" (#7665 review) — confirm the create landed, shown once.
+  const [showCreated, setShowCreated] = useState(false);
+  useEffect(() => {
+    const navState = location.state as { justCreated?: boolean } | null;
+    if (navState?.justCreated) {
+      setShowCreated(true);
+      // Clear the flag so a refresh / back-forward navigation won't re-show it.
+      navigate(location.pathname, { replace: true, state: {} });
+    }
+  }, [location.pathname, location.state, navigate]);
   const lockedSection = location.pathname.startsWith("/setup/")
     ? sectionParam
     : undefined;
@@ -545,7 +558,7 @@ export default function Config() {
           onCreated={(url) => {
             setAddSection(null);
             setNavRefresh((n) => n + 1);
-            navigate(url);
+            navigate(url, { state: { justCreated: true } });
           }}
         />
       )}
@@ -573,6 +586,22 @@ export default function Config() {
         ) : (
           activeSection && (
           <div className="flex flex-col gap-4 max-w-3xl min-h-full">
+            {showCreated && (
+              <div className="flex items-center justify-between gap-3 rounded-[var(--radius-md)] border border-status-success/30 bg-status-success/10 px-3 py-2 text-sm text-status-success">
+                <span className="flex items-center gap-2">
+                  <CheckCircle2 className="h-4 w-4 shrink-0" />
+                  {t("config.created_banner")}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowCreated(false)}
+                  aria-label={t("common.close")}
+                  className="text-status-success/70 transition-colors hover:text-status-success"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            )}
             {/* Mobile-only: return to the navigator (single-column nav↔detail). */}
             <Button
               variant="ghost"

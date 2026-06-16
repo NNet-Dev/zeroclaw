@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ChevronDown, ChevronUp, Pause, Play, Plus, RefreshCw, X } from 'lucide-react';
+import { Activity, AlertTriangle, ChevronDown, ChevronUp, Pause, Play, Plus, RefreshCw, X } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import type { LogEvent, LogsQueryParams, LogsResponse } from '@/lib/api';
 import { usePolling } from '@/hooks/usePolling';
@@ -328,6 +328,33 @@ export default function Logs() {
     (key) => !(key in filter.fieldEq),
   );
 
+  // Human-readable summary of the filters that are *narrowing* the result below
+  // the default view (`hide_internal` + `since_daemon_start` are the baseline,
+  // not narrowing). Drives the empty-state explanation so a 0-row result reads
+  // as "0 match these filters" rather than ambiguously "broken". A non-empty
+  // summary also means a "Clear filters" reset is worth offering.
+  const activeFilterSummary = useMemo(() => {
+    const parts: string[] = [];
+    if (filter.q.trim()) parts.push(`“${filter.q.trim()}”`);
+    if (filter.severityMin !== '' && filter.severityMin !== DEFAULT_SEVERITY_MIN) {
+      const label = SEVERITY_OPTIONS.find((option) => option.value === filter.severityMin)?.label;
+      parts.push(label || `severity ≥ ${filter.severityMin}`);
+    }
+    if (filter.category) parts.push(`category: ${filter.category}`);
+    if (filter.outcome) parts.push(`outcome: ${filter.outcome}`);
+    if (filter.action.trim()) parts.push(`event.action: ${filter.action.trim()}`);
+    for (const [key, value] of Object.entries(filter.fieldEq)) {
+      if (value.trim()) parts.push(`${key}=${value.trim()}`);
+    }
+    return parts;
+  }, [filter]);
+  const hasNarrowingFilters = activeFilterSummary.length > 0;
+
+  const clearAllFilters = useCallback(
+    () => setFilter({ ...DEFAULT_FILTER, fieldEq: {} }),
+    [],
+  );
+
   return (
     <div className="flex flex-col h-full">
       <div className="px-6 py-4 border-b border-pc-border bg-pc-surface">
@@ -546,39 +573,90 @@ export default function Logs() {
         </div>
       )}
 
-      {error && (
+      {/* When rows are already shown, a failed refresh/load-older surfaces as a
+          thin banner. When the list is empty the failure owns the body below
+          instead (so "couldn't load" is never mistaken for "no events"). */}
+      {error && events.length > 0 && (
         <div className="px-6 py-2 text-xs border-b border-status-error/20 bg-status-error/10 text-status-error">
           {error}
         </div>
       )}
 
       <div className="flex-1 overflow-y-auto p-4 space-y-1 min-h-0">
-        {events.length === 0 && !loading ? (
-          <div className="flex flex-col items-center justify-center h-full text-pc-text-muted">
-            <Activity className="h-10 w-10 mb-3 text-pc-text-faint" />
-            <p className="text-sm">{t('logs.no_events')}</p>
-          </div>
-        ) : (
-          events.map((event) => (
-            <LogRow
-              key={event.id}
-              event={event}
-              onFilterAction={setActionFilter}
-              onFilterField={setFieldEq}
-            />
-          ))
-        )}
-        {!atEnd && events.length > 0 && (
-          <div className="flex justify-center pt-3">
+        {error && events.length === 0 ? (
+          // Fetch failed and there's nothing to show — distinct from an empty
+          // result. Name the failure and offer a retry.
+          <div className="flex flex-col items-center justify-center h-full text-center text-pc-text-muted">
+            <AlertTriangle className="h-10 w-10 mb-3 text-status-error" />
+            <p className="text-sm text-status-error">{t('logs.load_failed_title')}</p>
+            <p className="mt-1 max-w-md break-words text-xs text-pc-text-faint">{error}</p>
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => void loadOlder()}
-              disabled={loadingOlder || !cursorOlder}
+              className="mt-3"
+              onClick={() => void initialLoad()}
+              disabled={loading}
             >
-              {loadingOlder ? t('common.loading') : t('logs.load_older')}
+              <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+              {t('logs.retry')}
             </Button>
           </div>
+        ) : events.length === 0 && !loading ? (
+          // Connected, no error: explain *why* it's empty. Narrowing filters →
+          // show them + a one-click reset; otherwise it's genuinely empty.
+          <div className="flex flex-col items-center justify-center h-full text-center text-pc-text-muted">
+            <Activity className="h-10 w-10 mb-3 text-pc-text-faint" />
+            {hasNarrowingFilters ? (
+              <>
+                <p className="text-sm">{t('logs.no_events')}</p>
+                <div className="mt-2 flex max-w-md flex-wrap items-center justify-center gap-1.5">
+                  <span className="text-[11px] text-pc-text-faint">
+                    {t('logs.active_filters_label')}
+                  </span>
+                  {activeFilterSummary.map((part) => (
+                    <span
+                      key={part}
+                      className="rounded-[var(--radius-sm)] border border-pc-border bg-pc-elevated px-1.5 py-0.5 text-[10px] font-mono text-pc-text-muted"
+                    >
+                      {part}
+                    </span>
+                  ))}
+                </div>
+                <Button variant="ghost" size="sm" className="mt-3" onClick={clearAllFilters}>
+                  {t('logs.clear_all_filters')}
+                </Button>
+              </>
+            ) : (
+              <p className="text-sm">
+                {filter.sinceDaemonStart
+                  ? t('logs.no_events_since_start')
+                  : t('logs.no_events_unfiltered')}
+              </p>
+            )}
+          </div>
+        ) : (
+          <>
+            {events.map((event) => (
+              <LogRow
+                key={event.id}
+                event={event}
+                onFilterAction={setActionFilter}
+                onFilterField={setFieldEq}
+              />
+            ))}
+            {!atEnd && events.length > 0 && (
+              <div className="flex justify-center pt-3">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void loadOlder()}
+                  disabled={loadingOlder || !cursorOlder}
+                >
+                  {loadingOlder ? t('common.loading') : t('logs.load_older')}
+                </Button>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

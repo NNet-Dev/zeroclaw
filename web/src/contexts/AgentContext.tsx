@@ -35,6 +35,9 @@ interface AgentContextValue {
   sendMessage: (content: string) => void;
   connected: boolean;
   error: string | null;
+  /** Raw provider/model error blob behind the friendly `error` summary, shown
+   *  in an expander. Null when there's nothing more than the summary. */
+  errorDetail: string | null;
   typing: boolean;
   streamingContent: string;
   streamingThinking: string;
@@ -66,19 +69,38 @@ export function useAgent() {
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
 
-function friendlyAgentError(message?: string): string {
+// Split an agent/provider error into a short human summary (for the banner +
+// chat bubble) and the raw provider detail (kept for an expander). Provider /
+// model errors arrive as long, JSON-ish blobs that read as "broken" when shown
+// inline verbatim (#7665 review); summarize them and tuck the raw text away.
+function describeAgentError(message?: string): { summary: string; detail: string | null } {
   const raw = message?.trim() || t('agent.unknown_error');
   const localConnectFailure = raw.match(
     /model_provider=(\w+)\s+model=([^\s]+).*?url \((https?:\/\/[^)]+)\).*?(?:Connection refused|tcp connect error)/i,
   );
   if (localConnectFailure) {
-    const provider = localConnectFailure[1] ?? '';
+    const displayProvider = modelProviderDisplayName(localConnectFailure[1] ?? '');
     const model = localConnectFailure[2] ?? 'the selected model';
     const url = localConnectFailure[3] ?? 'the configured endpoint';
-    const displayProvider = modelProviderDisplayName(provider);
-    return `${displayProvider} is unreachable at ${url}. Start the local provider service, confirm it serves ${model}, then try again.`;
+    return {
+      summary: `${displayProvider} is unreachable at ${url}. Start the local provider service, confirm it serves ${model}, then try again.`,
+      detail: raw,
+    };
   }
-  return raw;
+  // Generic provider-shaped failure (model unavailable, auth, HTTP error with a
+  // JSON body): summarize and move the raw blob behind the expander.
+  const looksProviderShaped =
+    raw.length > 120 || /model_provider=|"error"|status[\s_-]?code|\bHTTP\b|\{[\s\S]*\}/i.test(raw);
+  if (looksProviderShaped) {
+    const model = raw.match(/\bmodel=([^\s,)]+)/)?.[1];
+    return {
+      summary: model
+        ? `${t('agent.model_error_prefix')} ${model}. ${t('agent.model_error_hint')}`
+        : t('agent.provider_error_summary'),
+      detail: raw,
+    };
+  }
+  return { summary: raw, detail: null };
 }
 
 export interface AgentProviderProps {
@@ -96,7 +118,15 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   });
   const [historyReady, setHistoryReady] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setErrorState] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
+  // Setting an error clears any prior raw detail by default; the provider/model
+  // path sets a detail explicitly. Stable identity so existing callbacks that
+  // call setError keep working without dep-array churn.
+  const setError = useCallback((summary: string | null) => {
+    setErrorState(summary);
+    setErrorDetail(null);
+  }, []);
   const [typing, setTyping] = useState(false);
   const [streamingContent, setStreamingContent] = useState('');
   const [streamingThinking, setStreamingThinking] = useState('');
@@ -368,21 +398,23 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'error':
-        const friendlyMessage = friendlyAgentError(msg.message);
+        const { summary: errorSummary, detail: errorRawDetail } = describeAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
           {
             id: generateUUID(),
             role: 'agent',
-            content: `${t('agent.error_prefix')} ${friendlyMessage}`,
+            content: `${t('agent.error_prefix')} ${errorSummary}`,
             timestamp: new Date(),
           },
         ]);
         if (msg.code === 'AGENT_INIT_FAILED' || msg.code === 'AUTH_ERROR' || msg.code === 'PROVIDER_ERROR') {
-          setError(`${t('agent.configuration_error')}: ${friendlyMessage}`);
+          setErrorState(`${t('agent.configuration_error')}: ${errorSummary}`);
+          setErrorDetail(errorRawDetail);
         } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
-          setError(`${t('agent.message_error')}: ${msg.message}`);
+          setErrorState(`${t('agent.message_error')}: ${errorSummary}`);
+          setErrorDetail(errorRawDetail);
         }
         setTyping(false);
         pendingContentRef.current = '';
@@ -755,6 +787,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     sendMessage,
     connected,
     error,
+    errorDetail,
     typing,
     streamingContent,
     streamingThinking,
