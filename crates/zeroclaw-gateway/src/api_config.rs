@@ -1455,6 +1455,44 @@ async fn rename_config_cascade(
 /// workspace dir, re-point owned DB state (memory/cron/acp/session), mark the
 /// touched paths dirty, persist. Mirrors `delete_agent_cascade` but in-place —
 /// no archive, no live-session refusal (a live ACP session follows the rename).
+/// Move the agent workspace dir for a rename. Returns `Some(warning)` when a
+/// move was attempted and FAILED — surfaced to the caller so a config/DB rename
+/// to `to` with the workspace stranded at `from` isn't reported as a clean
+/// success. Returns `None` on success or when there is nothing to move (a custom
+/// alias-independent path, or a source dir that doesn't exist).
+async fn move_renamed_workspace(
+    old_ws: &std::path::Path,
+    new_ws: &std::path::Path,
+) -> Option<String> {
+    if old_ws == new_ws || !old_ws.exists() {
+        return None;
+    }
+    if let Some(parent) = new_ws.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    match tokio::fs::rename(old_ws, new_ws).await {
+        Ok(()) => None,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "old": old_ws.display().to_string(),
+                        "new": new_ws.display().to_string(),
+                        "err": err.to_string()
+                    })),
+                "agent rename: workspace move failed"
+            );
+            Some(format!(
+                "workspace move {} -> {} failed: {err}",
+                old_ws.display(),
+                new_ws.display()
+            ))
+        }
+    }
+}
+
 async fn rename_agent_cascade(
     state: &AppState,
     mut working: zeroclaw_config::schema::Config,
@@ -1478,27 +1516,14 @@ async fn rename_agent_cascade(
     // Move the workspace dir. For the default per-alias location this is
     // `<install>/agents/<from>/workspace` → `…/<to>/workspace`. A custom
     // workspace path is alias-independent, so `old_ws == new_ws` and we skip.
+    // A failed move is surfaced (like the owned-DB failures below), not just
+    // logged — otherwise config+DB point at `to` while the workspace is stranded
+    // at `from` and the caller sees a clean success.
     let new_ws = working.agent_workspace_dir(to);
-    let mut workspace_moved = false;
-    if old_ws != new_ws && old_ws.exists() {
-        if let Some(parent) = new_ws.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        match tokio::fs::rename(&old_ws, &new_ws).await {
-            Ok(()) => workspace_moved = true,
-            Err(err) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"from": from, "to": to, "err": err.to_string()})
-                        ),
-                    "agent rename: workspace move failed"
-                );
-            }
-        }
-    }
+    let move_warning = move_renamed_workspace(&old_ws, &new_ws).await;
+    let workspace_moved = old_ws != new_ws && old_ws.exists() && move_warning.is_none();
+    let mut warnings: Vec<String> = Vec::new();
+    warnings.extend(move_warning);
 
     // Re-point owned DB state (memory/cron/acp/session). Best-effort + reported.
     let owned = crate::agent_owned_state::cascade_rename_agent(
@@ -1509,21 +1534,24 @@ async fn rename_agent_cascade(
         to,
     )
     .await;
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": report.dirty_paths.len(), "warnings": owned.warnings})), "agent renamed with owned-state cascade");
+    // Combine the workspace-move warning (if any) with the owned-store warnings
+    // so every partial failure reaches the caller, not just the server log.
+    warnings.extend(owned.warnings);
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": report.dirty_paths.len(), "warnings": warnings})), "agent renamed with owned-state cascade");
 
     if let Err(e) = persist_and_swap(state, working).await {
         return error_response(e);
     }
-    // The config rename is complete and persisted. `owned.warnings` is non-empty
-    // only if an owned store (memory/cron/acp/session) did NOT follow — surface
-    // it to the caller (not just the server log) so the split can be remediated,
-    // rather than reporting a clean success.
+    // Config rename complete and persisted. `warnings` is non-empty only if a
+    // partial step (the workspace move, or an owned store) did NOT follow —
+    // surface it to the caller (not just the server log) so the split can be
+    // remediated, rather than reporting a clean success.
     axum::Json(RenameMapKeyResponse {
         path: body.path.clone(),
         from: from.clone(),
         to: to.clone(),
         renamed: true,
-        warnings: owned.warnings,
+        warnings,
     })
     .into_response()
 }
@@ -2272,6 +2300,34 @@ mod tests {
             custom,
             "after removal the custom workspace path defaults — resolve BEFORE the cascade"
         );
+    }
+
+    #[tokio::test]
+    async fn renamed_workspace_move_failure_is_surfaced() {
+        // A failed workspace move during rename must surface a warning (so the
+        // caller learns config/DB moved to `to` while the workspace is stranded
+        // at `from`), not be swallowed as a clean success.
+        let tmp = tempfile::tempdir().unwrap();
+        let old_ws = tmp.path().join("from-ws");
+        std::fs::create_dir_all(&old_ws).unwrap();
+        // Force the move to fail: new_ws's parent is a FILE, so create_dir_all
+        // and rename both fail.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let new_ws = blocker.join("to-ws");
+
+        let warning = move_renamed_workspace(&old_ws, &new_ws).await;
+        assert!(
+            warning.is_some(),
+            "a failed workspace move must surface a warning"
+        );
+        assert!(warning.unwrap().contains("workspace move"));
+        assert!(old_ws.exists(), "source dir stays put when the move fails");
+
+        // Nothing-to-move paths return None (no spurious warning).
+        assert!(move_renamed_workspace(&old_ws, &old_ws).await.is_none());
+        let missing = tmp.path().join("does-not-exist");
+        assert!(move_renamed_workspace(&missing, &new_ws).await.is_none());
     }
 
     #[test]
