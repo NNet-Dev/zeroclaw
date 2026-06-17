@@ -6034,6 +6034,7 @@ mod tests {
                 })
                 .collect(),
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         }
     }
@@ -6122,6 +6123,7 @@ mod tests {
                 timeout_secs: None,
             }],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         };
         tools::register_skill_tools_with_context(

@@ -15552,6 +15552,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 
@@ -15593,6 +15594,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 
@@ -15644,6 +15646,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 

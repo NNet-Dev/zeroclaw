@@ -3154,6 +3154,7 @@ mod tests {
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             tools: vec![],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         }
     }
