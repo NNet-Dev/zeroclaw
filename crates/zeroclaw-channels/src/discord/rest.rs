@@ -10,16 +10,34 @@ use reqwest::multipart::{Form, Part};
 
 use super::types::DiscordOutgoing;
 
-/// POST a plain-text message and return the new message's ID. Callers
-/// that don't need the ID (e.g. non-first chunks) can discard it.
+/// POST a content-only plain-text message and return the new message's ID.
+/// A thin adapter over [`send_discord_message_payload`] for the many callers
+/// (non-first chunks, streaming replies, approvals) that send no embeds.
 pub(crate) async fn send_discord_message_json(
     client: &reqwest::Client,
     bot_token: &str,
     recipient: &str,
     content: &str,
 ) -> anyhow::Result<String> {
+    send_discord_message_payload(
+        client,
+        bot_token,
+        recipient,
+        &DiscordOutgoing::text(content),
+    )
+    .await
+}
+
+/// POST a full message envelope (content plus any embeds) and return the new
+/// message's ID. Callers that don't need the ID can discard it.
+pub(crate) async fn send_discord_message_payload(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    payload: &DiscordOutgoing,
+) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-    let body = DiscordOutgoing::text(content).to_rest_json();
+    let body = payload.to_rest_json();
 
     let resp = client
         .post(&url)
@@ -40,8 +58,8 @@ pub(crate) async fn send_discord_message_json(
     extract_message_id(resp).await
 }
 
-/// POST a message with file attachments via multipart, returning the new
-/// message's ID. Callers that don't need the ID can discard it.
+/// POST a content-only message with file attachments via multipart. A thin
+/// adapter over [`send_discord_message_payload_with_files`].
 pub(crate) async fn send_discord_message_with_files(
     client: &reqwest::Client,
     bot_token: &str,
@@ -49,12 +67,28 @@ pub(crate) async fn send_discord_message_with_files(
     content: &str,
     files: &[PathBuf],
 ) -> anyhow::Result<String> {
+    send_discord_message_payload_with_files(
+        client,
+        bot_token,
+        recipient,
+        &DiscordOutgoing::text(content),
+        files,
+    )
+    .await
+}
+
+/// POST a full message envelope with file attachments via multipart,
+/// returning the new message's ID. Callers that don't need the ID can discard it.
+pub(crate) async fn send_discord_message_payload_with_files(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    payload: &DiscordOutgoing,
+    files: &[PathBuf],
+) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
 
-    let mut form = Form::new().text(
-        "payload_json",
-        DiscordOutgoing::text(content).payload_json(),
-    );
+    let mut form = Form::new().text("payload_json", payload.payload_json());
 
     for (idx, path) in files.iter().enumerate() {
         let bytes = tokio::fs::read(path).await.map_err(|error| {

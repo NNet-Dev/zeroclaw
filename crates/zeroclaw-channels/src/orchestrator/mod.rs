@@ -800,6 +800,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>], or [VOICE:<absolute-path>]\n\
              - Paths inside markers MUST be absolute (starting with /) and live inside the configured workspace directory. Never use relative paths.\n\
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
+             - For a rich embed, emit [EMBED:{...}] where {...} is a Discord embed JSON object (keys: title, description, url, color, timestamp, footer{text,icon_url}, image, thumbnail, author{name,url,icon_url}, fields[{name,value,inline}]). Any image/thumbnail/icon/url MUST be an http(s) URL; local paths are not embeddable. Keep the JSON on one line.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         "telegram" => Some(

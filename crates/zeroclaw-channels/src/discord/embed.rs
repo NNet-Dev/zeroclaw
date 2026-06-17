@@ -121,6 +121,21 @@ impl DiscordEmbed {
         }
         Value::Object(obj)
     }
+
+    /// True when no field carries content — `markers::spec_to_embed` uses it to
+    /// drop a spec that parsed but would render as an empty box.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.description.is_none()
+            && self.url.is_none()
+            && self.color.is_none()
+            && self.timestamp.is_none()
+            && self.footer.is_none()
+            && self.image.is_none()
+            && self.thumbnail.is_none()
+            && self.author.is_none()
+            && self.fields.is_empty()
+    }
 }
 
 fn media_json(url: &str) -> Value {
