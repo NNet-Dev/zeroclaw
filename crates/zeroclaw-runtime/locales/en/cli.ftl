@@ -800,6 +800,21 @@ cli-alias-owned-cascaded = owned-state cascaded: memory {$memory} · cron {$cron
 cli-alias-owned-repointed = owned-state re-pointed: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions}
 cli-alias-warn-workspace-move = warning: workspace move failed: {$error}
 cli-alias-warn = warning: {$warning}
+cli-alias-deleted = deleted {$section}.{$alias} (scrubbed {$count} reference(s))
+cli-alias-delete-refused-header = refused: {$count} hard reference(s) block the delete:
+cli-alias-delete-refused-hint = delete refused — resolve the hard references first
+cli-alias-not-configured = {$path} is not configured
+cli-alias-delete-failed = delete failed: {$error}
+cli-alias-delete-reserved-default = the `default` agent is reserved and cannot be deleted
+cli-alias-renamed = renamed {$section}.{$from} → {$section}.{$to} (rewrote {$count} reference path(s))
+cli-alias-rename-invalid = invalid new alias: {$message}
+cli-alias-rename-reserved = alias `{$alias}` is reserved and cannot be renamed
+cli-alias-rename-postcondition = rename cascade post-condition failed: {$message}
+cli-alias-unknown-provider-category = unknown provider category `{$category}` (expected models | tts | transcription)
+cli-alias-no-such-section = no such config section: {$section}
+cli-alias-live-acp-sessions = {$count} live ACP session(s) for `{$alias}` — end them first
+cli-bundle-not-configured = skill bundle '{$alias}' is not configured
+cli-bundle-rename-failed = rename failed: {$error}
 
 # ── Skill-bundle CLI — zeroclaw skills bundle {add,remove,rename} (#7468 / #7175) ──
 cli-bundle-exists = skill bundle '{$alias}' already exists (no change)

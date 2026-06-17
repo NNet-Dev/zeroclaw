@@ -490,7 +490,14 @@ async fn handle_bundle_remove(
         .get_map_keys("skill_bundles")
         .is_some_and(|k| k.contains(&alias));
     if !exists {
-        anyhow::bail!("skill bundle '{alias}' is not configured");
+        anyhow::bail!(
+            "{}",
+            mta(
+                "cli-bundle-not-configured",
+                &[("alias", alias.as_str())],
+                "skill bundle '{$alias}' is not configured"
+            )
+        );
     }
     let refs = zeroclaw_config::alias_refs::find_bundle_refs(config, &alias);
     if !yes {
@@ -516,13 +523,32 @@ async fn handle_bundle_remove(
         return Ok(());
     }
     let mut working = config.clone();
-    // Archive the bundle directory under shared/skills/_deleted/ (the runtime
-    // skips that path, so the archived bundle isn't re-scanned as live skills).
     let install_root = working.install_root_dir();
-    if let Ok(dir) =
+    // Resolve the bundle directory while the entry still exists, so it can be
+    // archived AFTER the config change is durable.
+    let bundle_dir =
         zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &alias)
-        && dir.exists()
-    {
+            .ok()
+            .filter(|d| d.exists());
+
+    // Mutate + PERSIST the config first, so a later archive failure can't leave
+    // the config pointing at a directory already moved to _deleted/.
+    let mut dirty = zeroclaw_config::alias_refs::scrub_bundle_refs(&mut working, &alias);
+    working
+        .delete_map_key("skill_bundles", &alias)
+        .map_err(anyhow::Error::msg)?;
+    dirty.push(format!("skill_bundles.{alias}"));
+    for p in &dirty {
+        working.mark_dirty(p);
+    }
+    Box::pin(working.save_dirty())
+        .await
+        .context("failed to persist config")?;
+
+    // Archive the bundle directory under shared/skills/_deleted/ (the runtime
+    // skips that path, so it isn't re-scanned as live skills) now that the
+    // config change is on disk.
+    if let Some(dir) = bundle_dir {
         let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
         let archive = install_root
             .join("shared")
@@ -557,14 +583,6 @@ async fn handle_bundle_remove(
             }
         }
     }
-    let mut dirty = zeroclaw_config::alias_refs::scrub_bundle_refs(&mut working, &alias);
-    working
-        .delete_map_key("skill_bundles", &alias)
-        .map_err(anyhow::Error::msg)?;
-    dirty.push(format!("skill_bundles.{alias}"));
-    for p in &dirty {
-        working.mark_dirty(p);
-    }
     let count = refs.len().to_string();
     println!(
         "{}",
@@ -574,9 +592,7 @@ async fn handle_bundle_remove(
             "deleted skill_bundles.{$alias} (stripped from {$count} agent(s))"
         )
     );
-    Box::pin(working.save_dirty())
-        .await
-        .context("failed to persist config")
+    Ok(())
 }
 
 /// Rename a skill bundle: rename the config entry, rewrite every agent's
@@ -593,16 +609,43 @@ async fn handle_bundle_rename(
         zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &from).ok();
     match working.rename_map_key("skill_bundles", &from, &to) {
         Ok(true) => {}
-        Ok(false) => anyhow::bail!("skill bundle '{from}' is not configured"),
-        Err(e) => anyhow::bail!("rename failed: {e}"),
+        Ok(false) => anyhow::bail!(
+            "{}",
+            mta(
+                "cli-bundle-not-configured",
+                &[("alias", from.as_str())],
+                "skill bundle '{$alias}' is not configured"
+            )
+        ),
+        Err(e) => {
+            let es = e.to_string();
+            anyhow::bail!(
+                "{}",
+                mta(
+                    "cli-bundle-rename-failed",
+                    &[("error", es.as_str())],
+                    "rename failed: {$error}"
+                )
+            )
+        }
     }
     let mut dirty = zeroclaw_config::alias_refs::rewrite_bundle_refs(&mut working, &from, &to);
     dirty.push(format!("skill_bundles.{from}"));
     dirty.push(format!("skill_bundles.{to}"));
-    // Move the directory (default per-alias path only; a custom path is
-    // alias-independent → old == new → skip).
+    // Resolve the NEW directory (the entry now lives under `to`) for the move.
     let new_dir =
         zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &to).ok();
+    for p in &dirty {
+        working.mark_dirty(p);
+    }
+    // PERSIST the config rename before moving the directory, so a later move
+    // failure can't leave the config naming `to` while the dir sits at `from`.
+    Box::pin(working.save_dirty())
+        .await
+        .context("failed to persist config")?;
+
+    // Move the directory (default per-alias path only; a custom path is
+    // alias-independent → old == new → skip).
     if let (Some(old), Some(new)) = (old_dir, new_dir)
         && old != new
         && old.exists()
@@ -622,9 +665,6 @@ async fn handle_bundle_rename(
             );
         }
     }
-    for p in &dirty {
-        working.mark_dirty(p);
-    }
     println!(
         "{}",
         mta(
@@ -633,9 +673,7 @@ async fn handle_bundle_rename(
             "renamed skill_bundles.{$from} → skill_bundles.{$to}"
         )
     );
-    Box::pin(working.save_dirty())
-        .await
-        .context("failed to persist config")
+    Ok(())
 }
 
 fn print_bundle_include_exclude(include: &[String], exclude: &[String]) {

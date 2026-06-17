@@ -57,9 +57,14 @@ fn parse_provider_category(category: &str) -> Result<ProviderCategory> {
         "models" => Ok(ProviderCategory::Models),
         "tts" => Ok(ProviderCategory::Tts),
         "transcription" => Ok(ProviderCategory::Transcription),
-        other => {
-            bail!("unknown provider category `{other}` (expected models | tts | transcription)")
-        }
+        other => bail!(
+            "{}",
+            mta(
+                "cli-alias-unknown-provider-category",
+                &[("category", other)],
+                "unknown provider category `{$category}` (expected models | tts | transcription)"
+            )
+        ),
     }
 }
 
@@ -99,7 +104,14 @@ fn list_section(config: &Config, section: &str) -> Result<()> {
                 }
             }
         }
-        None => bail!("no such config section: {section}"),
+        None => bail!(
+            "{}",
+            mta(
+                "cli-alias-no-such-section",
+                &[("section", section)],
+                "no such config section: {$section}"
+            )
+        ),
     }
     Ok(())
 }
@@ -222,24 +234,61 @@ fn apply_delete(config: &mut Config, kind: &AliasKind, alias: &str) -> Result<()
             for path in report.dirty_paths() {
                 config.mark_dirty(&path);
             }
+            let count = report.applied.len().to_string();
             println!(
-                "deleted {section}.{alias} (scrubbed {} reference(s))",
-                report.applied.len()
+                "{}",
+                mta(
+                    "cli-alias-deleted",
+                    &[
+                        ("section", section.as_str()),
+                        ("alias", alias),
+                        ("count", count.as_str())
+                    ],
+                    "deleted {$section}.{$alias} (scrubbed {$count} reference(s))"
+                )
             );
             Ok(())
         }
         Err(CascadeError::Refused(report)) => {
+            let count = report.blockers.len().to_string();
             println!(
-                "refused: {} hard reference(s) block the delete:",
-                report.blockers.len()
+                "{}",
+                mta(
+                    "cli-alias-delete-refused-header",
+                    &[("count", count.as_str())],
+                    "refused: {$count} hard reference(s) block the delete:"
+                )
             );
             for b in &report.blockers {
                 println!("  ✗ {}", b.path);
             }
-            bail!("delete refused — resolve the hard references first");
+            bail!(
+                "{}",
+                mt(
+                    "cli-alias-delete-refused-hint",
+                    "delete refused — resolve the hard references first"
+                )
+            );
         }
-        Err(CascadeError::NotFound(p)) => bail!("{p} is not configured"),
-        Err(e) => bail!("delete failed: {e}"),
+        Err(CascadeError::NotFound(p)) => bail!(
+            "{}",
+            mta(
+                "cli-alias-not-configured",
+                &[("path", p.as_str())],
+                "{$path} is not configured"
+            )
+        ),
+        Err(e) => {
+            let es = e.to_string();
+            bail!(
+                "{}",
+                mta(
+                    "cli-alias-delete-failed",
+                    &[("error", es.as_str())],
+                    "delete failed: {$error}"
+                )
+            )
+        }
     }
 }
 
@@ -250,17 +299,55 @@ fn rename_config(config: &mut Config, kind: &AliasKind, from: &str, to: &str) ->
             for path in &report.dirty_paths {
                 config.mark_dirty(path);
             }
+            let section = section_path(kind);
+            let count = report.dirty_paths.len().to_string();
             println!(
-                "renamed {sec}.{from} → {sec}.{to} (rewrote {} reference path(s))",
-                report.dirty_paths.len(),
-                sec = section_path(kind)
+                "{}",
+                mta(
+                    "cli-alias-renamed",
+                    &[
+                        ("section", section.as_str()),
+                        ("from", from),
+                        ("to", to),
+                        ("count", count.as_str())
+                    ],
+                    "renamed {$section}.{$from} → {$section}.{$to} (rewrote {$count} reference path(s))"
+                )
             );
             Ok(())
         }
-        Err(RenameError::NotFound(p)) => bail!("{p} is not configured"),
-        Err(RenameError::InvalidName(m)) => bail!("invalid new alias: {m}"),
-        Err(RenameError::Reserved(a)) => bail!("alias `{a}` is reserved and cannot be renamed"),
-        Err(RenameError::PostCondition(m)) => bail!("rename cascade post-condition failed: {m}"),
+        Err(RenameError::NotFound(p)) => bail!(
+            "{}",
+            mta(
+                "cli-alias-not-configured",
+                &[("path", p.as_str())],
+                "{$path} is not configured"
+            )
+        ),
+        Err(RenameError::InvalidName(m)) => bail!(
+            "{}",
+            mta(
+                "cli-alias-rename-invalid",
+                &[("message", m.as_str())],
+                "invalid new alias: {$message}"
+            )
+        ),
+        Err(RenameError::Reserved(a)) => bail!(
+            "{}",
+            mta(
+                "cli-alias-rename-reserved",
+                &[("alias", a.as_str())],
+                "alias `{$alias}` is reserved and cannot be renamed"
+            )
+        ),
+        Err(RenameError::PostCondition(m)) => bail!(
+            "{}",
+            mta(
+                "cli-alias-rename-postcondition",
+                &[("message", m.as_str())],
+                "rename cascade post-condition failed: {$message}"
+            )
+        ),
     }
 }
 
@@ -284,8 +371,11 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             // (custom paths are read off the entry, which the rename moves).
             let old_ws = config.agent_workspace_dir(&from);
             rename_config(config, &AliasKind::Agent, &from, &to)?;
-            agent_rename_owned_state(config, &from, &to, &old_ws).await?;
-            save(config).await
+            // Persist the config rename before the irreversible owned-state side
+            // effects (workspace move + DB re-point), so a later failure can't
+            // leave the config and owned state split.
+            save(config).await?;
+            agent_rename_owned_state(config, &from, &to, &old_ws).await
         }
         AgentsCommands::Delete {
             alias,
@@ -293,7 +383,13 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             yes,
         } => {
             if alias == RESERVED_DEFAULT_AGENT {
-                bail!("the `default` agent is reserved and cannot be deleted");
+                bail!(
+                    "{}",
+                    mt(
+                        "cli-alias-delete-reserved-default",
+                        "the `default` agent is reserved and cannot be deleted"
+                    )
+                );
             }
             if dry_run {
                 print_impact(&AliasKind::Agent, &alias, config);
@@ -302,16 +398,25 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             if !yes {
                 print_impact(&AliasKind::Agent, &alias, config);
                 println!(
-                    "\nNo changes made. Re-run with --yes to apply (or --dry-run to preview)."
+                    "\n{}",
+                    mt(
+                        "cli-alias-no-changes",
+                        "No changes made. Re-run with --yes to apply (or --dry-run to preview)."
+                    )
                 );
                 return Ok(());
             }
             // Owned-state HARD gate (live ACP sessions) runs BEFORE the config
             // cascade so a refusal mutates nothing.
             agent_delete_precheck(config, &alias)?;
+            // Resolve the workspace dir while the entry still exists (a custom
+            // `workspace.path` is read off it), then apply + PERSIST the config
+            // change before any irreversible owned-state side effects — so a
+            // later failure can't leave the config and owned state split.
+            let workspace = config.agent_workspace_dir(&alias);
             apply_delete(config, &AliasKind::Agent, &alias)?;
-            agent_delete_owned_state(config, &alias).await?;
-            save(config).await
+            save(config).await?;
+            agent_delete_owned_state(config, &alias, &workspace).await
         }
     }
 }
@@ -368,7 +473,15 @@ fn agent_delete_precheck(config: &Config, alias: &str) -> Result<()> {
     let live = crate::gateway::agent_owned_state::live_acp_session_count(config, alias)
         .context("could not verify live ACP sessions")?;
     if live > 0 {
-        bail!("{live} live ACP session(s) for `{alias}` — end them first");
+        let count = live.to_string();
+        bail!(
+            "{}",
+            mta(
+                "cli-alias-live-acp-sessions",
+                &[("count", count.as_str()), ("alias", alias)],
+                "{$count} live ACP session(s) for `{$alias}` — end them first"
+            )
+        );
     }
     Ok(())
 }
@@ -379,7 +492,11 @@ fn agent_delete_precheck(_config: &Config, _alias: &str) -> Result<()> {
 }
 
 #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
-async fn agent_delete_owned_state(config: &Config, alias: &str) -> Result<()> {
+async fn agent_delete_owned_state(
+    config: &Config,
+    alias: &str,
+    workspace: &std::path::Path,
+) -> Result<()> {
     let (mem, session_backend) = build_owned_state_handles(config)?;
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
     let archive_dir = config
@@ -388,8 +505,9 @@ async fn agent_delete_owned_state(config: &Config, alias: &str) -> Result<()> {
         .join("_deleted")
         .join(format!("{alias}-{ts}"));
     tokio::fs::create_dir_all(&archive_dir).await.ok();
-    // Archive the workspace dir alongside the owned-state exports.
-    let workspace = config.agent_workspace_dir(alias);
+    // Archive the workspace dir alongside the owned-state exports. `workspace`
+    // was resolved by the caller before the config entry was removed, so a
+    // custom `workspace.path` is preserved (post-removal it would default).
     if workspace.exists() {
         if let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await {
             let es = e.to_string();
@@ -444,7 +562,11 @@ async fn agent_delete_owned_state(config: &Config, alias: &str) -> Result<()> {
 }
 
 #[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
-async fn agent_delete_owned_state(_config: &Config, _alias: &str) -> Result<()> {
+async fn agent_delete_owned_state(
+    _config: &Config,
+    _alias: &str,
+    _workspace: &std::path::Path,
+) -> Result<()> {
     warn_agent_owned_state();
     Ok(())
 }
