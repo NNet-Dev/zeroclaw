@@ -1086,6 +1086,13 @@ async fn delete_agent_cascade(
         );
     }
 
+    // Resolve the workspace dir BEFORE the config cascade removes the agents
+    // entry: `agent_workspace_dir` only returns an operator-set custom
+    // `workspace.path` while the entry exists; after removal it silently falls
+    // back to the default `install_root/agents/<alias>/workspace`, so a
+    // custom-workspace agent's real dir would otherwise never be archived.
+    let workspace = working.agent_workspace_dir(alias);
+
     // Config cascade: scrub soft refs + remove the agents entry.
     let cascade = match alias_refs::delete_with_cascade(
         &mut working,
@@ -1107,8 +1114,8 @@ async fn delete_agent_cascade(
 
     // Archive into the shared graveyard `<data_dir>/agents/_deleted/<alias>-<ts>/`
     // (not inside the deleted agent's own dir), and give the owned-state exports
-    // a home there even if the agent had no workspace dir.
-    let workspace = working.agent_workspace_dir(alias);
+    // a home there even if the agent had no workspace dir. (`workspace` was
+    // resolved above, before the cascade removed the entry.)
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
     let archive_dir = working
         .data_dir
@@ -2032,6 +2039,41 @@ mod tests {
         assert_eq!(
             dirty_entry_for("providers.models.anthropic.default.fallback[0]"),
             "providers.models.anthropic.default"
+        );
+    }
+
+    #[test]
+    fn delete_cascade_resolves_custom_workspace_before_removing_entry() {
+        // Regression: `delete_agent_cascade` must resolve `agent_workspace_dir`
+        // BEFORE `delete_with_cascade` removes the agents entry. The method only
+        // returns an operator-set custom `workspace.path` while the entry exists;
+        // resolving it after removal silently yields the DEFAULT path, so a
+        // custom-workspace agent's real dir would never be archived.
+        let custom = std::path::PathBuf::from("/var/lib/zc-test/custom-victim-ws");
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        cfg.agents.get_mut("victim").unwrap().workspace.path = Some(custom.clone());
+
+        // While the entry exists → the custom path (what the handler captures).
+        assert_eq!(cfg.agent_workspace_dir("victim"), custom);
+
+        // After the cascade removes the entry → it falls back to the DEFAULT
+        // path; that is exactly why resolution must happen before the cascade.
+        zeroclaw_config::alias_refs::delete_with_cascade(
+            &mut cfg,
+            &zeroclaw_config::alias_refs::AliasKind::Agent,
+            "victim",
+            zeroclaw_config::alias_refs::CascadePolicy::RefuseOnHard,
+        )
+        .expect("soft-only agent delete succeeds");
+        assert!(!cfg.agents.contains_key("victim"));
+        assert_ne!(
+            cfg.agent_workspace_dir("victim"),
+            custom,
+            "after removal the custom workspace path defaults — resolve BEFORE the cascade"
         );
     }
 
