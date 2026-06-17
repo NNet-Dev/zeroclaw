@@ -363,10 +363,12 @@ fn delete_agent(
             deleted_entry: None,
         });
     }
-    // Config-scoped gate. The only HARD agent ref is an enabled `heartbeat.agent`
-    // (see `collect_agent_refs`). Owned-state HARD refs (e.g. live ACP sessions)
-    // are enforced by the surface layer that owns the infra stores; the pure
-    // config walk does not see them.
+    // Config-scoped gate: refuse if `plan_delete` found any HARD ref. The hard
+    // agent refs are whatever `collect_agent_refs` marks `RefStrength::Hard` —
+    // currently an enabled `heartbeat.agent` and a channel the agent solely owns
+    // (deleting its sole enabled owner would orphan the route). Owned-state HARD
+    // refs (e.g. live ACP sessions) are enforced by the surface layer that owns
+    // the infra stores; the pure config walk does not see them.
     if !report.allowed {
         return Err(CascadeError::Refused(Box::new(report)));
     }
@@ -1491,6 +1493,46 @@ mod tests {
         }
         assert!(cfg.agents.contains_key("bot"));
         assert_eq!(cfg.heartbeat.agent.as_str(), "bot");
+    }
+
+    #[test]
+    fn cascade_agent_refuses_when_solely_owned_channel() {
+        // The agent arm of `delete_with_cascade` must also refuse on a sole-owned
+        // channel — the second HARD agent ref besides an enabled `heartbeat.agent`
+        // — before any mutation, locking the mutating path against future
+        // scrub/collect drift (the plan-only case is `agent_delete_blocks_on_solely_owned_channel`).
+        let mut cfg = empty_config();
+        cfg.agents.insert(
+            "bot".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.main".into()], // bot is the sole enabled owner
+                ..Default::default()
+            },
+        );
+        let err = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "bot",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap_err();
+        match err {
+            CascadeError::Refused(report) => {
+                assert!(
+                    report
+                        .blockers
+                        .iter()
+                        .any(|b| b.path == "agents.bot.channels[0]"),
+                    "{:?}",
+                    report.blockers
+                );
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        // Refuse-before-mutate: the agent and its channel ownership survive intact.
+        assert!(cfg.agents.contains_key("bot"));
+        assert_eq!(cfg.agents["bot"].channels, vec!["discord.main".to_string()]);
     }
 
     #[test]
