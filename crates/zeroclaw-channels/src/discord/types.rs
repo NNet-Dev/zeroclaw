@@ -9,22 +9,25 @@ use std::sync::Arc;
 // ─────────────────────────────────────────────────────────────────────────────
 // Outbound message envelope
 //
-// The single payload the channel-message REST builders collapse onto. In EPIC A
-// only `content` is ever populated, so `to_rest_json` is byte-identical to the
+// The single payload the channel-message REST builders collapse onto. The
+// builders already route through `text()`/`to_rest_json()` (EPIC A Phase 2), so
+// the struct and its methods are live; `to_rest_json` is byte-identical to the
 // historical `json!({ "content": content })` (proven by the tests below and by
-// the existing wiremock send tests). EPIC C fills `embeds`, EPIC B fills
-// `components`/`flags`.
-//
-// `#[allow(dead_code)]`: authored here (contract-first) but not wired into the
-// builders until EPIC A Phase 2 — remove the allows when the builders collapse.
+// the existing wiremock send tests) because only `content` is populated today.
+// EPIC C fills `embeds`, EPIC B fills `components`/`flags` — until then those
+// three fields stay unread, so the `#[allow(dead_code)]` is scoped to just them.
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DiscordOutgoing {
     pub(crate) content: Option<String>,
+    // Unread until EPIC C/B wire these into `to_rest_json`; the allow is on the
+    // placeholder fields only, leaving the struct itself under dead-code analysis.
+    #[allow(dead_code)]
     pub(crate) embeds: Vec<DiscordEmbed>,
+    #[allow(dead_code)]
     pub(crate) components: Vec<DiscordActionRow>,
+    #[allow(dead_code)]
     pub(crate) flags: DiscordMessageFlags,
 }
 
@@ -44,7 +47,6 @@ pub(crate) struct DiscordActionRow;
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct DiscordMessageFlags(pub(crate) u64);
 
-#[allow(dead_code)]
 impl DiscordOutgoing {
     /// A content-only payload (no embeds/components/flags) — the shape every
     /// channel-message builder produces today. EPIC C/B add embed/component
