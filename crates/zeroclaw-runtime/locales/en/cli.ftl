@@ -785,3 +785,30 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+
+# ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
+cli-alias-list-empty = (no entries under {$section})
+cli-alias-created = created {$section}.{$alias}
+cli-alias-exists = {$section}.{$alias} already exists (no change)
+cli-alias-impact-scrub-header = deleting {$section}.{$alias} would scrub {$count} reference(s):
+cli-alias-impact-blocked-header = deleting {$section}.{$alias} is BLOCKED by {$count} hard reference(s):
+cli-alias-impact-blocker = ✗ {$path} (hard reference)
+cli-alias-impact-scrub = • {$path} (would be scrubbed)
+cli-alias-no-changes = No changes made. Re-run with --yes to apply (or --dry-run to preview).
+cli-alias-warn-workspace-archive = warning: workspace archive failed: {$error}
+cli-alias-owned-cascaded = owned-state cascaded: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions} → {$archive}
+cli-alias-owned-repointed = owned-state re-pointed: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions}
+cli-alias-warn-workspace-move = warning: workspace move failed: {$error}
+cli-alias-warn = warning: {$warning}
+
+# ── Skill-bundle CLI — zeroclaw skills bundle {add,remove,rename} (#7468 / #7175) ──
+cli-bundle-exists = skill bundle '{$alias}' already exists (no change)
+cli-bundle-created = created skill_bundles.{$alias} (dir: {$dir})
+cli-bundle-created-warn = created skill_bundles.{$alias} (warning: dir resolve failed: {$error})
+cli-bundle-impact-header = deleting skill_bundles.{$alias} would strip it from {$count} agent reference(s):
+cli-bundle-no-changes = No changes made. Re-run with --yes to apply.
+cli-bundle-archived = archived bundle directory → {$path}
+cli-bundle-warn-archive = warning: bundle directory archive failed: {$error}
+cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agent(s))
+cli-bundle-warn-move = warning: bundle directory move failed: {$error}
+cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}

@@ -24,6 +24,34 @@ use zeroclaw_config::schema::Config;
 /// (rename is already guarded inside `rename_with_cascade`).
 const RESERVED_DEFAULT_AGENT: &str = "default";
 
+/// Resolve a `cli-*` Fluent key for alias-CRUD CLI output. Under `agent-runtime`
+/// (default + what CI/release build) this routes through Fluent; without it the
+/// runtime i18n crate is absent, so the English `fallback` is used.
+#[allow(unused_variables)]
+fn mt(key: &str, fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::i18n::get_required_cli_string(key)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
+/// `mt` with `{$name}` arguments.
+#[allow(unused_variables)]
+fn mta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
 fn parse_provider_category(category: &str) -> Result<ProviderCategory> {
     match category {
         "models" => Ok(ProviderCategory::Models),
@@ -57,7 +85,14 @@ fn list_section(config: &Config, section: &str) -> Result<()> {
         Some(mut keys) => {
             keys.sort();
             if keys.is_empty() {
-                println!("(no entries under {section})");
+                println!(
+                    "{}",
+                    mta(
+                        "cli-alias-list-empty",
+                        &[("section", section)],
+                        "(no entries under {$section})"
+                    )
+                );
             } else {
                 for k in keys {
                     println!("{k}");
@@ -75,9 +110,23 @@ fn create_entry(config: &mut Config, section: &str, alias: &str) -> Result<()> {
         .map_err(anyhow::Error::msg)?
     {
         config.mark_dirty(&format!("{section}.{alias}"));
-        println!("created {section}.{alias}");
+        println!(
+            "{}",
+            mta(
+                "cli-alias-created",
+                &[("section", section), ("alias", alias)],
+                "created {$section}.{$alias}"
+            )
+        );
     } else {
-        println!("{section}.{alias} already exists (no change)");
+        println!(
+            "{}",
+            mta(
+                "cli-alias-exists",
+                &[("section", section), ("alias", alias)],
+                "{$section}.{$alias} already exists (no change)"
+            )
+        );
     }
     Ok(())
 }
@@ -85,24 +134,55 @@ fn create_entry(config: &mut Config, section: &str, alias: &str) -> Result<()> {
 /// Print the dry-run impact (blockers + scrubs) for a delete.
 fn print_impact(kind: &AliasKind, alias: &str, config: &Config) {
     let report = alias_refs::plan_delete(config, kind, alias);
+    let section = section_path(kind);
     if report.blockers.is_empty() {
+        let count = report.scrubs.len().to_string();
         println!(
-            "deleting {}.{alias} would scrub {} reference(s):",
-            section_path(kind),
-            report.scrubs.len()
+            "{}",
+            mta(
+                "cli-alias-impact-scrub-header",
+                &[
+                    ("section", section.as_str()),
+                    ("alias", alias),
+                    ("count", count.as_str())
+                ],
+                "deleting {$section}.{$alias} would scrub {$count} reference(s):"
+            )
         );
     } else {
+        let count = report.blockers.len().to_string();
         println!(
-            "deleting {}.{alias} is BLOCKED by {} hard reference(s):",
-            section_path(kind),
-            report.blockers.len()
+            "{}",
+            mta(
+                "cli-alias-impact-blocked-header",
+                &[
+                    ("section", section.as_str()),
+                    ("alias", alias),
+                    ("count", count.as_str())
+                ],
+                "deleting {$section}.{$alias} is BLOCKED by {$count} hard reference(s):"
+            )
         );
         for b in &report.blockers {
-            println!("  ✗ {} (hard reference)", b.path);
+            println!(
+                "  {}",
+                mta(
+                    "cli-alias-impact-blocker",
+                    &[("path", b.path.as_str())],
+                    "✗ {$path} (hard reference)"
+                )
+            );
         }
     }
     for s in &report.scrubs {
-        println!("  • {} (would be scrubbed)", s.path);
+        println!(
+            "  {}",
+            mta(
+                "cli-alias-impact-scrub",
+                &[("path", s.path.as_str())],
+                "• {$path} (would be scrubbed)"
+            )
+        );
     }
 }
 
@@ -121,7 +201,13 @@ fn delete_config(
     }
     if !yes {
         print_impact(kind, alias, config);
-        println!("\nNo changes made. Re-run with --yes to apply (or --dry-run to preview).");
+        println!(
+            "\n{}",
+            mt(
+                "cli-alias-no-changes",
+                "No changes made. Re-run with --yes to apply (or --dry-run to preview)."
+            )
+        );
         return Ok(());
     }
     apply_delete(config, kind, alias)
@@ -306,7 +392,15 @@ async fn agent_delete_owned_state(config: &Config, alias: &str) -> Result<()> {
     let workspace = config.agent_workspace_dir(alias);
     if workspace.exists() {
         if let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await {
-            eprintln!("warning: workspace archive failed: {e}");
+            let es = e.to_string();
+            eprintln!(
+                "{}",
+                mta(
+                    "cli-alias-warn-workspace-archive",
+                    &[("error", es.as_str())],
+                    "warning: workspace archive failed: {$error}"
+                )
+            );
         }
     }
     let report = crate::gateway::agent_owned_state::cascade_owned_state(
@@ -317,16 +411,34 @@ async fn agent_delete_owned_state(config: &Config, alias: &str) -> Result<()> {
         &archive_dir,
     )
     .await;
+    let memory = report.memory_purged.to_string();
+    let cron = report.cron_removed.to_string();
+    let acp = report.acp_removed.to_string();
+    let sessions = report.sessions_cleared.to_string();
+    let archive = archive_dir.display().to_string();
     println!(
-        "owned-state cascaded: memory {} · cron {} · acp {} · sessions {} → {}",
-        report.memory_purged,
-        report.cron_removed,
-        report.acp_removed,
-        report.sessions_cleared,
-        archive_dir.display()
+        "{}",
+        mta(
+            "cli-alias-owned-cascaded",
+            &[
+                ("memory", memory.as_str()),
+                ("cron", cron.as_str()),
+                ("acp", acp.as_str()),
+                ("sessions", sessions.as_str()),
+                ("archive", archive.as_str())
+            ],
+            "owned-state cascaded: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions} → {$archive}"
+        )
     );
     for w in &report.warnings {
-        eprintln!("warning: {w}");
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn",
+                &[("warning", w.as_str())],
+                "warning: {$warning}"
+            )
+        );
     }
     Ok(())
 }
@@ -352,7 +464,15 @@ async fn agent_rename_owned_state(
             tokio::fs::create_dir_all(parent).await.ok();
         }
         if let Err(e) = tokio::fs::rename(old_ws, &new_ws).await {
-            eprintln!("warning: workspace move failed: {e}");
+            let es = e.to_string();
+            eprintln!(
+                "{}",
+                mta(
+                    "cli-alias-warn-workspace-move",
+                    &[("error", es.as_str())],
+                    "warning: workspace move failed: {$error}"
+                )
+            );
         }
     }
     let (mem, session_backend) = build_owned_state_handles(config)?;
@@ -364,12 +484,32 @@ async fn agent_rename_owned_state(
         to,
     )
     .await;
+    let memory = report.memory_rows.to_string();
+    let cron = report.cron_jobs.to_string();
+    let acp = report.acp_sessions.to_string();
+    let sessions = report.sessions_repointed.to_string();
     println!(
-        "owned-state re-pointed: memory {} · cron {} · acp {} · sessions {}",
-        report.memory_rows, report.cron_jobs, report.acp_sessions, report.sessions_repointed
+        "{}",
+        mta(
+            "cli-alias-owned-repointed",
+            &[
+                ("memory", memory.as_str()),
+                ("cron", cron.as_str()),
+                ("acp", acp.as_str()),
+                ("sessions", sessions.as_str())
+            ],
+            "owned-state re-pointed: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions}"
+        )
     );
     for w in &report.warnings {
-        eprintln!("warning: {w}");
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn",
+                &[("warning", w.as_str())],
+                "warning: {$warning}"
+            )
+        );
     }
     Ok(())
 }

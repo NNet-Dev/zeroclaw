@@ -5,6 +5,35 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 use zeroclaw_runtime::skills::{ScaffoldOptions, SkillFrontmatter, SkillsService};
+
+/// Resolve a `cli-*` Fluent key for skill-bundle CLI output. Under `agent-runtime`
+/// (default + what CI/release build) this routes through Fluent; without it the
+/// runtime i18n crate is absent, so the English `fallback` is used.
+#[allow(unused_variables)]
+fn mt(key: &str, fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::i18n::get_required_cli_string(key)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
+/// `mt` with `{$name}` arguments.
+#[allow(unused_variables)]
+fn mta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
 pub mod creator {
     #[allow(unused_imports)]
     pub use zeroclaw_runtime::skills::creator::*;
@@ -402,7 +431,14 @@ async fn handle_bundle_add(
         .create_map_key("skill_bundles", &alias)
         .map_err(anyhow::Error::msg)?
     {
-        println!("skill bundle '{alias}' already exists (no change)");
+        println!(
+            "{}",
+            mta(
+                "cli-bundle-exists",
+                &[("alias", alias.as_str())],
+                "skill bundle '{$alias}' already exists (no change)"
+            )
+        );
         return Ok(());
     }
     if let Some(dir) = directory.as_ref()
@@ -415,9 +451,27 @@ async fn handle_bundle_add(
     match zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &alias) {
         Ok(dir) => {
             tokio::fs::create_dir_all(&dir).await.ok();
-            println!("created skill_bundles.{alias} (dir: {})", dir.display());
+            let d = dir.display().to_string();
+            println!(
+                "{}",
+                mta(
+                    "cli-bundle-created",
+                    &[("alias", alias.as_str()), ("dir", d.as_str())],
+                    "created skill_bundles.{$alias} (dir: {$dir})"
+                )
+            );
         }
-        Err(e) => println!("created skill_bundles.{alias} (warning: dir resolve failed: {e})"),
+        Err(e) => {
+            let es = e.to_string();
+            println!(
+                "{}",
+                mta(
+                    "cli-bundle-created-warn",
+                    &[("alias", alias.as_str()), ("error", es.as_str())],
+                    "created skill_bundles.{$alias} (warning: dir resolve failed: {$error})"
+                )
+            );
+        }
     }
     Box::pin(working.save_dirty())
         .await
@@ -440,14 +494,25 @@ async fn handle_bundle_remove(
     }
     let refs = zeroclaw_config::alias_refs::find_bundle_refs(config, &alias);
     if !yes {
+        let count = refs.len().to_string();
         println!(
-            "deleting skill_bundles.{alias} would strip it from {} agent reference(s):",
-            refs.len()
+            "{}",
+            mta(
+                "cli-bundle-impact-header",
+                &[("alias", alias.as_str()), ("count", count.as_str())],
+                "deleting skill_bundles.{$alias} would strip it from {$count} agent reference(s):"
+            )
         );
         for r in &refs {
             println!("  • {}", r.path);
         }
-        println!("\nNo changes made. Re-run with --yes to apply.");
+        println!(
+            "\n{}",
+            mt(
+                "cli-bundle-no-changes",
+                "No changes made. Re-run with --yes to apply."
+            )
+        );
         return Ok(());
     }
     let mut working = config.clone();
@@ -468,8 +533,28 @@ async fn handle_bundle_remove(
             tokio::fs::create_dir_all(p).await.ok();
         }
         match tokio::fs::rename(&dir, &archive).await {
-            Ok(()) => println!("archived bundle directory → {}", archive.display()),
-            Err(e) => eprintln!("warning: bundle directory archive failed: {e}"),
+            Ok(()) => {
+                let p = archive.display().to_string();
+                println!(
+                    "{}",
+                    mta(
+                        "cli-bundle-archived",
+                        &[("path", p.as_str())],
+                        "archived bundle directory → {$path}"
+                    )
+                );
+            }
+            Err(e) => {
+                let es = e.to_string();
+                eprintln!(
+                    "{}",
+                    mta(
+                        "cli-bundle-warn-archive",
+                        &[("error", es.as_str())],
+                        "warning: bundle directory archive failed: {$error}"
+                    )
+                );
+            }
         }
     }
     let mut dirty = zeroclaw_config::alias_refs::scrub_bundle_refs(&mut working, &alias);
@@ -480,9 +565,14 @@ async fn handle_bundle_remove(
     for p in &dirty {
         working.mark_dirty(p);
     }
+    let count = refs.len().to_string();
     println!(
-        "deleted skill_bundles.{alias} (stripped from {} agent(s))",
-        refs.len()
+        "{}",
+        mta(
+            "cli-bundle-deleted",
+            &[("alias", alias.as_str()), ("count", count.as_str())],
+            "deleted skill_bundles.{$alias} (stripped from {$count} agent(s))"
+        )
     );
     Box::pin(working.save_dirty())
         .await
@@ -521,13 +611,28 @@ async fn handle_bundle_rename(
             tokio::fs::create_dir_all(p).await.ok();
         }
         if let Err(e) = tokio::fs::rename(&old, &new).await {
-            eprintln!("warning: bundle directory move failed: {e}");
+            let es = e.to_string();
+            eprintln!(
+                "{}",
+                mta(
+                    "cli-bundle-warn-move",
+                    &[("error", es.as_str())],
+                    "warning: bundle directory move failed: {$error}"
+                )
+            );
         }
     }
     for p in &dirty {
         working.mark_dirty(p);
     }
-    println!("renamed skill_bundles.{from} → skill_bundles.{to}");
+    println!(
+        "{}",
+        mta(
+            "cli-bundle-renamed",
+            &[("from", from.as_str()), ("to", to.as_str())],
+            "renamed skill_bundles.{$from} → skill_bundles.{$to}"
+        )
+    );
     Box::pin(working.save_dirty())
         .await
         .context("failed to persist config")
