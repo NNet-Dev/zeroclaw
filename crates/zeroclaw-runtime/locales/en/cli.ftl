@@ -813,6 +813,7 @@ cli-alias-rename-postcondition = rename cascade post-condition failed: {$message
 cli-alias-unknown-provider-category = unknown provider category `{$category}` (expected models | tts | transcription)
 cli-alias-no-such-section = no such config section: {$section}
 cli-alias-live-acp-sessions = {$count} live ACP session(s) for `{$alias}` — end them first
+cli-alias-owned-state-unavailable = note: config references were updated, but the agent's owned state (memory rows, workspace dir, cron/acp/session rows) was NOT cascaded by this CLI yet — use the gateway API for the full owned-state cascade.
 cli-bundle-not-configured = skill bundle '{$alias}' is not configured
 cli-bundle-rename-failed = rename failed: {$error}
 

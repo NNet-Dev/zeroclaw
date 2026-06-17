@@ -650,9 +650,13 @@ async fn agent_rename_owned_state(
 #[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
 fn warn_agent_owned_state() {
     eprintln!(
-        "note: config references were updated, but the agent's owned state \
-         (memory rows, workspace dir, cron/acp/session rows) was NOT cascaded \
-         by this CLI yet — use the gateway API for the full owned-state cascade."
+        "{}",
+        mt(
+            "cli-alias-owned-state-unavailable",
+            "note: config references were updated, but the agent's owned state \
+             (memory rows, workspace dir, cron/acp/session rows) was NOT cascaded \
+             by this CLI yet — use the gateway API for the full owned-state cascade."
+        )
     );
 }
 
