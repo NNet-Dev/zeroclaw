@@ -1157,9 +1157,17 @@ fn prepare_outgoing_embeds(
 
 /// Deliver a (deferred) interaction's answer, splitting it across Discord's
 /// 2000-char limit: the first chunk edits the @original deferred message (with
-/// any `embeds`) and any remaining chunks are posted as followups. The chunking
-/// lives here in the wiring layer so `interaction` need not depend on `chunk`
-/// (preserving the no-impl-to-impl module boundary).
+/// any `embeds` and `components`) and any remaining chunks are posted as
+/// followups. The chunking lives here in the wiring layer so `interaction` need
+/// not depend on `chunk` (preserving the no-impl-to-impl module boundary).
+///
+/// `embeds` are the rich embeds parsed from `[EMBED:{…}]` markers, and
+/// `components` are the interactive action rows parsed from a `[COMPONENTS:{…}]`
+/// marker (already registered server-side by the caller). Both ride on the
+/// FIRST chunk only — the `@original` edit carries them; any overflow followups
+/// stay text-only, mirroring the normal channel-send path (embeds/components
+/// attach to the first message, not its continuation chunks). Empty slices are a
+/// no-op, so plain replies are byte-identical to before.
 async fn deliver_interaction_answer(
     client: &reqwest::Client,
     app_id: &str,
@@ -1167,12 +1175,21 @@ async fn deliver_interaction_answer(
     api_base: &str,
     content: &str,
     embeds: &[DiscordEmbed],
+    components: &[components::DiscordActionRow],
 ) -> anyhow::Result<()> {
     let chunks = split_message_for_discord(content);
     let mut chunks = chunks.iter();
     let first = chunks.next().map(String::as_str).unwrap_or("");
-    discord_edit_interaction_response(client, app_id, interaction_token, api_base, first, embeds)
-        .await?;
+    discord_edit_interaction_response(
+        client,
+        app_id,
+        interaction_token,
+        api_base,
+        first,
+        embeds,
+        components,
+    )
+    .await?;
     for chunk in chunks {
         discord_post_interaction_followup(client, app_id, interaction_token, api_base, chunk)
             .await?;
@@ -1857,6 +1874,19 @@ impl Channel for DiscordChannel {
             let raw = crate::util::strip_tool_call_tags(&message.content);
             let (content, embeds, _embed_failures, _embeds_truncated) =
                 prepare_outgoing_embeds(&raw, self.workspace_dir.as_deref());
+            // Mirror the normal-send path: a `[COMPONENTS:{json}]` marker in a
+            // slash-command reply must render as interactive components, not go
+            // out raw. Parse + strip the marker (after embeds, same ordering as
+            // the channel path), then build the action rows —
+            // `build_marker_components` registers each interactive component's
+            // `custom_id` in `pending_components` (same server-side, single-use,
+            // fail-closed model as the channel path), so a click dispatches.
+            let (content, component_rows) = parse_component_markers(&content);
+            let component_action_rows = if component_rows.is_empty() {
+                Vec::new()
+            } else {
+                self.build_marker_components(&component_rows)
+            };
             let client = self.http_client();
             return deliver_interaction_answer(
                 &client,
@@ -1865,6 +1895,7 @@ impl Channel for DiscordChannel {
                 DISCORD_API_BASE,
                 &content,
                 &embeds,
+                &component_action_rows,
             )
             .await;
         }
@@ -4099,7 +4130,7 @@ mod tests {
         let client = reqwest::Client::new();
         // 3000 contiguous chars (no break point) → a 2000-char chunk + a 1000.
         let content = "a".repeat(3000);
-        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), &content, &[])
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), &content, &[], &[])
             .await
             .unwrap();
         // wiremock verifies the expect(1) counts when the server drops.
@@ -4125,9 +4156,122 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), "short answer", &[])
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), "short answer", &[], &[])
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interaction_answer_emits_components_on_original_edit() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The @original edit MUST carry the `components` array (a type-1 action
+        // row holding the rendered button) and the stripped content — proving a
+        // slash-command reply with a [COMPONENTS:…] marker renders interactive
+        // controls instead of leaking the marker text.
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .and(body_partial_json(serde_json::json!({
+                "content": "Pick:",
+                "components": [{ "type": 1 }],
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Build a real action row through the same registry path send() uses.
+        let (cleaned, marker_rows) = parse_component_markers(
+            "Pick: [COMPONENTS:{\"rows\":[[{\"label\":\"Ship\",\"style\":\"primary\",\"prompt\":\"ship it\"}]]}]",
+        );
+        assert_eq!(cleaned, "Pick:");
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce", &marker_rows, &mut reg);
+        assert_eq!(action_rows.len(), 1);
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(
+            &client,
+            "app1",
+            "tok",
+            &server.uri(),
+            &cleaned,
+            &[],
+            &action_rows,
+        )
+        .await
+        .unwrap();
+        // wiremock verifies the expect(1) + body_partial_json when the server drops.
+    }
+
+    #[tokio::test]
+    async fn plain_interaction_answer_omits_components_key() {
+        // Behaviour-neutrality: a reply with no marker (empty components slice)
+        // serialises to a content-only @original edit — no `components` key.
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .and(body_partial_json(serde_json::json!({ "content": "hi" })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), "hi", &[], &[])
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("components").is_none(),
+            "plain reply must not carry a components key"
+        );
+    }
+
+    #[test]
+    fn send_interaction_pipeline_strips_marker_and_registers_intents() {
+        // The send() interaction-reply branch runs `parse_component_markers` then
+        // `self.build_marker_components` BEFORE delivering — proving the marker is
+        // stripped from the outgoing content AND each interactive component is
+        // registered server-side (a click resolves the bound prompt, not the
+        // wire payload). This is the wiring the bug was missing.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let content = crate::util::strip_tool_call_tags(
+            "Choose: [COMPONENTS:{\"rows\":[[{\"label\":\"Approve\",\"style\":\"success\",\"prompt\":\"user approved\"},{\"label\":\"Docs\",\"url\":\"https://example.com\"}]]}]",
+        );
+        let (stripped, marker_rows) = parse_component_markers(&content);
+        assert_eq!(
+            stripped, "Choose:",
+            "marker stripped from interaction reply"
+        );
+        assert!(!marker_rows.is_empty(), "marker parsed into rows");
+
+        let action_rows = ch.build_marker_components(&marker_rows);
+        assert_eq!(action_rows.len(), 1, "one action row rendered");
+
+        // The Approve button is registered (clickable); the link button is not.
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 1, "only the prompt-bearing button registers");
+        assert_eq!(
+            ch.pending_components.lock().take(&ids[0]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "user approved".into()
+            }),
+            "click resolves the server-bound prompt"
+        );
+        // Single-use take: a replay resolves nothing.
+        assert_eq!(ch.pending_components.lock().take(&ids[0]), None);
     }
 
     #[test]

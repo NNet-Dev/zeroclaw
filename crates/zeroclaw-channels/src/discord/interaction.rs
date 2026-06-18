@@ -6,6 +6,7 @@
 
 use serde_json::json;
 
+use super::components::DiscordActionRow;
 use super::embed::DiscordEmbed;
 use super::types::DiscordOutgoing;
 
@@ -183,6 +184,11 @@ pub(crate) async fn discord_reject_interaction(
 /// path uses. `content` must be within Discord's 2000-char limit — callers whose
 /// reply may exceed it chunk first and post the remainder via
 /// [`discord_post_interaction_followup`]. `api_base` is injectable for tests.
+///
+/// `components` are the interactive action rows that ride on this edit (the
+/// `[COMPONENTS:{…}]` marker's buttons/selects, already registered server-side
+/// by the caller). An empty slice omits the `components` key entirely, so plain
+/// text replies serialise byte-identically to before — no behaviour change.
 pub(crate) async fn discord_edit_interaction_response(
     client: &reqwest::Client,
     app_id: &str,
@@ -190,13 +196,17 @@ pub(crate) async fn discord_edit_interaction_response(
     api_base: &str,
     content: &str,
     embeds: &[DiscordEmbed],
+    components: &[DiscordActionRow],
 ) -> anyhow::Result<()> {
     let url = format!("{api_base}/webhooks/{app_id}/{interaction_token}/messages/@original");
     // No truncation: the caller chunks (deliver_interaction_answer) and this edit
-    // carries the first ≤2000-char chunk plus any embeds.
+    // carries the first ≤2000-char chunk plus any embeds (EPIC C) and any
+    // interactive action rows (EPIC B). `to_rest_json` omits whichever are empty,
+    // so a plain text reply stays byte-identical.
     let payload = DiscordOutgoing {
         content: Some(content.to_string()),
         embeds: embeds.to_vec(),
+        components: components.to_vec(),
         ..Default::default()
     };
     // without_url: transport errors embed the token-bearing URL.
@@ -270,6 +280,7 @@ mod embed_reply_tests {
             &server.uri(),
             "see below",
             std::slice::from_ref(&embed),
+            &[],
         )
         .await
         .unwrap();
@@ -287,7 +298,7 @@ mod embed_reply_tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        discord_edit_interaction_response(&client, "app", "tok", &server.uri(), "hi", &[])
+        discord_edit_interaction_response(&client, "app", "tok", &server.uri(), "hi", &[], &[])
             .await
             .unwrap();
     }
