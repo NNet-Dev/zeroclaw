@@ -33,6 +33,12 @@ pub(crate) use types::*;
 // explicitly — no crate-wide re-export needed.
 mod slash_options;
 
+// custom_id codec + outbound component builders. Accessed via explicit paths
+// (`super::components::…`) until EPIC B Phase 2/4 wires crate-wide consumers,
+// at which point these gain `pub(crate) use …::*` re-exports.
+mod custom_id;
+mod components;
+
 mod chunk;
 pub(crate) use chunk::*;
 
