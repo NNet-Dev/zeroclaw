@@ -382,6 +382,231 @@ fn vet_embed_url(url: &str, workspace_dir: Option<&Path>) -> Result<String, Disc
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Interactive components marker — `[COMPONENTS:{json}]`
+//
+// The agent emits a single `[COMPONENTS:{…}]` marker carrying one JSON object
+// `{"rows": [ [ <component>, … ], … ]}`. Each action button / select option may
+// carry a server-side `prompt` that is enqueued as a new agent turn when the
+// component is clicked. The marker is parsed out on the outgoing path (`send`),
+// its prompts are registered in the channel's single-use `PendingComponents`
+// registry, and the rendered action rows ride along on the first message chunk.
+//
+// Trust note: the `prompt` is the *agent's own* text (same trust as any other
+// model output). It is registered server-side at emit time and bound to a
+// freshly-minted `custom_id`; a click resolves only that registered prompt and
+// never anything reconstructed from the click payload (see `pending.rs`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One component declared inside a `[COMPONENTS:{…}]` row.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ComponentSpec {
+    /// An action button: a click enqueues `prompt` as a new agent turn.
+    Button {
+        label: String,
+        style: super::components::ButtonStyle,
+        prompt: String,
+    },
+    /// A link button: opens `url`, never dispatched back to the bot.
+    Link { label: String, url: String },
+    /// A string-select menu: choosing an option enqueues that option's `prompt`.
+    Select {
+        placeholder: String,
+        options: Vec<ComponentOptionSpec>,
+    },
+}
+
+/// One choice in a `[COMPONENTS:…]` select. `value` is the agent-supplied option
+/// value (shown to no one); `prompt` is enqueued when the option is chosen.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ComponentOptionSpec {
+    pub(crate) label: String,
+    pub(crate) value: String,
+    pub(crate) prompt: String,
+}
+
+/// Map a textual style name to a [`ButtonStyle`]. Unknown / missing → Secondary
+/// (a neutral default rather than a parse failure that would drop the button).
+fn button_style_from_str(s: Option<&str>) -> super::components::ButtonStyle {
+    use super::components::ButtonStyle;
+    match s.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("primary") => ButtonStyle::Primary,
+        Some("success") => ButtonStyle::Success,
+        Some("danger") => ButtonStyle::Danger,
+        // "secondary" and anything unrecognized.
+        _ => ButtonStyle::Secondary,
+    }
+}
+
+/// Parse one component JSON object into a [`ComponentSpec`]. `None` for a shape
+/// that can't be rendered (e.g. a button with no label, a select with no
+/// options) so the caller can skip it without failing the whole send.
+fn component_from_json(v: &serde_json::Value) -> Option<ComponentSpec> {
+    let obj = v.as_object()?;
+
+    // Select: distinguished by the `select` key (its placeholder text).
+    if let Some(placeholder) = obj.get("select") {
+        let placeholder = placeholder.as_str().unwrap_or("").to_string();
+        let options: Vec<ComponentOptionSpec> = obj
+            .get("options")
+            .and_then(|o| o.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|o| {
+                        let oo = o.as_object()?;
+                        let label = oo.get("label")?.as_str()?.to_string();
+                        if label.is_empty() {
+                            return None;
+                        }
+                        let value = oo
+                            .get("value")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or(label.as_str())
+                            .to_string();
+                        let prompt = oo
+                            .get("prompt")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Some(ComponentOptionSpec {
+                            label,
+                            value,
+                            prompt,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if options.is_empty() {
+            return None;
+        }
+        return Some(ComponentSpec::Select {
+            placeholder,
+            options,
+        });
+    }
+
+    // Buttons require a label.
+    let label = obj.get("label").and_then(|x| x.as_str())?.to_string();
+    if label.is_empty() {
+        return None;
+    }
+    // Link button: distinguished by the `url` key.
+    if let Some(url) = obj.get("url").and_then(|x| x.as_str()) {
+        if url.is_empty() {
+            return None;
+        }
+        return Some(ComponentSpec::Link {
+            label,
+            url: url.to_string(),
+        });
+    }
+    // Action button.
+    let prompt = obj
+        .get("prompt")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(ComponentSpec::Button {
+        label,
+        style: button_style_from_str(obj.get("style").and_then(|x| x.as_str())),
+        prompt,
+    })
+}
+
+/// Parse the `{"rows": [[…], …]}` body of a `[COMPONENTS:…]` marker into row
+/// specs. Returns `None` when the JSON is malformed or carries no renderable
+/// rows, so the caller drops the marker rather than 400-ing the send.
+fn parse_components_body(json: &str) -> Option<Vec<Vec<ComponentSpec>>> {
+    let parsed: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    let rows = parsed.get("rows")?.as_array()?;
+    let rows: Vec<Vec<ComponentSpec>> = rows
+        .iter()
+        .filter_map(|row| {
+            let comps: Vec<ComponentSpec> = row
+                .as_array()?
+                .iter()
+                .filter_map(component_from_json)
+                .collect();
+            (!comps.is_empty()).then_some(comps)
+        })
+        .collect();
+    (!rows.is_empty()).then_some(rows)
+}
+
+/// The marker tag, including the trailing colon — `[COMPONENTS:`.
+const COMPONENTS_TAG: &str = "[COMPONENTS:";
+
+/// Strip a single `[COMPONENTS:{json}]` marker from `message`, returning the
+/// stripped text and the parsed row specs (empty when no valid marker was
+/// present). Unlike the attachment scanner this is JSON-aware: the marker body
+/// is a JSON object that itself contains `[`/`]`, so the close bracket is found
+/// by tracking brace depth and string state rather than the first `]`.
+///
+/// Tolerance mirrors `parse_attachment_markers`: a malformed or empty-result
+/// marker is dropped from the text (its raw JSON should never leak to chatters)
+/// but never fails the send. Only the first marker is honored; any further
+/// `[COMPONENTS:…]` markers are left untouched in the text.
+pub(crate) fn parse_component_markers(message: &str) -> (String, Vec<Vec<ComponentSpec>>) {
+    let Some(tag_start) = message.find(COMPONENTS_TAG) else {
+        return (message.to_string(), Vec::new());
+    };
+    let body_start = tag_start + COMPONENTS_TAG.len();
+
+    // Walk from the start of the JSON body to the marker's closing `]`,
+    // skipping any `]` that sits inside the JSON (in a string or nested array).
+    let Some(close_rel) = find_marker_close(&message[body_start..]) else {
+        // No closing bracket — leave the text untouched (it isn't a marker).
+        return (message.to_string(), Vec::new());
+    };
+    let close = body_start + close_rel;
+    let json = &message[body_start..close];
+
+    let mut cleaned = String::with_capacity(message.len());
+    cleaned.push_str(&message[..tag_start]);
+    cleaned.push_str(&message[close + 1..]);
+    let cleaned = cleaned.trim().to_string();
+
+    let rows = parse_components_body(json).unwrap_or_default();
+    (cleaned, rows)
+}
+
+/// Given the text immediately after `[COMPONENTS:`, return the byte offset of
+/// the marker's closing `]` (relative to that slice), tracking JSON string and
+/// brace/bracket nesting so a `]` inside the JSON body doesn't end the marker.
+/// `None` when no balanced close is found.
+fn find_marker_close(after_tag: &str) -> Option<usize> {
+    let mut depth: i64 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in after_tag.char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' => depth -= 1,
+            ']' => {
+                if depth == 0 {
+                    // Top-level `]` closes the marker.
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+
 /// Resolved outbound attachment target after sandbox validation.
 #[derive(Debug)]
 pub(crate) enum DiscordMarkerTarget {
@@ -812,5 +1037,135 @@ mod embed_tests {
         let (embed, failures) = spec_to_embed(spec, None);
         assert!(embed.is_none());
         assert_eq!(failures, vec![DiscordMarkerFailure::Refused]);
+    }
+}
+
+#[cfg(test)]
+mod component_marker_tests {
+    use super::*;
+    use crate::discord::components::ButtonStyle;
+
+    #[test]
+    fn parses_button_row_and_strips_marker() {
+        let msg = "Choose: [COMPONENTS:{\"rows\":[[{\"label\":\"Approve\",\"style\":\"success\",\"prompt\":\"approve it\"},{\"label\":\"Deny\",\"style\":\"danger\",\"prompt\":\"deny it\"}]]}] thanks";
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert_eq!(cleaned, "Choose:  thanks");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(
+            rows[0][0],
+            ComponentSpec::Button {
+                label: "Approve".into(),
+                style: ButtonStyle::Success,
+                prompt: "approve it".into(),
+            }
+        );
+        assert_eq!(
+            rows[0][1],
+            ComponentSpec::Button {
+                label: "Deny".into(),
+                style: ButtonStyle::Danger,
+                prompt: "deny it".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_link_button_without_prompt() {
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"label\":\"Docs\",\"url\":\"https://example.com\"}]]}]",
+        );
+        assert_eq!(
+            rows[0][0],
+            ComponentSpec::Link {
+                label: "Docs".into(),
+                url: "https://example.com".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_select_with_options() {
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"select\":\"Pick one\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"chose a\"},{\"label\":\"B\",\"value\":\"b\",\"prompt\":\"chose b\"}]}]]}]",
+        );
+        assert_eq!(rows.len(), 1);
+        match &rows[0][0] {
+            ComponentSpec::Select {
+                placeholder,
+                options,
+            } => {
+                assert_eq!(placeholder, "Pick one");
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].label, "A");
+                assert_eq!(options[0].value, "a");
+                assert_eq!(options[0].prompt, "chose a");
+                assert_eq!(options[1].prompt, "chose b");
+            }
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_style_defaults_to_secondary() {
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"label\":\"X\",\"prompt\":\"p\"}]]}]",
+        );
+        assert!(matches!(
+            rows[0][0],
+            ComponentSpec::Button {
+                style: ButtonStyle::Secondary,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nested_brackets_in_prompt_dont_truncate_marker() {
+        // A prompt containing `]` (and a JSON array) must not end the marker early.
+        let msg =
+            "[COMPONENTS:{\"rows\":[[{\"label\":\"Go\",\"prompt\":\"run [tool] now ]]\"}]]}] tail";
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert_eq!(cleaned, "tail");
+        assert_eq!(rows.len(), 1);
+        match &rows[0][0] {
+            ComponentSpec::Button { prompt, .. } => assert_eq!(prompt, "run [tool] now ]]"),
+            other => panic!("expected button, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_json_is_tolerated_and_marker_dropped() {
+        // Bad JSON: the marker is stripped (so its raw body never leaks) but no
+        // rows are produced and the send is NOT failed.
+        let (cleaned, rows) = parse_component_markers("before [COMPONENTS:{not valid json}] after");
+        assert_eq!(cleaned, "before  after");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn missing_close_bracket_leaves_text_untouched() {
+        // No balanced close — it isn't a marker, so the text is returned as-is.
+        let msg = "[COMPONENTS:{\"rows\":[[{\"label\":\"x\"}]]} no close";
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert_eq!(cleaned, msg);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn no_marker_returns_input_unchanged() {
+        let (cleaned, rows) = parse_component_markers("just a normal message");
+        assert_eq!(cleaned, "just a normal message");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn empty_options_select_is_dropped() {
+        // A select with no renderable options yields no rows (dropped, not 400).
+        let (cleaned, rows) = parse_component_markers(
+            "hi [COMPONENTS:{\"rows\":[[{\"select\":\"p\",\"options\":[]}]]}]",
+        );
+        assert_eq!(cleaned, "hi");
+        assert!(rows.is_empty());
     }
 }

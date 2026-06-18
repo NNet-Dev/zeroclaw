@@ -801,6 +801,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Paths inside markers MUST be absolute (starting with /) and live inside the configured workspace directory. Never use relative paths.\n\
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
              - For a rich embed, emit [EMBED:{...}] where {...} is a Discord embed JSON object (keys: title, description, url, color, timestamp, footer{text,icon_url}, image, thumbnail, author{name,url,icon_url}, fields[{name,value,inline}]). Any image/thumbnail/icon/url MUST be an http(s) URL; local paths are not embeddable. Keep the JSON on one line.\n\
+             - To offer interactive buttons or a menu, emit one marker [COMPONENTS:{\"rows\":[[<component>, ...], ...]}] on a single line (up to 5 rows; a row holds up to 5 buttons OR exactly one select). Action button: {\"label\":\"Approve\",\"style\":\"primary|secondary|success|danger\",\"prompt\":\"<text run as a new turn when clicked>\"}; link button: {\"label\":\"Docs\",\"url\":\"https://...\"}; select: {\"select\":\"placeholder\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"<run when chosen>\"}, ...]}. Every action button and select option needs a prompt describing what should happen when it is clicked.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         "whatsapp" | "whatsapp-web" => Some(

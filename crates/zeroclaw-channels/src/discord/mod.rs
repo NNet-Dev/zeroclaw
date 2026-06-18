@@ -921,6 +921,146 @@ impl DiscordChannel {
             .await
             .map(|_id| ())
     }
+
+    /// Turn the rows parsed from a `[COMPONENTS:{…}]` marker into renderable
+    /// [`DiscordActionRow`]s, registering each action button / select option that
+    /// carries a `prompt` in `pending_components` so a click resolves the
+    /// server-side prompt (and only that prompt — never the wire payload).
+    ///
+    /// `custom_id` uniqueness within the message is guaranteed by a per-call
+    /// monotonic counter combined with a short random nonce, so two buttons that
+    /// share a label/prompt still register under distinct ids and can't collide
+    /// or alias each other in the single-use registry. Link buttons get no
+    /// `custom_id` and no registration. Rows/buttons are capped to Discord's
+    /// limits by `action_row`/`cap_rows`; a component whose id won't encode is
+    /// dropped at serialization (logged) rather than failing the send.
+    fn build_marker_components(
+        &self,
+        rows: &[Vec<markers::ComponentSpec>],
+    ) -> Vec<components::DiscordActionRow> {
+        // One nonce per emitted message; the counter makes each component's id
+        // unique under it. Deterministic relative to the nonce (no per-component
+        // RNG), so the registry mapping is reproducible for a given send.
+        let nonce = Uuid::new_v4().simple().to_string();
+        let nonce = &nonce[..nonce.len().min(8)];
+        let mut reg = self.pending_components.lock();
+        build_component_rows(nonce, rows, &mut reg)
+    }
+}
+
+/// Render marker rows into action rows, registering each action button / select
+/// option's `prompt` under a freshly-minted `custom_id` in `reg`. Split out of
+/// [`DiscordChannel::build_marker_components`] so the registry round-trip (emit →
+/// click resolves the bound prompt) is unit-testable without a live channel.
+///
+/// Uniqueness: a single monotonic counter `seq` advances once per minted id
+/// across the whole message and is combined with `nonce`, so two buttons (even
+/// with identical label/prompt) register under distinct ids and never alias in
+/// the single-use registry. Link buttons get no id and no registration. A select
+/// menu's own id is non-routing (the dispatch routes on the chosen option's
+/// `value`); each option's `value` IS its own `zc1` token bound to that option's
+/// prompt.
+fn build_component_rows(
+    nonce: &str,
+    rows: &[Vec<markers::ComponentSpec>],
+    reg: &mut pending::PendingComponents,
+) -> Vec<components::DiscordActionRow> {
+    use components::{SelectOption, action_row, button, cap_rows, link_button, string_select};
+    use custom_id::CustomId;
+
+    /// Mint a fresh, message-unique `cmp` id and register `prompt` under it.
+    /// `seq` advances on every call so ids never collide within the message.
+    fn mint(
+        nonce: &str,
+        seq: &mut u32,
+        reg: &mut pending::PendingComponents,
+        prompt: String,
+    ) -> CustomId {
+        *seq += 1;
+        let id = CustomId::new("cmp", format!("{nonce}-{seq}"));
+        if let Some(wire) = id.encode() {
+            reg.register(wire, ComponentIntent::ResolveIntoTurn { prompt });
+        }
+        id
+    }
+
+    let mut seq: u32 = 0;
+    let mut built: Vec<components::DiscordActionRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut comps: Vec<components::DiscordComponent> = Vec::with_capacity(row.len());
+        for spec in row {
+            let comp = match spec {
+                markers::ComponentSpec::Button {
+                    label,
+                    style,
+                    prompt,
+                } => {
+                    let cid = mint(nonce, &mut seq, reg, prompt.clone());
+                    button(*style, label.clone(), cid)
+                }
+                markers::ComponentSpec::Link { label, url } => {
+                    link_button(label.clone(), url.clone())
+                }
+                markers::ComponentSpec::Select {
+                    placeholder,
+                    options,
+                } => {
+                    // A select carries ONE menu `custom_id`, but the inbound
+                    // dispatch routes a selection on the chosen option's *value*
+                    // (`data.values[0]`). So each option's value is its own zc1
+                    // `cmp` token registered with that option's prompt; the menu
+                    // id itself is a non-routing marker.
+                    let mut opts: Vec<SelectOption> = Vec::with_capacity(options.len());
+                    for o in options {
+                        let value_id = mint(nonce, &mut seq, reg, o.prompt.clone());
+                        // The option value IS the routing token; fall back to the
+                        // raw value if it won't encode (it then won't route, but
+                        // still renders).
+                        let value = value_id.encode().unwrap_or_else(|| o.value.clone());
+                        opts.push(SelectOption {
+                            label: o.label.clone(),
+                            value,
+                            description: None,
+                            default: false,
+                        });
+                    }
+                    seq += 1;
+                    let menu_id = CustomId::new("cmp", format!("{nonce}-{seq}-menu"));
+                    let placeholder = (!placeholder.is_empty()).then(|| placeholder.clone());
+                    string_select(menu_id, opts, placeholder)
+                }
+            };
+            comps.push(comp);
+        }
+        built.push(action_row(comps));
+    }
+    cap_rows(built)
+}
+
+/// Derive the routing token for a type-3/5 interaction from its `data` object.
+///
+/// Buttons and modal submits route on `data.custom_id`. A string-select carries
+/// one menu `custom_id`, but each of its options was emitted with its own `zc1`
+/// token as the option `value`; the chosen option arrives in `data.values`. So
+/// when the first `data.values[]` entry is a well-formed `zc1` token we route on
+/// it (resolving that option's server-bound prompt), otherwise we fall back to
+/// `data.custom_id`. The token is still validated/`take`n downstream — this only
+/// selects *which* registered entry a select selection drains, never trusts the
+/// wire for the action itself.
+fn component_routing_id(data: Option<&serde_json::Value>) -> Option<String> {
+    let data = data?;
+    if let Some(value) = data
+        .get("values")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        && custom_id::CustomId::parse(value).is_some()
+    {
+        return Some(value.to_string());
+    }
+    data.get("custom_id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
 }
 
 /// Whether a Discord channel type integer identifies a thread.
@@ -1680,8 +1820,22 @@ impl Channel for DiscordChannel {
         let (content_without_embeds, embeds, embed_failures, embeds_truncated) =
             prepare_outgoing_embeds(&raw_content, self.workspace_dir.as_deref());
 
+        // Interactive components next: the `[COMPONENTS:{json}]` body also contains
+        // `[`/`]`, so it must be stripped before the attachment scanner (which
+        // splits on the first `]`) sees the text — same ordering rationale as the
+        // embed marker. Each action button / select option carrying a `prompt` is
+        // registered in `pending_components` here, bound to a unique `custom_id`;
+        // a click resolves only that prompt.
+        let (content_without_components, component_rows) =
+            parse_component_markers(&content_without_embeds);
+        let component_action_rows = if component_rows.is_empty() {
+            Vec::new()
+        } else {
+            self.build_marker_components(&component_rows)
+        };
+
         let (cleaned_content, parsed_attachments) =
-            parse_attachment_markers(&content_without_embeds);
+            parse_attachment_markers(&content_without_components);
         let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
 
@@ -1729,11 +1883,17 @@ impl Channel for DiscordChannel {
 
         let mut first_message_id: Option<String> = None;
         for (i, chunk) in chunks.iter().enumerate() {
-            // Embeds ride the first message only (same placement as attachments).
-            let message_id = if i == 0 {
+            // Embeds (EPIC C) and interactive components (EPIC B) both ride the
+            // FIRST chunk only — Discord attaches embeds and action rows
+            // per-message, and the registered prompts are for this reply, not its
+            // continuation chunks. On chunk 0 we build a single envelope carrying
+            // content + embeds + components; `to_rest_json` omits whichever are
+            // empty, so a plain reply stays byte-identical.
+            let message_id = if i == 0 && (!embeds.is_empty() || !component_action_rows.is_empty()) {
                 let payload = DiscordOutgoing {
                     content: Some(chunk.clone()),
                     embeds: embeds.clone(),
+                    components: component_action_rows.clone(),
                     ..Default::default()
                 };
                 if local_files.is_empty() {
@@ -1754,6 +1914,15 @@ impl Channel for DiscordChannel {
                     )
                     .await?
                 }
+            } else if i == 0 && !local_files.is_empty() {
+                send_discord_message_with_files(
+                    &client,
+                    &self.bot_token,
+                    &message.recipient,
+                    chunk,
+                    &local_files,
+                )
+                .await?
             } else {
                 send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
                     .await?
@@ -2445,12 +2614,15 @@ impl Channel for DiscordChannel {
                                 let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let app_id = d.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let custom_id_raw = d
-                                    .get("data")
-                                    .and_then(|x| x.get("custom_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                // The routing key is normally the component's
+                                // `custom_id`. A string-select carries ONE menu
+                                // `custom_id` but the chosen option is in
+                                // `data.values`; we mint each option's value as
+                                // its own `zc1` token, so a select selection
+                                // routes on `data.values[0]` (its bound prompt),
+                                // falling back to `custom_id` for buttons/modals.
+                                let custom_id_raw =
+                                    component_routing_id(d.get("data")).unwrap_or_default();
                                 // Modal submits carry their typed-in field values;
                                 // a component click carries none.
                                 let modal_fields = if itype == 5 {
@@ -6784,6 +6956,169 @@ mod tests {
                 "each button resolves to its server-bound decision"
             );
         }
+    }
+
+    // ── [COMPONENTS:{json}] agent marker → interactive components (EPIC B) ──
+
+    /// Collect every `custom_id` (zc1 wire form) rendered by a set of action
+    /// rows — button ids and select-option values — so a test can drive a
+    /// "click" by `take`-ing it from the registry. Mirrors what the live type-3
+    /// dispatch routes on (`component_routing_id`: custom_id for buttons, the
+    /// chosen option `value` for selects).
+    fn rendered_routing_ids(rows: &[components::DiscordActionRow]) -> Vec<String> {
+        let mut ids = Vec::new();
+        for row in rows {
+            let api = row.to_api().expect("non-empty row serializes");
+            for comp in api["components"].as_array().unwrap() {
+                if comp["type"] == serde_json::json!(2) {
+                    if let Some(cid) = comp.get("custom_id").and_then(|v| v.as_str()) {
+                        ids.push(cid.to_string()); // action button (not a link)
+                    }
+                } else if comp["type"] == serde_json::json!(3) {
+                    for opt in comp["options"].as_array().unwrap() {
+                        ids.push(opt["value"].as_str().unwrap().to_string());
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn marker_emit_to_click_resolves_the_registered_prompt() {
+        // End-to-end at the registry boundary: the agent emits a [COMPONENTS:…]
+        // marker with an action button; build_component_rows registers its prompt
+        // under a minted custom_id; a "click" (take of that id) returns exactly
+        // the bound prompt — never anything from the wire.
+        let (cleaned, rows) = parse_component_markers(
+            "Pick: [COMPONENTS:{\"rows\":[[{\"label\":\"Ship\",\"style\":\"primary\",\"prompt\":\"ship the release\"}]]}]",
+        );
+        assert_eq!(cleaned, "Pick:", "marker stripped from content");
+
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce123", &rows, &mut reg);
+        assert_eq!(action_rows.len(), 1);
+
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 1, "one action button → one registered id");
+        // The click resolves the server-side prompt the bot registered at emit.
+        assert_eq!(
+            reg.take(&ids[0]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "ship the release".into()
+            })
+        );
+        // Single-use: a replay of the same id resolves nothing.
+        assert_eq!(reg.take(&ids[0]), None, "single-use: replay refused");
+    }
+
+    #[test]
+    fn marker_link_button_renders_without_registration() {
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"label\":\"Docs\",\"url\":\"https://example.com\"}]]}]",
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("n", &rows, &mut reg);
+        let api = action_rows[0].to_api().unwrap();
+        let btn = &api["components"][0];
+        assert_eq!(btn["style"], serde_json::json!(5), "link button");
+        assert_eq!(btn["url"], serde_json::json!("https://example.com"));
+        assert!(
+            btn.get("custom_id").is_none(),
+            "link button has no custom_id"
+        );
+        // No prompt was registered for a link button.
+        assert!(rendered_routing_ids(&action_rows).is_empty());
+    }
+
+    #[test]
+    fn marker_select_options_each_register_their_own_prompt() {
+        // Each select option's value IS its own routing token bound to that
+        // option's prompt; choosing an option (take of its value) resolves only
+        // that option's prompt, matching the dispatch's `component_routing_id`.
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"select\":\"Pick\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"chose a\"},{\"label\":\"B\",\"value\":\"b\",\"prompt\":\"chose b\"}]}]]}]",
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce", &rows, &mut reg);
+        let api = action_rows[0].to_api().unwrap();
+        assert_eq!(api["components"][0]["type"], serde_json::json!(3), "select");
+
+        let opt_values: Vec<String> = api["components"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["value"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(opt_values.len(), 2);
+        // The chosen option resolves its own prompt; the other still resolves to
+        // its own (distinct ids, no aliasing).
+        assert_eq!(
+            reg.take(&opt_values[0]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "chose a".into()
+            })
+        );
+        assert_eq!(
+            reg.take(&opt_values[1]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "chose b".into()
+            })
+        );
+    }
+
+    #[test]
+    fn marker_custom_ids_are_unique_within_a_message() {
+        // Two buttons with identical label/prompt must register under distinct
+        // ids so they can't collide or alias in the single-use registry.
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"label\":\"X\",\"prompt\":\"same\"},{\"label\":\"X\",\"prompt\":\"same\"}]]}]",
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce", &rows, &mut reg);
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "ids are unique even with identical content");
+        // Both resolve independently (single-use, no aliasing).
+        assert!(reg.take(&ids[0]).is_some());
+        assert!(reg.take(&ids[1]).is_some());
+    }
+
+    #[test]
+    fn malformed_component_marker_does_not_register_anything() {
+        let (cleaned, rows) = parse_component_markers("hi [COMPONENTS:{garbage}] there");
+        assert_eq!(cleaned, "hi  there", "bad marker stripped, not 400");
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("n", &rows, &mut reg);
+        assert!(action_rows.is_empty(), "no rows from a malformed marker");
+    }
+
+    #[test]
+    fn component_routing_id_prefers_zc1_select_value_else_custom_id() {
+        // Button / modal: routes on custom_id.
+        let data = serde_json::json!({ "custom_id": "zc1|cmp|n-1" });
+        assert_eq!(
+            component_routing_id(Some(&data)),
+            Some("zc1|cmp|n-1".to_string())
+        );
+        // Select: the chosen option value is a zc1 token → route on it.
+        let data = serde_json::json!({
+            "custom_id": "zc1|cmp|n-1-menu",
+            "values": ["zc1|cmp|n-2"]
+        });
+        assert_eq!(
+            component_routing_id(Some(&data)),
+            Some("zc1|cmp|n-2".to_string())
+        );
+        // A non-zc1 selected value falls back to the menu custom_id.
+        let data = serde_json::json!({
+            "custom_id": "zc1|cmp|n-1-menu",
+            "values": ["not-a-token"]
+        });
+        assert_eq!(
+            component_routing_id(Some(&data)),
+            Some("zc1|cmp|n-1-menu".to_string())
+        );
     }
 
     #[test]
