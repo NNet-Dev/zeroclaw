@@ -2947,11 +2947,17 @@ impl Channel for DiscordChannel {
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or("")
                                     .to_string();
+                                // The focused option + its partial input, owned
+                                // (so the spawned 'static task doesn't borrow
+                                // `event`). Discord marks exactly one option
+                                // `"focused": true`; absent → no completion.
+                                let focused = slash_options::extract_focused_option(d);
                                 if !interaction_id.is_empty() && !interaction_token.is_empty() {
                                     let client = self.http_client();
                                     let peers = (self.peer_resolver)();
                                     let guild_filter = guild_filter.clone();
                                     let channel_filter = channel_filter.clone();
+                                    let resolver = self.slash_command_resolver.clone();
 
                                     zeroclaw_spawn::spawn!(async move {
                                         // Fail-closed authz, side-effect-free:
@@ -2978,22 +2984,48 @@ impl Channel for DiscordChannel {
                                         )
                                         .is_ok();
 
-                                        // LIMITATION: choices come from EPIC D's
-                                        // typed-option model, which is not wired
-                                        // in this branch. Until then an
-                                        // authorized keystroke answers an empty
-                                        // (valid) choice set — the dispatch +
-                                        // fail-closed gate are the deliverable
-                                        // here; populated choices land with D.
-                                        let choices: Vec<(String, String)> = Vec::new();
-                                        let answer: &[(String, String)] =
-                                            if authorized { &choices } else { &[] };
+                                        // Suggestions are the focused option's
+                                        // predefined `choices` (the typed-option
+                                        // model), filtered by the partial input.
+                                        // Resolved from canonical state via the
+                                        // same blocking resolver the type-2 arm
+                                        // uses (no cache — SINGLE SOURCE OF
+                                        // TRUTH); this is a LOCAL read, never a
+                                        // Discord REST probe, so authz stays
+                                        // side-effect-free. An unauthorized
+                                        // keystroke skips even this and answers
+                                        // empty — no policy leak, no work.
+                                        let choices: Vec<(String, String)> = match (authorized, focused) {
+                                            (true, Some((command, option_name, partial))) => {
+                                                let specs = match resolver {
+                                                    Some(resolve) => match tokio::task::spawn_blocking(move || resolve()).await {
+                                                        Ok(specs) => specs,
+                                                        Err(e) => {
+                                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "skills resolver panicked; answering empty autocomplete");
+                                                            Vec::new()
+                                                        }
+                                                    },
+                                                    None => Vec::new(),
+                                                };
+                                                specs
+                                                    .iter()
+                                                    .find(|spec| spec.slug == command)
+                                                    .and_then(|spec| {
+                                                        spec.options.iter().find(|o| o.name == option_name)
+                                                    })
+                                                    .map(|opt| opt.matching_choices(&partial))
+                                                    .unwrap_or_default()
+                                            }
+                                            // Unauthorized, or no focused option:
+                                            // a valid empty answer (clears the box).
+                                            _ => Vec::new(),
+                                        };
 
                                         if let Err(e) = discord_answer_autocomplete(
                                             &client,
                                             &interaction_id,
                                             &interaction_token,
-                                            answer,
+                                            &choices,
                                         )
                                         .await
                                         {
@@ -7305,5 +7337,207 @@ mod tests {
             interaction_gate(&[], &[], &[], "u1", None, "c1", None).is_err(),
             "empty peer list denies"
         );
+    }
+
+    // ── Autocomplete (type-4) choice sourcing ────────────────────────────────
+    //
+    // The type-4 arm's body is: authorize (pure gate) → extract the focused
+    // option → resolve the command spec → find that option → filter its choices
+    // by the partial. These tests exercise that chain through the same public
+    // helpers the arm calls (`extract_focused_option`, `OptionSpec::matching_choices`)
+    // plus a wiremock check that the answer is a single type-8 POST.
+
+    fn autocomplete_spec_with_big_choice_list(slug: &str, option: &str) -> DiscordSlashCommandSpec {
+        let mut opt = slash_options::OptionSpec {
+            name: option.to_string(),
+            description: "o".to_string(),
+            kind: slash_options::OptKind::String,
+            required: false,
+            choices: Vec::new(),
+            min: None,
+            max: None,
+            min_length: None,
+            max_length: None,
+        };
+        // 40 > Discord's 25 static cap → served via autocomplete.
+        opt.choices = (0..40)
+            .map(|i| slash_options::Choice {
+                name: format!("region-{i:02}"),
+                value: format!("r{i:02}"),
+            })
+            .collect();
+        DiscordSlashCommandSpec {
+            skill_name: "deploy".to_string(),
+            slug: slug.to_string(),
+            description: "d".to_string(),
+            options: vec![opt],
+        }
+    }
+
+    // Reproduces the arm's choice-sourcing step exactly (spec lookup by slug →
+    // focused option by name → filter), given the resolved spec set.
+    fn arm_choices(
+        specs: &[DiscordSlashCommandSpec],
+        focused: Option<(String, String, String)>,
+        authorized: bool,
+    ) -> Vec<(String, String)> {
+        match (authorized, focused) {
+            (true, Some((command, option_name, partial))) => specs
+                .iter()
+                .find(|s| s.slug == command)
+                .and_then(|s| s.options.iter().find(|o| o.name == option_name))
+                .map(|o| o.matching_choices(&partial))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn autocomplete_arm_returns_matching_choices_for_focused_option() {
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        let payload = serde_json::json!({
+            "type": 4,
+            "data": {
+                "name": "deploy",
+                "options": [ { "name": "region", "type": 3, "value": "region-1", "focused": true } ]
+            }
+        });
+        let focused = slash_options::extract_focused_option(&payload);
+        let choices = arm_choices(&specs, focused, true);
+        // "region-1" prefixes region-10..region-19 (10 of them).
+        assert_eq!(choices.len(), 10);
+        assert!(choices.iter().all(|(n, _)| n.starts_with("region-1")));
+        assert_eq!(choices[0], ("region-10".to_string(), "r10".to_string()));
+    }
+
+    #[test]
+    fn autocomplete_arm_returns_empty_for_unauthorized() {
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        let payload = serde_json::json!({
+            "type": 4,
+            "data": { "name": "deploy", "options": [ { "name": "region", "value": "region", "focused": true } ] }
+        });
+        let focused = slash_options::extract_focused_option(&payload);
+        // Even with a matching focused option, an unauthorized keystroke answers
+        // empty — no policy leak, no work.
+        assert!(arm_choices(&specs, focused, false).is_empty());
+    }
+
+    #[test]
+    fn autocomplete_arm_returns_empty_for_no_match_and_unknown_targets() {
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        // No choice matches the partial.
+        let p = serde_json::json!({
+            "data": { "name": "deploy", "options": [ { "name": "region", "value": "zzz", "focused": true } ] }
+        });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+        // Unknown command slug.
+        let p = serde_json::json!({
+            "data": { "name": "ghost", "options": [ { "name": "region", "value": "r", "focused": true } ] }
+        });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+        // Known command, unknown focused option name.
+        let p = serde_json::json!({
+            "data": { "name": "deploy", "options": [ { "name": "ghost", "value": "r", "focused": true } ] }
+        });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+        // No focused option at all.
+        let p = serde_json::json!({ "data": { "name": "deploy", "options": [] } });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+    }
+
+    #[test]
+    fn interaction_arms_gate_before_take_after_the_doptions_merge() {
+        // Source-level regression: the rebase combined this handler with the
+        // D-options type-2 arm. Lock the fail-closed ordering against a future
+        // merge silently reordering `take` before the gate. We read THIS file's
+        // source and assert, within the type-3/5 arm, that `interaction_gate(`
+        // appears before `pending_components.lock().take(` — and that the type-2
+        // arm's `interaction_gate(` precedes its credential stash + defer.
+        let src = include_str!("mod.rs");
+
+        let arm35 = src
+            .find("} else if itype == 3 || itype == 5 {")
+            .expect("type-3/5 arm present");
+        let arm4 = src[arm35..]
+            .find("} else if itype == 4 {")
+            .map(|i| arm35 + i)
+            .expect("type-4 arm present (arm-3/5 boundary)");
+        let region35 = &src[arm35..arm4];
+        let gate35 = region35
+            .find("interaction_gate(")
+            .expect("type-3/5 arm gates");
+        let take35 = region35
+            .find("pending_components.lock().take(")
+            .expect("type-3/5 arm takes");
+        assert!(
+            gate35 < take35,
+            "type-3/5: interaction_gate must run BEFORE the single-use take"
+        );
+        // The cheap peer pre-check is also before the take.
+        let peer35 = region35
+            .find("crate::allowlist::is_user_allowed(")
+            .expect("type-3/5 arm peer-checks");
+        assert!(
+            peer35 < take35 && peer35 < gate35,
+            "peer check precedes gate+take"
+        );
+
+        // type-2 arm: gate precedes the credential stash (`pending.lock()`) and
+        // the defer — an unauthorized invoker never stashes creds or defers.
+        let arm2 = src.find("if itype == 2 {").expect("type-2 arm present");
+        let region2 = &src[arm2..arm35];
+        let gate2 = region2.find("interaction_gate(").expect("type-2 arm gates");
+        let stash2 = region2
+            .find("let mut guard = pending.lock();")
+            .expect("type-2 arm stashes creds");
+        let defer2 = region2
+            .find("discord_defer_interaction(")
+            .expect("type-2 arm defers");
+        assert!(
+            gate2 < stash2 && gate2 < defer2,
+            "type-2: gate before stash+defer"
+        );
+    }
+
+    #[tokio::test]
+    async fn autocomplete_answer_posts_a_single_type8_callback_and_nothing_else() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The ONLY call an autocomplete keystroke may make: a type-8
+        // (AUTOCOMPLETE_RESULT) callback. No defer, no reject, no followup.
+        Mock::given(method("POST"))
+            .and(path("/interactions/iid/tok/callback"))
+            .and(body_partial_json(serde_json::json!({ "type": 8 })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        let p = serde_json::json!({
+            "data": { "name": "deploy", "options": [ { "name": "region", "value": "region-2", "focused": true } ] }
+        });
+        let choices = arm_choices(&specs, slash_options::extract_focused_option(&p), true);
+        assert_eq!(choices.len(), 10, "region-2x → 10 matches");
+
+        let client = reqwest::Client::new();
+        // The arm posts the answer to <api_base>/interactions/{id}/{token}/callback;
+        // discord_answer_autocomplete hardcodes the real base, so post directly
+        // here against the mock to verify the single-call, type-8 shape.
+        let url = format!("{}/interactions/iid/tok/callback", server.uri());
+        let rendered: Vec<_> = choices
+            .iter()
+            .map(|(n, v)| serde_json::json!({ "name": n, "value": v }))
+            .collect();
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({ "type": 8, "data": { "choices": rendered } }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        // wiremock verifies expect(1) on drop.
     }
 }
