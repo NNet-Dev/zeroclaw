@@ -17,18 +17,29 @@ use std::time::{Duration, Instant};
 /// after that can't be answered anyway.
 const COMPONENT_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// What a registered component does when clicked. Phase 2 resolves into an agent
-/// turn; Phase 4 adds an approval variant that resolves a parked `oneshot`
-/// instead of enqueuing.
+/// What a registered component does when clicked. A click resolves into an
+/// agent turn (a plain button, a select option, or a modal submit), opens a
+/// modal whose submit later resolves into a turn, or resolves a parked
+/// tool-approval `oneshot`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ComponentIntent {
     /// Enqueue this prompt as an agent turn — the click drives the agent, whose
-    /// reply is delivered through the interaction followup. The dispatch arm
-    /// `take`s and matches it; the *emitter* (a feature that renders a
-    /// resolve-into-turn button) lands in a later phase, so no production code
-    /// constructs it yet — only the dispatch + tests reference it.
-    #[allow(dead_code)]
+    /// reply is delivered through the interaction followup. Bound to action
+    /// buttons and select options by the `[COMPONENTS:…]` marker builder, and
+    /// to a modal's `custom_id` so its type-5 submit resolves into a turn (the
+    /// submitted field values are appended to the prompt at dispatch).
     ResolveIntoTurn { prompt: String },
+    /// Open a text-input modal (Discord response type 9) in answer to the
+    /// click. The modal-open IS the interaction response (no defer, no enqueue
+    /// here). When the click is dispatched, the modal's own `custom_id` is
+    /// registered as `ResolveIntoTurn { prompt }`, so the eventual type-5 submit
+    /// resolves into a turn (with the submitted field values appended). Binding
+    /// the submit at click time (not emit time) starts its single-use TTL when
+    /// the modal actually opens.
+    OpenModal {
+        modal: Box<super::components::DiscordModal>,
+        prompt: String,
+    },
     /// Resolve a parked tool-approval `oneshot` keyed by `token` in
     /// `pending_approvals` with the server-bound `decision`. The decision is a
     /// fixed enum captured when the button was emitted — NEVER derived from the

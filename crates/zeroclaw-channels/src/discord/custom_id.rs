@@ -8,11 +8,6 @@
 //! slash reaper uses. No bearer secrets ever go in a `custom_id`: it flows
 //! through logs and client round-trips, so it carries only a routing key.
 
-// `encode` is live via the component serializers; `parse`/`new` get their first
-// callers in EPIC B Phase 2 (inbound component dispatch). The allow is lifted
-// when that phase lands.
-#![allow(dead_code)]
-
 /// Scheme marker prefixing every custom_id this channel emits. Versioned so a
 /// future wire change can coexist with `zc1` tokens still in flight on
 /// already-rendered messages.

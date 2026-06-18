@@ -7,12 +7,6 @@
 //! inputs are added with modal handling (Phase 3) — a message action row never
 //! holds them.
 
-// The builder API below is constructed starting EPIC B Phase 4 (buttoned
-// approval emits the first real buttons); the `to_api` serializers are already
-// live via `DiscordOutgoing::to_rest_json`. Until a phase wires a caller the
-// builders/variants have no in-crate use outside tests — lifted per phase.
-#![allow(dead_code)]
-
 use serde_json::{Value, json};
 
 use super::custom_id::CustomId;

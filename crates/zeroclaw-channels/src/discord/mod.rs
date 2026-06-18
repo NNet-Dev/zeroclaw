@@ -959,25 +959,36 @@ impl DiscordChannel {
 /// the single-use registry. Link buttons get no id and no registration. A select
 /// menu's own id is non-routing (the dispatch routes on the chosen option's
 /// `value`); each option's `value` IS its own `zc1` token bound to that option's
-/// prompt.
+/// prompt. A modal button mints TWO ids: the modal's own `custom_id` bound to
+/// the resolve-into-turn prompt (the submit dispatches on it), and the button's
+/// `custom_id` bound to `OpenModal` carrying that modal.
 fn build_component_rows(
     nonce: &str,
     rows: &[Vec<markers::ComponentSpec>],
     reg: &mut pending::PendingComponents,
 ) -> Vec<components::DiscordActionRow> {
-    use components::{SelectOption, action_row, button, cap_rows, link_button, string_select};
+    use components::{
+        DiscordModal, ModalField, SelectOption, action_row, button, cap_rows, link_button,
+        string_select,
+    };
     use custom_id::CustomId;
 
-    /// Mint a fresh, message-unique `cmp` id and register `prompt` under it.
-    /// `seq` advances on every call so ids never collide within the message.
+    /// Mint a fresh, message-unique `cmp` id (advancing `seq` so ids never
+    /// collide within the message) WITHOUT registering anything. The caller
+    /// decides the intent.
+    fn mint_id(nonce: &str, seq: &mut u32) -> CustomId {
+        *seq += 1;
+        CustomId::new("cmp", format!("{nonce}-{seq}"))
+    }
+
+    /// Mint a fresh id and register `prompt` under it as a resolve-into-turn.
     fn mint(
         nonce: &str,
         seq: &mut u32,
         reg: &mut pending::PendingComponents,
         prompt: String,
     ) -> CustomId {
-        *seq += 1;
-        let id = CustomId::new("cmp", format!("{nonce}-{seq}"));
+        let id = mint_id(nonce, seq);
         if let Some(wire) = id.encode() {
             reg.register(wire, ComponentIntent::ResolveIntoTurn { prompt });
         }
@@ -1000,6 +1011,51 @@ fn build_component_rows(
                 }
                 markers::ComponentSpec::Link { label, url } => {
                     link_button(label.clone(), url.clone())
+                }
+                markers::ComponentSpec::ModalButton {
+                    label,
+                    style,
+                    prompt,
+                    modal,
+                } => {
+                    // Two minted ids: the MODAL's own `custom_id` is the routing
+                    // token its type-5 submit will dispatch on, and the BUTTON's
+                    // `custom_id` is registered now as `OpenModal` carrying the
+                    // built modal + prompt. A click opens the modal and (at that
+                    // point) registers the modal id as `ResolveIntoTurn { prompt }`;
+                    // the submit then resolves the prompt with the typed field
+                    // values appended. The modal id is NOT registered at emit time
+                    // so its single-use TTL starts when the modal actually opens.
+                    let modal_id = mint_id(nonce, &mut seq);
+                    let fields: Vec<ModalField> = modal
+                        .fields
+                        .iter()
+                        .map(|f| ModalField {
+                            custom_id: f.id.clone(),
+                            label: f.label.clone(),
+                            style: f.style,
+                            required: f.required,
+                            placeholder: f.placeholder.clone(),
+                            min_length: f.min_length,
+                            max_length: f.max_length,
+                        })
+                        .collect();
+                    let built_modal = DiscordModal {
+                        custom_id: modal_id,
+                        title: modal.title.clone(),
+                        fields,
+                    };
+                    let button_id = mint_id(nonce, &mut seq);
+                    if let Some(wire) = button_id.encode() {
+                        reg.register(
+                            wire,
+                            ComponentIntent::OpenModal {
+                                modal: Box::new(built_modal),
+                                prompt: prompt.clone(),
+                            },
+                        );
+                    }
+                    button(*style, label.clone(), button_id)
                 }
                 markers::ComponentSpec::Select {
                     placeholder,
@@ -2760,6 +2816,29 @@ impl Channel for DiscordChannel {
                                                 let msg = i18n::get_required_cli_string(key);
                                                 if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
                                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord approval ack failed");
+                                                }
+                                                return;
+                                            }
+                                            // Modal-open button: the click's
+                                            // response IS opening the modal (type
+                                            // 9) — we do NOT defer or enqueue.
+                                            // Register the modal's own `custom_id`
+                                            // as the resolve-into-turn now (so the
+                                            // type-5 submit, handled by the
+                                            // ResolveIntoTurn arm above, resolves
+                                            // the prompt with its typed field
+                                            // values appended), then open the modal.
+                                            // The `take` already ran after the
+                                            // fail-closed gate, same as Approval.
+                                            Some(ComponentIntent::OpenModal { modal, prompt }) => {
+                                                if let Some(wire) = modal.custom_id.encode() {
+                                                    pending_components.lock().register(
+                                                        wire,
+                                                        ComponentIntent::ResolveIntoTurn { prompt },
+                                                    );
+                                                }
+                                                if let Err(e) = discord_open_modal(&client, &interaction_id, &interaction_token, &modal).await {
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord modal open failed");
                                                 }
                                                 return;
                                             }
@@ -7082,6 +7161,82 @@ mod tests {
         // Both resolve independently (single-use, no aliasing).
         assert!(reg.take(&ids[0]).is_some());
         assert!(reg.take(&ids[1]).is_some());
+    }
+
+    #[test]
+    fn marker_modal_button_registers_open_modal_and_submit_resolves_into_turn() {
+        // A modal button parses → build_component_rows registers OpenModal under
+        // the button's minted id (the modal id is NOT pre-registered). A "click"
+        // (take of the button id) yields OpenModal { modal, prompt }; the modal
+        // carries its OWN minted zc1 custom_id. Registering that modal id (as the
+        // dispatch arm does on open) makes the eventual type-5 submit resolve into
+        // a turn bound to the button's server-side prompt.
+        let (cleaned, rows) = parse_component_markers(
+            "Tell us: [COMPONENTS:{\"rows\":[[{\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"file a report\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"paragraph\",\"required\":true,\"max\":500}]}}]]}]",
+        );
+        assert_eq!(cleaned, "Tell us:", "marker stripped from content");
+        // The spec carries the parsed modal (title + one paragraph field).
+        match &rows[0][0] {
+            markers::ComponentSpec::ModalButton {
+                label,
+                modal,
+                prompt,
+                ..
+            } => {
+                assert_eq!(label, "Report");
+                assert_eq!(prompt, "file a report");
+                assert_eq!(modal.title, "Report");
+                assert_eq!(modal.fields.len(), 1);
+                assert_eq!(modal.fields[0].id, "reason");
+                assert_eq!(modal.fields[0].style, components::TextInputStyle::Paragraph);
+                assert!(modal.fields[0].required);
+                assert_eq!(modal.fields[0].max_length, Some(500));
+            }
+            other => panic!("expected ModalButton, got {other:?}"),
+        }
+
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce42", &rows, &mut reg);
+        assert_eq!(action_rows.len(), 1);
+        // The button renders as a normal (non-link) action button with a zc1 id.
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 1, "one modal button → one registered button id");
+
+        // The click drains OpenModal, carrying the built modal + bound prompt.
+        let (modal, prompt) = match reg.take(&ids[0]) {
+            Some(ComponentIntent::OpenModal { modal, prompt }) => (modal, prompt),
+            other => panic!("expected OpenModal, got {other:?}"),
+        };
+        assert_eq!(prompt, "file a report");
+        // Single-use: the button id is drained.
+        assert_eq!(reg.take(&ids[0]), None, "modal button is single-use");
+
+        // The modal carries its own minted zc1 routing token, distinct from the
+        // button's, and was NOT pre-registered (its TTL starts at open).
+        let modal_wire = modal.custom_id.encode().expect("modal id encodes");
+        assert!(modal_wire.starts_with("zc1|cmp|"));
+        assert_ne!(
+            modal_wire, ids[0],
+            "modal id is distinct from the button id"
+        );
+        assert!(
+            reg.take(&modal_wire).is_none(),
+            "modal submit is not registered until the modal opens"
+        );
+
+        // The OpenModal dispatch arm registers the modal id as the resolve-into-
+        // turn on open; the type-5 submit then drains that prompt.
+        reg.register(
+            modal_wire.clone(),
+            ComponentIntent::ResolveIntoTurn { prompt },
+        );
+        assert_eq!(
+            reg.take(&modal_wire),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "file a report".into()
+            }),
+            "modal submit resolves into the button's server-side prompt"
+        );
     }
 
     #[test]

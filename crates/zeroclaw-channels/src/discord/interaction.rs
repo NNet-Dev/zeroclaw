@@ -51,10 +51,9 @@ pub(crate) async fn discord_defer_interaction(
 }
 
 /// Open a modal in response to a button/slash interaction (callback type 9).
-/// The caller must register the modal's `custom_id` in the pending registry
-/// first so the eventual type-5 submit can resolve it. Sender-side — the first
-/// caller lands with a feature that opens a modal (EPIC B Phase 4 onward).
-#[allow(dead_code)]
+/// The caller registers the modal's `custom_id` in the pending registry as a
+/// resolve-into-turn so the eventual type-5 submit resolves it. Driven by the
+/// `OpenModal` dispatch arm (a `[COMPONENTS:…]` modal button click).
 pub(crate) async fn discord_open_modal(
     client: &reqwest::Client,
     interaction_id: &str,

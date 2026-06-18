@@ -409,11 +409,43 @@ pub(crate) enum ComponentSpec {
     },
     /// A link button: opens `url`, never dispatched back to the bot.
     Link { label: String, url: String },
+    /// A modal button: a click opens a text-input modal (Discord response
+    /// type 9). The submitted field values are appended to `prompt`, which is
+    /// then run as a new agent turn. The modal's own routing `custom_id` is
+    /// minted at build time (it is the token the type-5 submit dispatches on).
+    ModalButton {
+        label: String,
+        style: super::components::ButtonStyle,
+        prompt: String,
+        modal: ComponentModalSpec,
+    },
     /// A string-select menu: choosing an option enqueues that option's `prompt`.
     Select {
         placeholder: String,
         options: Vec<ComponentOptionSpec>,
     },
+}
+
+/// The agent-declared shape of a modal opened by a [`ComponentSpec::ModalButton`].
+/// Carries only the title + field declarations; the routing `custom_id` is
+/// minted server-side at build time (never agent-supplied), so a click can't
+/// alias another component's token.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ComponentModalSpec {
+    pub(crate) title: String,
+    pub(crate) fields: Vec<ComponentModalField>,
+}
+
+/// One text-input field declared inside a modal button's `modal.fields`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ComponentModalField {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) style: super::components::TextInputStyle,
+    pub(crate) required: bool,
+    pub(crate) placeholder: Option<String>,
+    pub(crate) min_length: Option<u16>,
+    pub(crate) max_length: Option<u16>,
 }
 
 /// One choice in a `[COMPONENTS:…]` select. `value` is the agent-supplied option
@@ -436,6 +468,76 @@ fn button_style_from_str(s: Option<&str>) -> super::components::ButtonStyle {
         // "secondary" and anything unrecognized.
         _ => ButtonStyle::Secondary,
     }
+}
+
+/// Map a textual text-input style to a [`TextInputStyle`]. Unknown / missing →
+/// Short (the common single-line default rather than a parse failure).
+fn text_input_style_from_str(s: Option<&str>) -> super::components::TextInputStyle {
+    use super::components::TextInputStyle;
+    match s.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("paragraph") => TextInputStyle::Paragraph,
+        // "short" and anything unrecognized.
+        _ => TextInputStyle::Short,
+    }
+}
+
+/// Read an optional `u16` length bound (`min`/`max`) from a modal-field object.
+/// Out-of-range / non-numeric values are dropped (treated as absent) rather
+/// than failing the field.
+fn modal_field_len(field: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<u16> {
+    field
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u16::try_from(n).ok())
+}
+
+/// Parse a modal button's `modal` object into a [`ComponentModalSpec`]. `None`
+/// when it has no renderable fields (each field requires `id` and `label`), so
+/// the caller drops the whole button rather than rendering a modal that opens
+/// empty.
+fn modal_spec_from_json(v: &serde_json::Value) -> Option<ComponentModalSpec> {
+    let obj = v.as_object()?;
+    let title = obj
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let fields: Vec<ComponentModalField> = obj
+        .get("fields")
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    let fo = f.as_object()?;
+                    let id = fo.get("id")?.as_str()?.to_string();
+                    let label = fo.get("label")?.as_str()?.to_string();
+                    if id.is_empty() || label.is_empty() {
+                        return None;
+                    }
+                    Some(ComponentModalField {
+                        id,
+                        label,
+                        style: text_input_style_from_str(fo.get("style").and_then(|x| x.as_str())),
+                        required: fo
+                            .get("required")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                        placeholder: fo
+                            .get("placeholder")
+                            .and_then(|x| x.as_str())
+                            .filter(|p| !p.is_empty())
+                            .map(ToString::to_string),
+                        min_length: modal_field_len(fo, "min"),
+                        max_length: modal_field_len(fo, "max"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if fields.is_empty() {
+        return None;
+    }
+    Some(ComponentModalSpec { title, fields })
 }
 
 /// Parse one component JSON object into a [`ComponentSpec`]. `None` for a shape
@@ -499,6 +601,22 @@ fn component_from_json(v: &serde_json::Value) -> Option<ComponentSpec> {
         return Some(ComponentSpec::Link {
             label,
             url: url.to_string(),
+        });
+    }
+    // Modal button: distinguished by the `modal` key. A click opens a
+    // text-input modal whose submitted values are appended to `prompt`.
+    if let Some(modal_json) = obj.get("modal") {
+        let modal = modal_spec_from_json(modal_json)?;
+        let prompt = obj
+            .get("prompt")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(ComponentSpec::ModalButton {
+            label,
+            style: button_style_from_str(obj.get("style").and_then(|x| x.as_str())),
+            prompt,
+            modal,
         });
     }
     // Action button.
@@ -1156,6 +1274,49 @@ mod component_marker_tests {
     fn no_marker_returns_input_unchanged() {
         let (cleaned, rows) = parse_component_markers("just a normal message");
         assert_eq!(cleaned, "just a normal message");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn parses_modal_button_with_fields() {
+        use crate::discord::components::TextInputStyle;
+        let (cleaned, rows) = parse_component_markers(
+            "Open: [COMPONENTS:{\"rows\":[[{\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"file it\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"paragraph\",\"required\":true,\"placeholder\":\"why?\",\"min\":1,\"max\":500}]}}]]}]",
+        );
+        assert_eq!(cleaned, "Open:");
+        match &rows[0][0] {
+            ComponentSpec::ModalButton {
+                label,
+                style,
+                prompt,
+                modal,
+            } => {
+                assert_eq!(label, "Report");
+                assert_eq!(*style, ButtonStyle::Danger);
+                assert_eq!(prompt, "file it");
+                assert_eq!(modal.title, "Report");
+                assert_eq!(modal.fields.len(), 1);
+                let f = &modal.fields[0];
+                assert_eq!(f.id, "reason");
+                assert_eq!(f.label, "Reason");
+                assert_eq!(f.style, TextInputStyle::Paragraph);
+                assert!(f.required);
+                assert_eq!(f.placeholder.as_deref(), Some("why?"));
+                assert_eq!(f.min_length, Some(1));
+                assert_eq!(f.max_length, Some(500));
+            }
+            other => panic!("expected modal button, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modal_button_without_fields_is_dropped() {
+        // A modal with no renderable fields drops the whole button (it can't open
+        // an empty form), rather than rendering or 400-ing the send.
+        let (cleaned, rows) = parse_component_markers(
+            "hi [COMPONENTS:{\"rows\":[[{\"label\":\"X\",\"modal\":{\"title\":\"t\",\"fields\":[]}}]]}]",
+        );
+        assert_eq!(cleaned, "hi");
         assert!(rows.is_empty());
     }
 
