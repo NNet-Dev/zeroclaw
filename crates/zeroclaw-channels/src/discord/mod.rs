@@ -33,11 +33,14 @@ pub(crate) use types::*;
 // explicitly — no crate-wide re-export needed.
 mod slash_options;
 
-// custom_id codec + outbound component builders. Accessed via explicit paths
-// (`super::components::…`) until EPIC B Phase 2/4 wires crate-wide consumers,
-// at which point these gain `pub(crate) use …::*` re-exports.
-mod custom_id;
+// custom_id codec + outbound component builders + the inbound single-use
+// pending registry. Accessed via explicit paths (`super::components::…`).
 mod components;
+mod custom_id;
+mod pending;
+// Imported bare so the type-3 arm (where a local `pending` var shadows the
+// module) can still name it.
+use pending::ComponentIntent;
 
 mod chunk;
 pub(crate) use chunk::*;
@@ -135,6 +138,11 @@ pub struct DiscordChannel {
     /// rows. Keyed by interaction id; swept on insert; entries expire with
     /// Discord's 15-minute followup window.
     pending_interactions: Arc<Mutex<HashMap<String, PendingInteraction>>>,
+    /// Single-use registry binding a live component `custom_id` to the
+    /// server-side intent it resolves. A click is trusted only if its id is
+    /// present here (forged/replayed/expired ids resolve to nothing). Populated
+    /// when the channel emits a component; drained on click.
+    pending_components: Arc<Mutex<pending::PendingComponents>>,
     /// Resolves skill-derived commands to register alongside `/ask`.
     /// `None` (or an empty resolution) = `/ask` only.
     slash_command_resolver: Option<DiscordSlashCommandResolver>,
@@ -185,6 +193,7 @@ impl DiscordChannel {
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
             slash_commands: false,
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
+            pending_components: Arc::new(Mutex::new(pending::PendingComponents::default())),
             slash_command_resolver: None,
         }
     }
@@ -2215,6 +2224,172 @@ impl Channel for DiscordChannel {
                                         };
                                         if tx.send(channel_msg).await.is_err() {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping interaction prompt");
+                                        }
+                                    });
+                                }
+                            } else if itype == 3 {
+                                // type 3 = MESSAGE_COMPONENT (button / select click)
+                                let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let app_id = d.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let custom_id_raw = d
+                                    .get("data")
+                                    .and_then(|x| x.get("custom_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let user_id = d
+                                    .get("member")
+                                    .and_then(|m| m.get("user"))
+                                    .or_else(|| d.get("user"))
+                                    .and_then(|u| u.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let interaction_guild = d
+                                    .get("guild_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                let interaction_channel = d
+                                    .get("channel_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                // Foreign or malformed component: not our `zc1`
+                                // scheme, so another app may own it — drop
+                                // silently rather than acking someone else's
+                                // button. The pending registry is the real gate
+                                // below; this is a cheap pre-filter.
+                                if custom_id::CustomId::parse(&custom_id_raw).is_none() {
+                                    continue;
+                                }
+                                if !interaction_id.is_empty()
+                                    && !interaction_token.is_empty()
+                                    && !app_id.is_empty()
+                                {
+                                    let client = self.http_client();
+                                    let bot_token = self.bot_token.clone();
+                                    let peers = (self.peer_resolver)();
+                                    let guild_filter = guild_filter.clone();
+                                    let channel_filter = channel_filter.clone();
+                                    let thread_channels = Arc::clone(&self.thread_channels);
+                                    let pending = Arc::clone(&self.pending_interactions);
+                                    let pending_components = Arc::clone(&self.pending_components);
+                                    let alias = self.alias.clone();
+                                    let tx = tx.clone();
+
+                                    zeroclaw_spawn::spawn!(async move {
+                                        // Cheap peer check first (parity with
+                                        // type-2): an unauthorized invoker must
+                                        // not be able to drive the authenticated
+                                        // thread-lookup REST call.
+                                        // interaction_gate re-checks fail-closed.
+                                        if !crate::allowlist::is_user_allowed(
+                                            &peers,
+                                            &user_id,
+                                            crate::allowlist::Match::Sensitive,
+                                        ) {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": "UnauthorizedUser"})), "rejecting unauthorized component interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+                                        let parent_id = if !channel_filter.is_empty()
+                                            && !interaction_channel.is_empty()
+                                            && !channel_filter.iter().any(|c| c == &interaction_channel)
+                                        {
+                                            discord_thread_parent(
+                                                &client,
+                                                &bot_token,
+                                                &thread_channels,
+                                                &interaction_channel,
+                                            )
+                                            .await
+                                        } else {
+                                            None
+                                        };
+                                        if let Err(denial) = interaction_gate(
+                                            &peers,
+                                            &guild_filter,
+                                            &channel_filter,
+                                            &user_id,
+                                            interaction_guild.as_deref(),
+                                            &interaction_channel,
+                                            parent_id.as_deref(),
+                                        ) {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": format!("{denial:?}")})), "rejecting unauthorized component interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Single-use: drain the intent bound to
+                                        // this custom_id. Absent/expired/replayed
+                                        // (incl. a forged-but-zc1 id we never
+                                        // registered) → refuse, don't act.
+                                        let intent = pending_components.lock().take(&custom_id_raw);
+                                        let Some(ComponentIntent::ResolveIntoTurn { prompt }) = intent else {
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-component-expired",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord component expired-notice failed");
+                                            }
+                                            return;
+                                        };
+
+                                        // Stash creds before the defer so a fast
+                                        // reply can't race an absent entry.
+                                        {
+                                            let mut guard = pending.lock();
+                                            guard.retain(|_, p| {
+                                                p.created.elapsed() < INTERACTION_TOKEN_TTL
+                                            });
+                                            guard.insert(
+                                                interaction_id.clone(),
+                                                PendingInteraction {
+                                                    app_id: app_id.clone(),
+                                                    token: interaction_token.clone(),
+                                                    created: std::time::Instant::now(),
+                                                },
+                                            );
+                                        }
+                                        if let Err(e) = discord_defer_interaction(&client, &interaction_id, &interaction_token).await {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord component defer failed");
+                                            pending.lock().remove(&interaction_id);
+                                            return;
+                                        }
+
+                                        // Resolve-into-turn: the registered
+                                        // intent drives an agent turn, answered
+                                        // through the interaction followup.
+                                        let channel_msg = ChannelMessage {
+                                            id: format!("discord_interaction_{interaction_id}"),
+                                            sender: user_id,
+                                            reply_target: discord_interaction_reply_target(&interaction_id),
+                                            content: prompt,
+                                            channel: "discord".to_string(),
+                                            channel_alias: Some(alias),
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs(),
+                                            interruption_scope_id: None,
+                                            thread_ts: None,
+                                            attachments: Vec::new(),
+                                            subject: None,
+                                        };
+                                        if tx.send(channel_msg).await.is_err() {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping component prompt");
                                         }
                                     });
                                 }

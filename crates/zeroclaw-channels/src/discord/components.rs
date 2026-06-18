@@ -13,7 +13,7 @@
 // builders/variants have no in-crate use outside tests — lifted per phase.
 #![allow(dead_code)]
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::custom_id::CustomId;
 
@@ -289,7 +289,11 @@ mod tests {
     #[test]
     fn button_row_serializes_to_discord_shape() {
         let row = action_row(vec![
-            button(ButtonStyle::Success, "Approve", CustomId::new("approve", "i1")),
+            button(
+                ButtonStyle::Success,
+                "Approve",
+                CustomId::new("approve", "i1"),
+            ),
             button(ButtonStyle::Danger, "Deny", CustomId::new("deny", "i1")),
         ]);
         let api = row.to_api().unwrap();
@@ -334,14 +338,23 @@ mod tests {
         let api = row.to_api().unwrap();
         assert_eq!(api["components"][0]["type"], json!(3));
         assert_eq!(api["components"][0]["placeholder"], json!("Choose"));
-        assert_eq!(api["components"][0]["options"][0]["description"], json!("first"));
+        assert_eq!(
+            api["components"][0]["options"][0]["description"],
+            json!("first")
+        );
     }
 
     #[test]
     fn button_row_truncates_past_five() {
         let row = action_row(
             (0..7)
-                .map(|i| button(ButtonStyle::Secondary, format!("b{i}"), CustomId::new("k", i.to_string())))
+                .map(|i| {
+                    button(
+                        ButtonStyle::Secondary,
+                        format!("b{i}"),
+                        CustomId::new("k", i.to_string()),
+                    )
+                })
                 .collect(),
         );
         assert_eq!(row.components.len(), 5);
@@ -357,7 +370,11 @@ mod tests {
         // A custom_id whose arg blows the 100-char limit drops just that button.
         let row = action_row(vec![
             button(ButtonStyle::Primary, "ok", CustomId::new("k", "y")),
-            button(ButtonStyle::Primary, "bad", CustomId::new("k", "x".repeat(200))),
+            button(
+                ButtonStyle::Primary,
+                "bad",
+                CustomId::new("k", "x".repeat(200)),
+            ),
         ]);
         let api = row.to_api().unwrap();
         assert_eq!(api["components"].as_array().unwrap().len(), 1);
