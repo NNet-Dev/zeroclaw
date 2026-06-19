@@ -7,7 +7,7 @@
 use serde_json::json;
 
 use super::embed::DiscordEmbed;
-use super::types::{DISCORD_MAX_MESSAGE_LENGTH, DiscordOutgoing};
+use super::types::DiscordOutgoing;
 
 /// Credentials needed to answer a deferred interaction later: the followup
 /// webhook is addressed by application id + interaction token.
@@ -101,12 +101,14 @@ pub(crate) async fn discord_reject_interaction(
     Ok(())
 }
 
-/// Deliver the agent's answer by editing the deferred interaction response
+/// Edit the deferred interaction's @original message
 /// (`PATCH {api_base}/webhooks/{app_id}/{token}/messages/@original`). The token
 /// is valid for 15 minutes; no bot auth header is required for the followup
-/// webhook. Renders any `[EMBED:…]` the agent emitted: `embeds` is attached
-/// alongside the (2000-char-capped) content via the same `DiscordOutgoing`
-/// envelope the normal send path uses. `api_base` is injectable for tests.
+/// webhook. Renders any `[EMBED:…]` the agent emitted by attaching `embeds`
+/// alongside the content via the same `DiscordOutgoing` envelope the normal send
+/// path uses. `content` must be within Discord's 2000-char limit — callers whose
+/// reply may exceed it chunk first and post the remainder via
+/// [`discord_post_interaction_followup`]. `api_base` is injectable for tests.
 pub(crate) async fn discord_edit_interaction_response(
     client: &reqwest::Client,
     app_id: &str,
@@ -116,20 +118,10 @@ pub(crate) async fn discord_edit_interaction_response(
     embeds: &[DiscordEmbed],
 ) -> anyhow::Result<()> {
     let url = format!("{api_base}/webhooks/{app_id}/{interaction_token}/messages/@original");
-    let trimmed: String = content.chars().take(DISCORD_MAX_MESSAGE_LENGTH).collect();
-    if trimmed.chars().count() < content.chars().count() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "content_chars": content.chars().count(),
-                })),
-            "interaction reply truncated to Discord's 2000-char limit (chunked followups are a planned follow-up)"
-        );
-    }
+    // No truncation: the caller chunks (deliver_interaction_answer) and this edit
+    // carries the first ≤2000-char chunk plus any embeds.
     let payload = DiscordOutgoing {
-        content: Some(trimmed),
+        content: Some(content.to_string()),
         embeds: embeds.to_vec(),
         ..Default::default()
     };
@@ -144,6 +136,31 @@ pub(crate) async fn discord_edit_interaction_response(
         let status = resp.status();
         let err = resp.text().await.unwrap_or_default();
         anyhow::bail!("interaction followup edit failed ({status}): {err}");
+    }
+    Ok(())
+}
+
+/// Post an additional interaction followup message
+/// (`POST {api_base}/webhooks/{app_id}/{token}`), used to deliver the answer
+/// chunks beyond the first when a reply exceeds Discord's 2000-char limit.
+pub(crate) async fn discord_post_interaction_followup(
+    client: &reqwest::Client,
+    app_id: &str,
+    interaction_token: &str,
+    api_base: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let url = format!("{api_base}/webhooks/{app_id}/{interaction_token}");
+    let resp = client
+        .post(&url)
+        .json(&DiscordOutgoing::text(content).to_rest_json())
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("interaction followup post failed ({status}): {err}");
     }
     Ok(())
 }

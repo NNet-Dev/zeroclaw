@@ -10195,8 +10195,37 @@ pub struct RiskProfileConfig {
     /// authorization constraint. Authorization decision: which tools is
     /// the agent permitted to invoke at all. See `excluded_tools` for
     /// the inverse denylist scoped to non-CLI channels.
+    ///
+    /// The TOML config does not distinguish an omitted field from
+    /// `allowed_tools = []`; both deserialize to `Vec::new()` and
+    /// `SecurityPolicy::from_profiles` maps that to "no authorization
+    /// constraint" at this layer. If you need an explicit deny-all gate,
+    /// apply it on the caller-supplied per-run `allowed_tools` (cron
+    /// jobs and other narrowers pass that list in directly to
+    /// `ToolAccessPolicy`, which honors `Some(vec![])` as deny-all) or
+    /// via `excluded_tools` covering the specific tools you want blocked.
+    ///
+    /// MCP exception: when the list is non-empty, runtime-discovered MCP
+    /// tools (any name containing `__`, which is the `<server>__<tool>`
+    /// convention used by the MCP wrapper) are auto-admitted into the
+    /// effective allow-list without needing to be listed here individually.
+    /// This keeps the post-#7464 eager-MCP default usable for agents with an
+    /// explicit allow-list. Block individual MCP tools via `excluded_tools`.
+    ///
+    /// Scope of the exception: the `__` auto-admit applies only to this
+    /// risk-profile allow-list, **not** to caller-supplied per-run
+    /// `allowed_tools` (cron job `allowed_tools`, narrowed delegate
+    /// invocations, etc.). Per-run lists are still strict explicit-list
+    /// intersections, so a job that narrows `allowed_tools = ["cron_add"]`
+    /// will not see runtime-discovered MCP tools unless it names them.
+    /// See PR #7547 review for the rationale.
     pub allowed_tools: Vec<String>,
     /// Tools excluded from non-CLI channels under this profile.
+    ///
+    /// Also subtracts from the agentic-delegate allow-list resolved at
+    /// runtime, which is the only way to block individual
+    /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
+    /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.
@@ -11661,6 +11690,82 @@ impl ChannelsConfig {
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
             || self.amqp.values().any(|c| c.enabled)
+    }
+
+    /// One `(canonical_name, configured, deliverable)` row per channel in the
+    /// registry. Single source for name-addressed channel lookups so no surface
+    /// has to hardcode a subset of the channel list. `deliverable` is `false`
+    /// for input-only transports whose `Channel::send` is a no-op (mqtt and
+    /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
+    /// outbound surface such as `heartbeat.target` can refuse them at validation
+    /// instead of accepting a target the delivery layer silently drops.
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 34] {
+        [
+            ("telegram", !self.telegram.is_empty(), true),
+            ("discord", !self.discord.is_empty(), true),
+            ("slack", !self.slack.is_empty(), true),
+            ("mattermost", !self.mattermost.is_empty(), true),
+            ("webhook", !self.webhook.is_empty(), true),
+            ("imessage", !self.imessage.is_empty(), true),
+            ("matrix", !self.matrix.is_empty(), true),
+            ("signal", !self.signal.is_empty(), true),
+            ("whatsapp", !self.whatsapp.is_empty(), true),
+            ("linq", !self.linq.is_empty(), true),
+            ("wati", !self.wati.is_empty(), true),
+            ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
+            ("email", !self.email.is_empty(), true),
+            ("gmail_push", !self.gmail_push.is_empty(), true),
+            ("irc", !self.irc.is_empty(), true),
+            ("twitch", !self.twitch.is_empty(), true),
+            ("lark", !self.lark.is_empty(), true),
+            ("line", !self.line.is_empty(), true),
+            ("dingtalk", !self.dingtalk.is_empty(), true),
+            ("wecom", !self.wecom.is_empty(), true),
+            ("wecom_ws", !self.wecom_ws.is_empty(), true),
+            ("wechat", !self.wechat.is_empty(), true),
+            ("qq", !self.qq.is_empty(), true),
+            ("twitter", !self.twitter.is_empty(), true),
+            ("mochat", !self.mochat.is_empty(), true),
+            ("nostr", !self.nostr.is_empty(), true),
+            ("clawdtalk", !self.clawdtalk.is_empty(), true),
+            ("reddit", !self.reddit.is_empty(), true),
+            ("bluesky", !self.bluesky.is_empty(), true),
+            ("voice_call", !self.voice_call.is_empty(), true),
+            ("voice_wake", !self.voice_wake.is_empty(), false),
+            ("voice_duplex", !self.voice_duplex.is_empty(), false),
+            ("mqtt", !self.mqtt.is_empty(), false),
+            ("amqp", !self.amqp.is_empty(), false),
+        ]
+    }
+
+    /// Whether a channel named `name` (case-insensitive) is a known channel
+    /// with at least one configured instance. Used by name-addressed surfaces
+    /// (e.g. `heartbeat.target`) without hardcoding a subset of the registry.
+    pub fn is_channel_configured(&self, name: &str) -> bool {
+        let needle = name.to_ascii_lowercase();
+        self.channel_presence()
+            .iter()
+            .any(|(canonical, configured, _)| *configured && *canonical == needle)
+    }
+
+    /// Whether `name` (case-insensitive) names a channel in the registry,
+    /// regardless of whether it is configured.
+    pub fn is_known_channel(&self, name: &str) -> bool {
+        let needle = name.to_ascii_lowercase();
+        self.channel_presence()
+            .iter()
+            .any(|(canonical, _, _)| *canonical == needle)
+    }
+
+    /// Whether `name` (case-insensitive) names a channel that can actually
+    /// deliver an outbound message. Input-only transports (mqtt, amqp,
+    /// voice_wake) are known and may be configured, but their `Channel::send`
+    /// is a no-op, so they are not valid outbound targets.
+    pub fn is_channel_deliverable(&self, name: &str) -> bool {
+        let needle = name.to_ascii_lowercase();
+        self.channel_presence()
+            .iter()
+            .any(|(canonical, _, deliverable)| *deliverable && *canonical == needle)
     }
 }
 
@@ -13508,6 +13613,13 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub per_user_session: bool,
+
+    /// Override for the top-level `ack_reactions` setting. When `None`, the
+    /// channel falls back to `[channels].ack_reactions`. When set
+    /// explicitly, it takes precedence.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub ack_reactions: Option<bool>,
 
     /// Streaming mode for the LLM response: `off` (default) routes every
     /// response through `send()`; `partial` opens a Feishu interactive
@@ -20932,6 +21044,7 @@ default_temperature = 0.7
                 excluded_tools: vec![],
                 approval_timeout_secs: 300,
                 per_user_session: false,
+                ack_reactions: None,
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
             },
@@ -23273,6 +23386,7 @@ default_model = "legacy-model"
                 excluded_tools: vec![],
                 approval_timeout_secs: 300,
                 per_user_session: false,
+                ack_reactions: None,
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
             },
@@ -23840,6 +23954,7 @@ api_token = "tok"
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
         };
@@ -23868,6 +23983,7 @@ api_token = "tok"
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
         };
@@ -29017,6 +29133,26 @@ model_provider = \"ollama.default\"
         let agent = cfg.agents.get("legacy").expect("agent present");
         assert!(agent.delegate_same_risk_profile, "default must be true");
         assert!(agent.delegates.is_empty(), "default must be empty");
+    }
+
+    #[test]
+    async fn channel_presence_names_are_unique_and_undeliverable_set_is_fixed() {
+        let presence = ChannelsConfig::default().channel_presence();
+        let mut seen = std::collections::HashSet::new();
+        for (name, _, _) in presence {
+            assert!(seen.insert(name), "duplicate channel_presence name: {name}");
+        }
+        let mut undeliverable: Vec<&str> = presence
+            .iter()
+            .filter(|(_, _, deliverable)| !*deliverable)
+            .map(|(name, _, _)| *name)
+            .collect();
+        undeliverable.sort_unstable();
+        assert_eq!(
+            undeliverable,
+            ["amqp", "mqtt", "voice_duplex", "voice_wake"],
+            "only input-only transports may be non-deliverable; update channel_presence and is_channel_deliverable together"
+        );
     }
 
     // ── Serde-default vs struct-Default drift guards ──────────────
