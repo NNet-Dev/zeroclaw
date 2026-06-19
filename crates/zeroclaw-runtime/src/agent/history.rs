@@ -230,15 +230,15 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
 /// Tools whose output merely *lists* or *quotes* local filesystem paths
 /// (search hits, glob matches) rather than presenting an image as visual
 /// content. Their incidental image-file paths must NOT be auto-promoted to
-/// `[IMAGE:…]` markers: the agent loop counts the current iteration's
+/// `[IMAGE:...]` markers: the agent loop counts the current iteration's
 /// tool-result markers (`multimodal::count_image_markers`) when deciding
 /// whether to switch to a vision provider, so a path echo here falsely
-/// triggers vision routing — producing a provider-capability error on a
+/// triggers vision routing - producing a provider-capability error on a
 /// text-only provider. See PR #7345.
 ///
-/// This is a denylist (default-allow): any other tool — including ones that
+/// This is a denylist (default-allow): any other tool - including ones that
 /// genuinely *generate* or *fetch* an image and print its path (e.g.
-/// `image_gen`, `file_download`) — keeps canonicalization, so real
+/// `image_gen`, `file_download`) - keeps canonicalization, so real
 /// tool-produced images still route to a configured vision provider.
 fn is_path_listing_tool(tool_name: &str) -> bool {
     matches!(
@@ -250,7 +250,7 @@ fn is_path_listing_tool(tool_name: &str) -> bool {
 /// Provenance-aware wrapper around [`canonicalize_tool_result_media_markers`].
 ///
 /// Returns the output unchanged for path-listing tools ([`is_path_listing_tool`])
-/// so their incidental image paths never become routable `[IMAGE:…]` markers;
+/// so their incidental image paths never become routable `[IMAGE:...]` markers;
 /// all other tools are canonicalized exactly as before.
 pub fn canonicalize_tool_result_media_markers_for(tool_name: &str, output: &str) -> String {
     if is_path_listing_tool(tool_name) {
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn canonicalize_for_skips_path_listing_tools() {
         // A search/listing tool that surfaces a real image path must be left
-        // untouched — promoting it to [IMAGE:…] would falsely trigger vision
+        // untouched - promoting it to [IMAGE:...] would falsely trigger vision
         // routing (PR #7345).
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("hit.png");
