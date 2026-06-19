@@ -346,7 +346,39 @@ impl SopRunStore for InMemoryRunStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sop::types::{SopEvent, SopRun, SopRunStatus, SopTriggerSource};
     use serde_json::json;
+
+    /// Build a `PersistedRun` at a given revision and completion timestamp.
+    fn run(id: &str, revision: u64, completed_at: Option<&str>) -> PersistedRun {
+        let started_at = "2020-01-01T00:00:00Z".to_string();
+        let sop_run = SopRun {
+            run_id: id.to_string(),
+            sop_name: "deploy".to_string(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: started_at.clone(),
+            },
+            status: SopRunStatus::Running,
+            current_step: 0,
+            total_steps: 1,
+            started_at: started_at.clone(),
+            completed_at: completed_at.map(|s| s.to_string()),
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+        };
+        PersistedRun {
+            version: SOP_STORE_VERSION,
+            revision,
+            run: sop_run,
+            last_progress_at: started_at,
+            redacted: false,
+            trigger_source: SopTriggerSource::Manual,
+        }
+    }
 
     fn ev(run: &str, kind: &str) -> SopEventRecord {
         SopEventRecord {
@@ -428,5 +460,96 @@ mod tests {
             1
         );
         assert_eq!(s.backend(), "in-memory");
+    }
+
+    #[test]
+    fn save_run_rejects_stale_revision_but_accepts_same_or_newer() {
+        let s = build_run_store();
+        s.save_run(&run("r1", 5, None)).unwrap();
+        // A lower revision loses the race.
+        let err = s.save_run(&run("r1", 4, None)).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::StaleRevision {
+                have: 4,
+                found: 5,
+                ..
+            }
+        ));
+        // The stored revision is unchanged after the rejected write.
+        assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 5);
+        // Same revision is idempotent (last-writer guard allows ==).
+        s.save_run(&run("r1", 5, None)).unwrap();
+        // A newer revision wins.
+        s.save_run(&run("r1", 6, None)).unwrap();
+        assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 6);
+    }
+
+    #[test]
+    fn finish_run_marks_terminal_and_releases_claim() {
+        let s = build_run_store();
+        s.save_run(&run("r1", 0, None)).unwrap();
+        let tok = s.try_claim_run("r1", "deploy", 4).unwrap().unwrap();
+        assert!(
+            s.load_active_runs()
+                .unwrap()
+                .iter()
+                .any(|r| r.run_id() == "r1")
+        );
+
+        s.finish_run("r1", &run("r1", 1, Some("2020-01-02T00:00:00Z")))
+            .unwrap();
+
+        // No longer reported as active...
+        assert!(s.load_active_runs().unwrap().is_empty());
+        // ...but still loadable as a terminal record.
+        assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 1);
+        // ...and its claim slot was freed.
+        assert!(s.try_claim_run("r1b", "deploy", 1).unwrap().is_some());
+        // A terminal run is not re-claimable even after its claim was released.
+        assert!(s.try_claim_run("r1", "deploy", 4).unwrap().is_none());
+        // release_claim on the old token is a no-op (slot already freed).
+        s.release_claim(&tok).unwrap();
+    }
+
+    #[test]
+    fn prune_evicts_oldest_terminal_runs_first() {
+        let s = build_run_store();
+        // Three terminal runs with ascending completion timestamps.
+        for (id, ts) in [
+            ("old", "2020-01-01T00:00:00Z"),
+            ("mid", "2020-02-01T00:00:00Z"),
+            ("new", "2020-03-01T00:00:00Z"),
+        ] {
+            s.finish_run(id, &run(id, 1, Some(ts))).unwrap();
+        }
+        let dropped = s
+            .prune(&RetentionPolicy {
+                max_terminal: 2,
+                keep_secs: None,
+            })
+            .unwrap();
+        assert_eq!(dropped, 1);
+        // The oldest was evicted; the two newest survive.
+        assert!(s.load_run("old").unwrap().is_none());
+        assert!(s.load_run("mid").unwrap().is_some());
+        assert!(s.load_run("new").unwrap().is_some());
+        // A no-op prune (under cap) drops nothing.
+        assert_eq!(
+            s.prune(&RetentionPolicy {
+                max_terminal: 100,
+                keep_secs: None,
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn expired_claims_skips_empty_leases_and_matches_past_due() {
+        let s = build_run_store();
+        // The in-memory backend stamps empty leases — those are never expired.
+        s.try_claim_run("r1", "deploy", 4).unwrap().unwrap();
+        assert!(s.expired_claims("2999-01-01T00:00:00Z").unwrap().is_empty());
     }
 }
