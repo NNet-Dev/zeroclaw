@@ -402,7 +402,16 @@ fn localizations_object(entries: &[(&str, &str)]) -> Option<serde_json::Value> {
     }
     let map: serde_json::Map<String, serde_json::Value> = entries
         .iter()
-        .map(|(loc, text)| ((*loc).to_string(), json!(text)))
+        // Clamp to Discord's 100-char description limit, as the skill-authored
+        // path does (`valid_discord_localizations`): a built-in translation that
+        // ever exceeds it would otherwise 400 the registration and wedge the
+        // reconcile in a retry loop.
+        .map(|(loc, text)| {
+            (
+                (*loc).to_string(),
+                json!(text.chars().take(100).collect::<String>()),
+            )
+        })
         .collect();
     Some(serde_json::Value::Object(map))
 }
@@ -640,7 +649,21 @@ async fn reap_all_owned_commands(
         );
         return Ok(ReconcileOutcome::Reconciled);
     }
-    let existing: Vec<serde_json::Value> = resp.json().await?;
+    // Best-effort: a malformed listing body must not abort the (more important)
+    // active-scope reconcile — log and skip cross-scope cleanup, as for a failed
+    // listing status above.
+    let existing: Vec<serde_json::Value> = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"err": e.without_url().to_string()})),
+                "inactive-scope command listing returned an unparseable body; skipping cross-scope cleanup"
+            );
+            return Ok(ReconcileOutcome::Reconciled);
+        }
+    };
     for cmd in &existing {
         let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
         // Only reap a `/ask` that is *ours* — one whose projection matches the
@@ -717,7 +740,8 @@ async fn reconcile_one_endpoint(
     if !resp.status().is_success() {
         anyhow::bail!("listing commands failed ({})", resp.status());
     }
-    let existing: Vec<serde_json::Value> = resp.json().await?;
+    let existing: Vec<serde_json::Value> =
+        resp.json().await.map_err(reqwest::Error::without_url)?;
     for cmd in &existing {
         let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
         if name == "ask" || desired_names.contains(name) || !is_skill_command_shape(cmd) {

@@ -12079,7 +12079,10 @@ pub struct DiscordConfig {
     /// Scope for registered slash commands: `global` (default, application-wide,
     /// ~1h propagation) or `guild` (registered to each `guild_ids` entry,
     /// instant). Only meaningful when `slash_commands = true`; `guild` with an
-    /// empty `guild_ids` warns and falls back to global.
+    /// empty `guild_ids` warns and falls back to global. Switching scope reaps
+    /// owned commands from the now-inactive scope; note that *removing* a guild
+    /// from `guild_ids` (without switching scope) does not reap that guild's
+    /// commands — remove the bot from the guild, or switch scope, to clear them.
     #[tab(Behavior)]
     #[serde(default)]
     pub slash_command_scope: SlashCommandScope,
