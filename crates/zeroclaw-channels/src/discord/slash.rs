@@ -363,10 +363,10 @@ pub(crate) const SKILL_COMMAND_OPTION_DESCRIPTION: &str = "What to send to the s
 
 /// Compiled-in Discord-locale translations for the channel's own built-in
 /// command/option descriptions. Compiled in (rather than sourced from the i18n
-/// FTL machinery) because that machinery only compiles in `en`/`zh-CN` — es/fr/ja
+/// FTL machinery) because that machinery only compiles in `en`/`zh-CN` - es/fr/ja
 /// load from a runtime locale dir that may not be deployed, so a stock binary
 /// would silently drop them. `en` is the default (the literal description) and
-/// is omitted. Initial translations — open to native-speaker refinement; skill
+/// is omitted. Initial translations - open to native-speaker refinement; skill
 /// authors localize their own commands via the skill manifest.
 mod builtin_localizations {
     /// `/ask` command description ("Ask the agent a question").
@@ -463,7 +463,7 @@ pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
         "description": cmd.get("description").cloned().unwrap_or_default(),
         // Localizations participate in change detection (with the GET's
         // `with_localizations=true`): Discord echoes `null` when none, which
-        // equals our omitted key — so un-localized commands stay a no-op while
+        // equals our omitted key - so un-localized commands stay a no-op while
         // a translation change forces exactly one re-registration.
         "description_localizations": cmd
             .get("description_localizations")
@@ -615,7 +615,7 @@ pub(crate) async fn reconcile_slash_commands(
 }
 
 /// Reap every command this channel owns (`/ask` + skill-shaped) from an
-/// endpoint without upserting — used to clear the inactive scope after a
+/// endpoint without upserting - used to clear the inactive scope after a
 /// `slash_command_scope` switch. Best-effort: a failed listing (e.g. the bot
 /// lacks `applications.commands` in a guild it has left) is logged and skipped,
 /// never fatal to the active-scope reconcile.
@@ -650,7 +650,7 @@ async fn reap_all_owned_commands(
         return Ok(ReconcileOutcome::Reconciled);
     }
     // Best-effort: a malformed listing body must not abort the (more important)
-    // active-scope reconcile — log and skip cross-scope cleanup, as for a failed
+    // active-scope reconcile - log and skip cross-scope cleanup, as for a failed
     // listing status above.
     let existing: Vec<serde_json::Value> = match resp.json().await {
         Ok(v) => v,
@@ -666,7 +666,7 @@ async fn reap_all_owned_commands(
     };
     for cmd in &existing {
         let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        // Only reap a `/ask` that is *ours* — one whose projection matches the
+        // Only reap a `/ask` that is *ours* - one whose projection matches the
         // `/ask` we register (#7922). Deleting by name alone would reap a `/ask`
         // registered by other tooling that happens to share the inactive scope.
         // Skill commands keep their own shape-based ownership marker.

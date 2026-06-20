@@ -4668,7 +4668,7 @@ mod tests {
         let server = MockServer::start().await;
         // Derive the stale `/ask` from what we register (incl. its
         // `description_localizations`, which the reaper's listing requests via
-        // `with_localizations=true`) plus a server-side id — so its projection
+        // `with_localizations=true`) plus a server-side id - so its projection
         // matches ours and the ownership check reaps it (#7922).
         let mut stale_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
         stale_ask["id"] = serde_json::json!("a1");
@@ -4722,7 +4722,7 @@ mod tests {
     #[tokio::test]
     async fn scope_switch_spares_foreign_ask_in_inactive_scope() {
         // A `/ask` registered by OTHER tooling (different description) on the
-        // now-inactive global scope must NOT be reaped on a scope switch — we
+        // now-inactive global scope must NOT be reaped on a scope switch - we
         // only delete the `/ask` whose projection matches what we register
         // (#7922). Our own skill command on that scope is still reaped.
         use wiremock::matchers::{method, path};
@@ -4793,7 +4793,7 @@ mod tests {
         let server = MockServer::start().await;
         // Echo back exactly what we'd register for `/ask` (incl. its
         // `description_localizations`, which the GET requests via
-        // `with_localizations=true`) plus a server-side id — so the projection
+        // `with_localizations=true`) plus a server-side id - so the projection
         // matches and no upsert fires. Deriving it keeps the test agnostic to
         // the built-in translation table.
         let mut existing_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
@@ -7757,6 +7757,7 @@ mod tests {
         let mut opt = slash_options::OptionSpec {
             name: option.to_string(),
             description: "o".to_string(),
+            description_localizations: Default::default(),
             kind: slash_options::OptKind::String,
             required: false,
             choices: Vec::new(),
@@ -7776,6 +7777,7 @@ mod tests {
             skill_name: "deploy".to_string(),
             slug: slug.to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             options: vec![opt],
         }
     }

@@ -11849,7 +11849,7 @@ pub enum StreamMode {
 }
 
 /// Where a channel registers its skill slash commands. `global` (default)
-/// registers application-wide — the commands work everywhere the bot is, but
+/// registers application-wide - the commands work everywhere the bot is, but
 /// Discord takes up to ~1h to propagate changes. `guild` registers to each
 /// guild in `guild_ids`, which propagates instantly (the right choice for fast
 /// iteration and single-server bots). When `guild` is set with an empty
@@ -12082,7 +12082,7 @@ pub struct DiscordConfig {
     /// empty `guild_ids` warns and falls back to global. Switching scope reaps
     /// owned commands from the now-inactive scope; note that *removing* a guild
     /// from `guild_ids` (without switching scope) does not reap that guild's
-    /// commands — remove the bot from the guild, or switch scope, to clear them.
+    /// commands - remove the bot from the guild, or switch scope, to clear them.
     #[tab(Behavior)]
     #[serde(default)]
     pub slash_command_scope: SlashCommandScope,
