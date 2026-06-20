@@ -476,7 +476,7 @@ function isRequiredField(typeHint: string): boolean {
 // server-side `validate_mcp_config` contract here so the badge + empty hint
 // follow the chosen transport instead of the type. Returns null for any field
 // that isn't one of these two transport-gated leaves (transport itself, args,
-// headers, …), leaving the generic `Option<…>` rule in charge.
+// headers, ...), leaving the generic `Option<...>` rule in charge.
 function mcpFieldRequired(
   path: string,
   transport: string | null | undefined,
@@ -549,7 +549,7 @@ function validationHint(
   }
 
   // MCP transport-gated fields own their own required decision (command-for-
-  // stdio / url-for-http-sse), overriding the generic Option<…> rule — `url` is
+  // stdio / url-for-http-sse), overriding the generic Option<...> rule - `url` is
   // optional at the type level yet client-required under http/sse, and `command`
   // is type-required yet optional under http/sse.
   const mcpRequired = mcpFieldRequired(entry.path, mcpTransport);
