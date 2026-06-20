@@ -1548,6 +1548,8 @@ mod tests {
         config.channels.discord.insert(
             "clamps".to_string(),
             zeroclaw_config::schema::DiscordConfig {
+                voice_enabled: false,
+                voice_channels: std::collections::HashMap::new(),
                 enabled: false,
                 bot_token: "token".into(),
                 guild_ids: vec![],
@@ -1573,6 +1575,8 @@ mod tests {
         config.channels.discord.insert(
             "glados".to_string(),
             zeroclaw_config::schema::DiscordConfig {
+                voice_enabled: false,
+                voice_channels: std::collections::HashMap::new(),
                 enabled: false,
                 bot_token: "token2".into(),
                 guild_ids: vec![],

@@ -12057,6 +12057,21 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub slash_commands: bool,
+    /// When true, the bot also speaks its text replies into a Discord voice
+    /// channel (outbound text-to-speech), for guilds listed in `voice_channels`.
+    /// Requires a TTS provider configured for the agent and the
+    /// `channel-discord-voice` build feature. Off by default. Inbound voice
+    /// (listening / transcription) is not handled by this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub voice_enabled: bool,
+    /// Per-guild target voice channel for spoken replies: guild id → voice
+    /// channel id. v1 is config-driven (no auto-discovery of the speaker's
+    /// current voice channel). A message from a guild not in this map is not
+    /// spoken even when `voice_enabled` is true.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub voice_channels: HashMap<String, String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -21420,6 +21435,8 @@ default_temperature = 0.7
     #[test]
     async fn discord_config_serde() {
         let dc = DiscordConfig {
+            voice_enabled: false,
+            voice_channels: std::collections::HashMap::new(),
             enabled: true,
             bot_token: "discord-token".into(),
             guild_ids: vec!["12345".into()],
@@ -21450,6 +21467,8 @@ default_temperature = 0.7
     #[test]
     async fn discord_config_empty_guild_ids() {
         let dc = DiscordConfig {
+            voice_enabled: false,
+            voice_channels: std::collections::HashMap::new(),
             enabled: true,
             bot_token: "tok".into(),
             guild_ids: Vec::new(),

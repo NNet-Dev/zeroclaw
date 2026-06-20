@@ -108,6 +108,8 @@ mod tests {
         };
 
         let discord = DiscordConfig {
+            voice_enabled: false,
+            voice_channels: std::collections::HashMap::new(),
             enabled: true,
             bot_token: "token".into(),
             guild_ids: vec!["123".into()],

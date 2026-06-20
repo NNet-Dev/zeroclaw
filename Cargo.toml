@@ -339,6 +339,10 @@ channel-lark = ["zeroclaw-channels/channel-lark"]
 channel-nostr = ["zeroclaw-channels/channel-nostr", "dep:nostr-sdk"]
 channel-matrix = ["zeroclaw-channels/channel-matrix"]
 channel-discord = ["zeroclaw-channels/channel-discord"]
+# Outbound voice (speak replies into a Discord voice channel). Opt-in; pulls
+# libopus + the voice-packet AEAD, so it is deliberately NOT in default-channels,
+# channels-full, or the 32-bit CI feature set.
+channel-discord-voice = ["channel-discord", "zeroclaw-channels/channel-discord-voice"]
 channel-slack = ["zeroclaw-channels/channel-slack"]
 channel-signal = ["zeroclaw-channels/channel-signal"]
 channel-mattermost = ["zeroclaw-channels/channel-mattermost"]

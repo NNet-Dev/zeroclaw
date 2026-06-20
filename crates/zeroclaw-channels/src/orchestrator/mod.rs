@@ -7058,6 +7058,34 @@ fn collect_configured_channels(
         .with_slash_commands(dc.slash_commands)
         .with_intents_mask(dc.intents_mask)
         .with_reaction_notifications(dc.reaction_notifications);
+        // Outbound voice: when enabled and a target VC is configured, build the
+        // agent's TTS pipeline and wire it so replies are spoken into the
+        // configured voice channel. Requires the `channel-discord-voice` build.
+        #[cfg(feature = "channel-discord-voice")]
+        if dc.voice_enabled && !dc.voice_channels.is_empty() {
+            // Bind TTS to the agent that OWNS this discord channel (oracle,
+            // herald, ...) so voice speaks with that agent's `tts_provider` -
+            // not the ambiguous runtime-active agent that `None` resolves to
+            // in a multi-agent daemon (which would mis-bind or fail loud).
+            let owning_agent = config.agent_for_channel(&format!("discord.{alias}"));
+            match crate::voice::VoicePipeline::from_config_for_agent(&config, owning_agent) {
+                Ok(pipeline) => {
+                    discord_ch = discord_ch
+                        .with_voice(std::sync::Arc::new(pipeline), dc.voice_channels.clone());
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({ "error": e.to_string(), "alias": alias })
+                            ),
+                        "discord voice_enabled but TTS pipeline init failed; voice disabled"
+                    );
+                }
+            }
+        }
         if dc.slash_commands {
             // Skill-derived commands: resolved from canonical state at
             // READY/interaction time (no cache), scoped to the agent that

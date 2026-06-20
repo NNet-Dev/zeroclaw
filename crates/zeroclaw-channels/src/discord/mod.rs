@@ -52,6 +52,9 @@ mod markers;
 pub(crate) use markers::*;
 
 mod rest;
+
+// Outbound voice (TTS into a voice channel) - gated by `channel-discord-voice`.
+mod voice;
 pub(crate) use rest::*;
 
 mod interaction;
@@ -149,6 +152,11 @@ pub struct DiscordChannel {
     /// Resolves skill-derived commands to register alongside `/ask`.
     /// `None` (or an empty resolution) = `/ask` only.
     slash_command_resolver: Option<DiscordSlashCommandResolver>,
+    /// Outbound voice: speak text replies into a configured voice channel.
+    /// `Some` only when `voice_enabled` and a TTS-capable pipeline is wired
+    /// (build feature `channel-discord-voice`).
+    #[cfg(feature = "channel-discord-voice")]
+    voice: Option<voice::VoiceState>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -156,6 +164,16 @@ struct DiscordGatewaySession {
     session_id: Option<String>,
     resume_gateway_url: Option<String>,
     sequence: Option<i64>,
+}
+
+/// Await the next pre-rendered opcode-4 voice command, or pend forever when the
+/// voice command channel is absent - lets `listen()`'s `select!` include the
+/// voice arm unconditionally (non-voice builds simply never resolve it).
+async fn recv_voice_cmd(rx: &mut Option<tokio::sync::mpsc::Receiver<String>>) -> Option<String> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl DiscordChannel {
@@ -198,7 +216,24 @@ impl DiscordChannel {
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
             pending_components: Arc::new(Mutex::new(pending::PendingComponents::default())),
             slash_command_resolver: None,
+            #[cfg(feature = "channel-discord-voice")]
+            voice: None,
         }
+    }
+
+    /// Enable outbound voice: speak text replies via `pipeline` into the voice
+    /// channel configured for each guild in `voice_channels` (guild id → voice
+    /// channel id). A no-op unless the build includes `channel-discord-voice`.
+    #[cfg(feature = "channel-discord-voice")]
+    pub fn with_voice(
+        mut self,
+        pipeline: Arc<crate::voice::VoicePipeline>,
+        voice_channels: HashMap<String, String>,
+    ) -> Self {
+        if !voice_channels.is_empty() && pipeline.is_tts_available() {
+            self.voice = Some(voice::VoiceState::new(pipeline, voice_channels));
+        }
+        self
     }
 
     /// Provide the resolver for skill-derived slash commands. Only consulted
@@ -1939,6 +1974,64 @@ impl Channel for DiscordChannel {
         }
 
         let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+
+        // Voice: when this channel is configured to speak into a voice channel
+        // for the originating guild, enqueue the reply text for TTS playback (in
+        // addition to posting it). Best-effort: a full queue or unresolved VC is
+        // silently skipped - the text message is the primary surface.
+        #[cfg(feature = "channel-discord-voice")]
+        if let Some(vstate) = self.voice.as_ref()
+            && !cleaned_content.trim().is_empty()
+        {
+            match vstate.resolve_target(&message.recipient) {
+                Some((guild_id, vc_id)) => {
+                    match vstate.handle.request_tx.try_send(voice::VoiceRequest {
+                        guild_id: guild_id.clone(),
+                        channel_id: vc_id.clone(),
+                        text: cleaned_content.clone(),
+                    }) {
+                        Ok(()) => ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "guild_id": guild_id,
+                                "voice_channel_id": vc_id,
+                                "text_len": cleaned_content.len(),
+                            })),
+                            "voice: reply enqueued for TTS playback"
+                        ),
+                        Err(e) => ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "guild_id": guild_id,
+                                "voice_channel_id": vc_id,
+                                "error": e.to_string(),
+                            })),
+                            "voice: TTS request dropped (queue full or actor down)"
+                        ),
+                    }
+                }
+                None => ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "text_channel_id": message.recipient.as_str(),
+                        })),
+                    "voice: no voice channel mapped for this text channel (skipped)"
+                ),
+            }
+        }
+
         // The delivery-failure note counts dropped *attachments* only. Embed URL
         // rejections and structural truncation surface as reactions, not a note.
         let note = delivery_failure_note(&failures);
@@ -2052,6 +2145,26 @@ impl Channel for DiscordChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
         let mut had_ready = false;
+
+        // Voice: the opcode-4 command channel carries the already-rendered
+        // gateway payload (a plain `String`), so this receiver and its `select!`
+        // arm compile whether or not the voice feature is on. With the feature,
+        // spawn the actor once (it outlives reconnects) and take the receiver for
+        // this connection; it is restored before `listen()` returns.
+        let mut voice_cmd_rx: Option<tokio::sync::mpsc::Receiver<String>> = None;
+        #[cfg(feature = "channel-discord-voice")]
+        if let Some(vstate) = self.voice.as_ref() {
+            if let Some(inputs) = vstate.handle.take_bootstrap() {
+                voice::spawn_voice_actor(
+                    inputs.request_rx,
+                    inputs.event_rx,
+                    inputs.cmd_tx,
+                    Arc::clone(&vstate.pipeline),
+                    Arc::new(bot_user_id.clone()),
+                );
+            }
+            voice_cmd_rx = vstate.handle.cmd_rx.lock().take();
+        }
 
         // Get Gateway URL
         let gw_resp = self
@@ -2241,6 +2354,21 @@ impl Channel for DiscordChannel {
                     let hb = json!({"op": 1, "d": d});
                     if write.send(Message::Text(hb.to_string().into())).await.is_err() {
                         break;
+                    }
+                }
+                // Voice actor asked us to (re)join a voice channel: write its
+                // pre-rendered opcode-4 VOICE_STATE_UPDATE on the main gateway.
+                // The future pends forever when voice is off or unwired, so this
+                // arm is harmless in non-voice builds.
+                cmd = recv_voice_cmd(&mut voice_cmd_rx) => {
+                    match cmd {
+                        Some(payload) => {
+                            if write.send(Message::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        // All senders dropped (actor gone): stop polling this arm.
+                        None => voice_cmd_rx = None,
                     }
                 }
                 msg = read.next() => {
@@ -2465,6 +2593,84 @@ impl Channel for DiscordChannel {
                             break;
                         }
                         _ => {}
+                    }
+
+                    // Voice: learn which guild a text channel belongs to (so
+                    // `send()` can resolve the configured VC), and route the two
+                    // voice-credential events to the voice actor.
+                    #[cfg(feature = "channel-discord-voice")]
+                    if let Some(vstate) = self.voice.as_ref() {
+                        match event_type {
+                            "MESSAGE_CREATE" => {
+                                if let Some(d) = event.get("d")
+                                    && let (Some(ch), Some(g)) = (
+                                        d.get("channel_id").and_then(|v| v.as_str()),
+                                        d.get("guild_id").and_then(|v| v.as_str()),
+                                    )
+                                {
+                                    vstate.remember_channel_guild(ch, g);
+                                }
+                            }
+                            "VOICE_SERVER_UPDATE" => {
+                                if let Some(d) = event.get("d")
+                                    && let (Some(g), Some(ep), Some(tok)) = (
+                                        d.get("guild_id").and_then(|v| v.as_str()),
+                                        d.get("endpoint").and_then(|v| v.as_str()),
+                                        d.get("token").and_then(|v| v.as_str()),
+                                    )
+                                {
+                                    let _ = vstate.handle.event_tx.try_send(
+                                        voice::VoiceEvent::Server {
+                                            guild_id: g.to_string(),
+                                            endpoint: ep.to_string(),
+                                            token: tok.to_string(),
+                                        },
+                                    );
+                                    ::zeroclaw_log::record!(
+                                        INFO,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                        .with_attrs(::serde_json::json!({
+                                            "guild_id": g,
+                                            "endpoint": ep,
+                                        })),
+                                        "voice: VOICE_SERVER_UPDATE received from Discord"
+                                    );
+                                }
+                            }
+                            "VOICE_STATE_UPDATE" => {
+                                // Only the bot's own state carries the session id.
+                                if let Some(d) = event.get("d")
+                                    && d.get("user_id").and_then(|v| v.as_str())
+                                        == Some(bot_user_id.as_str())
+                                    && let (Some(g), Some(sid)) = (
+                                        d.get("guild_id").and_then(|v| v.as_str()),
+                                        d.get("session_id").and_then(|v| v.as_str()),
+                                    )
+                                {
+                                    let _ = vstate.handle.event_tx.try_send(
+                                        voice::VoiceEvent::State {
+                                            guild_id: g.to_string(),
+                                            session_id: sid.to_string(),
+                                        },
+                                    );
+                                    ::zeroclaw_log::record!(
+                                        INFO,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                        .with_attrs(::serde_json::json!({ "guild_id": g })),
+                                        "voice: VOICE_STATE_UPDATE (bot) received from Discord"
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
                     }
 
                     // Slash commands arrive as INTERACTION_CREATE over this
@@ -3394,6 +3600,13 @@ impl Channel for DiscordChannel {
         // reconnection loop can start fresh.
         if let Some(ref wd) = watchdog {
             wd.stop().await;
+        }
+
+        // Hand the opcode-4 receiver back so the next connection can take it
+        // (the voice actor itself outlives reconnects).
+        #[cfg(feature = "channel-discord-voice")]
+        if let Some(vstate) = self.voice.as_ref() {
+            *vstate.handle.cmd_rx.lock() = voice_cmd_rx.take();
         }
 
         Ok(())

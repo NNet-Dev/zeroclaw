@@ -149,6 +149,22 @@ waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b9
 serde-big-array = { version = "0.5", optional = true }
 
 cpal = { version = "0.15", optional = true }
+
+# Discord voice (outbound TTS into a voice channel) - opt-in, behind
+# `channel-discord-voice`, NOT in default-channels or the 32-bit CI feature set.
+# `audiopus` vendors libopus (no system dependency) for 20ms/48kHz Opus encode;
+# `chacha20poly1305` provides the XChaCha20-Poly1305 AEAD that encrypts the RTP
+# voice packets (Discord's `aead_xchacha20_poly1305_rtpsize` mode).
+audiopus = { version = "0.3.0-rc.0", optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
+# `davey` (MIT) implements Discord's DAVE end-to-end encryption: the MLS group key
+# agreement (via openmls / RFC 9420) plus the AES-128-GCM media-frame transform.
+# DAVE/E2EE is mandatory for all Discord voice connections since 2026-03-01; non-DAVE
+# clients are rejected at the voice gateway with close code 4017. Feature-gated
+# behind `channel-discord-voice`, so it (and its openmls tree) only compiles into
+# voice-enabled builds.
+davey = { version = "0.1.4", optional = true }
+
 whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true }
 whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
@@ -230,6 +246,11 @@ whatsapp-web = [
 ]
 # Channels with no optional deps (cfg gate only)
 channel-discord = []
+# Outbound voice (TTS into a Discord voice channel). Opt-in: pulls libopus (via
+# audiopus) + the voice-packet AEAD. Deliberately NOT in default-channels or
+# channels-full, and excluded from the 32-bit CI feature set, so the libopus C
+# FFI never enters those build closures.
+channel-discord-voice = ["channel-discord", "dep:audiopus", "dep:chacha20poly1305", "dep:davey"]
 channel-slack = []
 channel-signal = []
 channel-mattermost = []
