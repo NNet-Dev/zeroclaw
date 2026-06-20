@@ -1529,6 +1529,37 @@ impl DelegateTool {
 
     // ── Result Retrieval ────────────────────────────────────────────
 
+    /// When a background task's flat-file status still reads `Running` but the durable
+    /// control-plane has reconciled it to a terminal-loss state — the owning daemon died
+    /// (`Lost`) or it exceeded its runtime (`TimedOut`) — return the loss label so result
+    /// readers surface the truth instead of a task that will never finish. `None` when
+    /// there is no loss to report: the control-plane is absent, has no record, or the
+    /// flat file is already authoritative (the task wrote its own terminal state).
+    async fn reconciled_loss_label(
+        task_id: &str,
+        file_status: &BackgroundTaskStatus,
+    ) -> Option<&'static str> {
+        let cp = crate::control_plane::control_plane()?;
+        Self::reconciled_loss_label_with(task_id, file_status, cp.store.as_ref()).await
+    }
+
+    /// Store-injected core of [`Self::reconciled_loss_label`] — kept separate from the
+    /// process-global accessor so it is unit-testable against an in-memory store.
+    async fn reconciled_loss_label_with(
+        task_id: &str,
+        file_status: &BackgroundTaskStatus,
+        store: &dyn crate::control_plane::TaskRegistry,
+    ) -> Option<&'static str> {
+        if *file_status != BackgroundTaskStatus::Running {
+            return None;
+        }
+        match store.get(task_id).await.ok().flatten()?.status {
+            crate::control_plane::TaskStatus::Lost => Some("lost"),
+            crate::control_plane::TaskStatus::TimedOut => Some("timed_out"),
+            _ => None,
+        }
+    }
+
     /// Retrieve the result of a background delegate task by task_id.
     async fn handle_check_result(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let task_id = args
@@ -1566,6 +1597,24 @@ impl DelegateTool {
         let content = tokio::fs::read_to_string(&result_path).await?;
         let result: BackgroundDelegateResult = serde_json::from_str(&content)?;
 
+        // Overlay the control-plane's reconciled view: a crashed/timed-out task whose
+        // flat file still says `Running` is surfaced as lost/timed_out, so the agent
+        // stops polling a task that will never complete.
+        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
+            return Ok(ToolResult {
+                success: false,
+                output: serde_json::to_string_pretty(&json!({
+                    "task_id": task_id,
+                    "agent": result.agent,
+                    "status": label,
+                    "started_at": result.started_at,
+                    "note": "the owning daemon exited or the task exceeded its max runtime; \
+                             reconciled by the supervision reaper",
+                }))?,
+                error: Some(format!("background task is {label} and will not complete")),
+            });
+        }
+
         Ok(ToolResult {
             success: result.status == BackgroundTaskStatus::Completed,
             output: serde_json::to_string_pretty(&result)?,
@@ -1597,10 +1646,17 @@ impl DelegateTool {
                 && let Ok(content) = tokio::fs::read_to_string(&path).await
                 && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
             {
+                // Surface the reconciled loss state (lost/timed_out) for a task whose flat
+                // file still says `Running` but whose owning daemon died / timed out.
+                let status =
+                    match Self::reconciled_loss_label(&result.task_id, &result.status).await {
+                        Some(label) => json!(label),
+                        None => json!(result.status),
+                    };
                 results.push(json!({
                     "task_id": result.task_id,
                     "agent": result.agent,
-                    "status": result.status,
+                    "status": status,
                     "started_at": result.started_at,
                     "finished_at": result.finished_at,
                 }));
@@ -2097,6 +2153,90 @@ mod tests {
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+
+    #[tokio::test]
+    async fn reconciled_loss_label_surfaces_registry_truth() {
+        use crate::control_plane::{
+            SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+        };
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let rec = |id: &str, status: TaskStatus| TaskRecord {
+            id: id.into(),
+            kind: TaskKind::Delegate,
+            agent: "main".into(),
+            status,
+            owner_pid: 0,
+            owner_boot_id: "b".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            started_at: "2026-06-21T00:00:00Z".into(),
+            finished_at: None,
+        };
+        store.create(rec("lost", TaskStatus::Lost)).await.unwrap();
+        store
+            .create(rec("timed", TaskStatus::TimedOut))
+            .await
+            .unwrap();
+        store
+            .create(rec("alive", TaskStatus::Running))
+            .await
+            .unwrap();
+
+        // Flat file says Running + registry reconciled to a loss state → surface the loss.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "lost",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            Some("lost")
+        );
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "timed",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            Some("timed_out")
+        );
+        // Registry still Running → nothing to overlay.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "alive",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            None
+        );
+        // The flat file already wrote a terminal state → it is authoritative, no overlay.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "lost",
+                &BackgroundTaskStatus::Completed,
+                &store
+            )
+            .await,
+            None
+        );
+        // Unknown task → None.
+        assert_eq!(
+            DelegateTool::reconciled_loss_label_with(
+                "missing",
+                &BackgroundTaskStatus::Running,
+                &store
+            )
+            .await,
+            None
+        );
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
