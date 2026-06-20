@@ -1135,11 +1135,41 @@ impl DelegateTool {
         let result_path = results_dir.join(format!("{task_id}.json"));
         Self::write_result_atomic(&result_path, &initial_result).await?;
 
+        // EPIC-A supervision: register the task in the durable control-plane BEFORE the
+        // spawn, so a crash between here and the spawn is recoverable by the reaper. A
+        // no-op when not running under a booted daemon (the plane is absent).
+        if let Some(cp) = crate::control_plane::control_plane() {
+            let _ = cp
+                .store
+                .create(crate::control_plane::TaskRecord {
+                    id: task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Delegate,
+                    agent: agent_name_owned.clone(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: cp.boot_id.clone(),
+                    heartbeat_at: None,
+                    depth: self.depth,
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: started_at.clone(),
+                    finished_at: None,
+                })
+                .await;
+        }
+
         let agents = Arc::clone(&self.agents);
         let security = target_policy;
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
-        let depth = self.depth;
+        // Monotonic descent: was `self.depth` (verbatim copy), which left the
+        // `self.depth >= max_depth` check inert — a chain of background delegations never
+        // escalated depth. Matches the documented `with_depth(parent.depth + 1)` intent.
+        // Behavior change: deep background re-delegation now saturates at `max_delegation_depth`.
+        let depth = self.depth + 1;
         let parent_tools = Arc::clone(&self.parent_tools);
         let multimodal_config = self.multimodal_config.clone();
         let delegate_config = self.delegate_config.clone();
@@ -1239,6 +1269,33 @@ impl DelegateTool {
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
                 let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
+
+                // EPIC-A supervision: mirror the terminal state into the control-plane so
+                // the registry reflects the real outcome (and the reaper never reclaims a
+                // finished task). No-op when the plane is absent. The store's
+                // terminal-state guard makes a late write after a reaper TimedOut a safe
+                // no-op.
+                if let Some(cp) = crate::control_plane::control_plane() {
+                    let cp_status = match final_result.status {
+                        BackgroundTaskStatus::Completed => {
+                            crate::control_plane::TaskStatus::Completed
+                        }
+                        BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
+                        BackgroundTaskStatus::Cancelled => {
+                            crate::control_plane::TaskStatus::Cancelled
+                        }
+                        BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
+                    };
+                    let _ = cp
+                        .store
+                        .update_status(
+                            &task_id_clone,
+                            cp_status,
+                            final_result.output.clone(),
+                            final_result.error.clone(),
+                        )
+                        .await;
+                }
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -1362,7 +1419,10 @@ impl DelegateTool {
                 .unwrap_or_else(|| Arc::clone(&self.security));
             let global_credential = self.global_credential.clone();
             let provider_runtime_options = self.provider_runtime_options.clone();
-            let depth = self.depth;
+            // Monotonic descent on the parallel path — was `self.depth` (verbatim copy),
+            // leaving the `>= max_depth` check inert (see the background path above).
+            // Behavior change: deep parallel re-delegation now saturates at `max_delegation_depth`.
+            let depth = self.depth + 1;
             let parent_tools = Arc::clone(&self.parent_tools);
             let multimodal_config = self.multimodal_config.clone();
             let delegate_config = self.delegate_config.clone();
