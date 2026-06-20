@@ -1543,6 +1543,76 @@ async fn move_renamed_workspace(
     }
 }
 
+/// Read-only residue probe for the agent-rename resume path (#7940).
+///
+/// Returns `true` if ANY store the rename side-effects touch still references
+/// `from` - the exact fingerprint a genuine post-persist partial failure leaves
+/// (config committed `to`, a follower lagging at `from`). The resume in
+/// `rename_agent_cascade` only fires when this is true, so an UNRELATED request
+/// `X -> to` (where `to` exists and `X` is absent from config but nothing lags
+/// under `X`) is NOT mistaken for a resume - it falls through to the normal
+/// branch, which surfaces the operator's NotFound/collision error.
+///
+/// MUST mirror every store `move_renamed_workspace` + `cascade_rename_agent`
+/// re-point, or a false negative here would break a real resume in the store it
+/// missed. Each probe is the read-only twin of the corresponding mutation:
+/// - workspace: the default per-alias dir for `from` still exists,
+/// - cron: `list_jobs_by_agent(from)` non-empty,
+/// - acp: any session (live OR killed) owned by `from` - `rename_sessions_by_agent`
+///   moves both, so the live-only count would miss killed-only residue,
+/// - memory: `Memory::count_agent(from)` (the `agents` row the SQL rename moves),
+/// - sessions: `SessionBackend::count_agent_attribution(from)`.
+///
+/// Best-effort like the cascade itself: a store that errors on probe is treated
+/// as "no residue from this store" (logged), never blocking the fall-through.
+async fn rename_residue_exists(
+    state: &AppState,
+    working: &zeroclaw_config::schema::Config,
+    from: &str,
+) -> bool {
+    // Workspace: the default per-alias dir for `from`. A custom/alias-independent
+    // path is not moved by the cascade, so it is not residue.
+    if working.agent_workspace_dir(from).exists() {
+        return true;
+    }
+
+    // Short-lived clone for the DB-backed stores - never hold the lock across an
+    // `.await`.
+    let cfg = state.config.read().clone();
+
+    // Cron jobs still owned by `from`.
+    if zeroclaw_runtime::cron::list_jobs_by_agent(&cfg, from)
+        .map(|jobs| !jobs.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // ACP sessions (live OR killed) still owned by `from`.
+    if let Ok(store) = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&cfg.data_dir)
+        && store
+            .list_sessions_by_agent(from)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // Memory rows still attributed to `from`.
+    if state.mem.count_agent(from).await.unwrap_or(0) > 0 {
+        return true;
+    }
+
+    // Session-metadata attribution still pointing at `from`.
+    if let Some(backend) = state.session_backend.as_ref()
+        && backend.count_agent_attribution(from).unwrap_or(0) > 0
+    {
+        return true;
+    }
+
+    false
+}
+
 async fn rename_agent_cascade(
     state: &AppState,
     mut working: zeroclaw_config::schema::Config,
@@ -1572,7 +1642,18 @@ async fn rename_agent_cascade(
     // collision; or `from` absent → `NotFound`), so the documented recovery could
     // never run. Detect that committed state up front and skip the already-done
     // rewrite + persist, falling through to re-run only the lagging side-effects.
-    let dirty_count = if working.agent(from).is_none() && working.agent(to).is_some() {
+    //
+    // But the committed-`to` shape alone is ambiguous: an UNRELATED `X -> to`
+    // (where `to` already exists and `X` is absent from config) matches it too,
+    // and silently treating that as a resume would run no-op side-effects and
+    // return 2xx instead of surfacing the operator's error. So request-correlate
+    // the resume to ACTUAL lagging residue under `from` - the fingerprint a real
+    // partial failure leaves (`rename_residue_exists`). With committed-`to` but NO
+    // residue, the else branch runs `rename_with_cascade(from -> to)` with `from`
+    // absent → NotFound (or `to` collision) → `rename_error_response`, which is the
+    // desired surfacing.
+    let committed_to = working.agent(from).is_none() && working.agent(to).is_some();
+    let dirty_count = if committed_to && rename_residue_exists(state, &working, from).await {
         0
     } else {
         match alias_refs::rename_with_cascade(&mut working, &AliasKind::Agent, from, to) {
@@ -2616,6 +2697,61 @@ mod tests {
         // Config still names `to` and never regained `from` (no double-rename).
         assert!(state.config.read().agents.contains_key("to"));
         assert!(!state.config.read().agents.contains_key("from"));
+    }
+
+    /// #7940 (Audacity88's concern): the resume must be request-correlated, not
+    /// purely config-state-based. An UNRELATED `X -> to` where `to` already exists
+    /// and the source `X` is absent from config AND nothing lags under `X` matches
+    /// the committed-`to` shape but is NOT a resume - there is no residue to
+    /// converge. It must surface the operator's error (NotFound), not silently
+    /// return 2xx after running no-op side-effects.
+    #[tokio::test]
+    async fn agent_rename_unrelated_collision_is_not_treated_as_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"), // writable
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        // Committed-`to` shape: config has `to`, the source `gone` is absent.
+        // Crucially there is NO residue under `gone` - no workspace dir, no cron
+        // job, no acp/memory/session rows. This is an unrelated request (or an
+        // already-fully-converged duplicate), not a partial-failure resume.
+        let mut config = config;
+        config.agents.insert(
+            "to".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.entry("default".into()).or_default();
+        config.runtime_profiles.entry("default".into()).or_default();
+        // Guard the test's own premise: the source workspace must not exist.
+        assert!(
+            !config.agent_workspace_dir("gone").exists(),
+            "precondition: no residue workspace under the absent source"
+        );
+
+        let state = crate::api::test_state(config.clone());
+        let body = RenameMapKeyBody {
+            path: "agents".to_string(),
+            from: "gone".to_string(),
+            to: "to".to_string(),
+        };
+        let resp = rename_agent_cascade(&state, config.clone(), &body).await;
+
+        // No residue → NOT a resume → the normal branch runs `rename_with_cascade`
+        // with `gone` absent → NotFound → an error response, not a silent success.
+        assert!(
+            !resp.status().is_success(),
+            "an unrelated `gone -> to` with no residue must surface an error, not be silently treated as a resume"
+        );
+        // Config untouched: no rename happened, `to` still present, `gone` absent.
+        assert!(state.config.read().agents.contains_key("to"));
+        assert!(!state.config.read().agents.contains_key("gone"));
     }
 
     #[test]
