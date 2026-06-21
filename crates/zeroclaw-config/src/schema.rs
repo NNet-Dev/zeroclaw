@@ -19257,10 +19257,30 @@ pub struct SopConfig {
     /// Oldest runs are evicted when over capacity. 0 = unlimited.
     #[serde(default = "default_sop_max_finished_runs")]
     pub max_finished_runs: usize,
+
+    /// Persist run state durably across restarts. Default `false` → today's
+    /// ephemeral in-memory behavior (no surprise activation on upgrade). The
+    /// durable store is inert until this is enabled AND the engine is wired to it.
+    #[serde(default)]
+    pub persist_runs: bool,
+
+    /// Durable run-state backend when `persist_runs` is true:
+    /// `sqlite` (default) or `memory` (explicitly non-durable, for tests/degraded).
+    #[serde(default = "default_sop_run_store_backend")]
+    pub run_store_backend: String,
+
+    /// Directory for the durable run store (created mode-0700). When omitted,
+    /// `<data_dir>/sop`. Never OS-temp.
+    #[serde(default)]
+    pub run_state_dir: Option<String>,
 }
 
 fn default_sop_execution_mode() -> String {
     "supervised".to_string()
+}
+
+fn default_sop_run_store_backend() -> String {
+    "sqlite".to_string()
 }
 
 fn default_sop_max_concurrent_total() -> usize {
@@ -19283,6 +19303,9 @@ impl Default for SopConfig {
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),
             max_finished_runs: default_sop_max_finished_runs(),
+            persist_runs: false,
+            run_store_backend: default_sop_run_store_backend(),
+            run_state_dir: None,
         }
     }
 }

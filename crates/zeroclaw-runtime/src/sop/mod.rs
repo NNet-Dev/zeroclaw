@@ -11,7 +11,7 @@ pub use engine::SopEngine;
 pub use metrics::SopMetricsCollector;
 pub use store::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
-    StoreError, build_run_store,
+    SqliteRunStore, StoreError, build_run_store,
 };
 #[allow(unused_imports)]
 pub use types::{
@@ -39,8 +39,22 @@ pub fn build_sop_engine(
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
-    let mut engine = SopEngine::new(config);
+    // Select the run-state backend from config (default: ephemeral in-memory →
+    // unchanged behavior). A backend-open failure must not crash daemon startup,
+    // so fall back to in-memory with a loud log.
+    let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": e.to_string()})),
+            "SOP: run-store init failed; falling back to in-memory"
+        );
+        Arc::new(store::InMemoryRunStore::new())
+    });
+    let mut engine = SopEngine::new(config).with_store(store);
     engine.reload(workspace_dir);
+    engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
     let audit = Arc::new(SopAuditLogger::new(audit_memory));
     (engine, audit)

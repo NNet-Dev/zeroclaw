@@ -13,14 +13,19 @@
 //! `epics/B-run-state-store/{03-architecture,04-implementation-plan}.md`.
 
 pub mod model;
+pub mod sqlite;
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use zeroclaw_config::schema::SopConfig;
 
 pub use model::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SOP_STORE_VERSION,
     SopEventRecord,
 };
+pub use sqlite::SqliteRunStore;
 
 /// First-class durable run-state store. ONE per engine singleton.
 ///
@@ -150,11 +155,43 @@ impl From<serde_json::Error> for StoreError {
 
 /// Build the configured run store.
 ///
-/// Default backend is in-memory (current behaviour). The config-driven
-/// SQLite/Memory selection lands with `SqliteRunStore` (follow-on commit); this
-/// keeps the contract stable for callers in the meantime.
-pub fn build_run_store() -> Arc<dyn SopRunStore> {
-    Arc::new(InMemoryRunStore::new())
+/// - `persist_runs = false` (default) -> ephemeral [`InMemoryRunStore`] (current behaviour).
+/// - `persist_runs = true`, backend `"sqlite"` (default) -> [`SqliteRunStore`] at
+///   `<run_state_dir | data_dir/sop>/runs.db` (dir created mode-0700).
+/// - `persist_runs = true`, backend `"memory"` -> ephemeral [`InMemoryRunStore`] (degraded/tests).
+/// - any other backend -> fail-loud `StoreError`.
+///
+/// Not yet called in production; the engine persist-seams that consume this are
+/// the next slice, so the durable store stays inert until then.
+pub fn build_run_store(
+    cfg: &SopConfig,
+    data_dir: &Path,
+) -> Result<Arc<dyn SopRunStore>, StoreError> {
+    if !cfg.persist_runs {
+        return Ok(Arc::new(InMemoryRunStore::new()));
+    }
+    match cfg.run_store_backend.trim().to_ascii_lowercase().as_str() {
+        "sqlite" => {
+            let dir: PathBuf = match cfg.run_state_dir.as_deref() {
+                Some(d) if !d.is_empty() => PathBuf::from(shellexpand::tilde(d).as_ref()),
+                _ => data_dir.join("sop"),
+            };
+            std::fs::create_dir_all(&dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Best-effort tighten to 0700; ignore if the filesystem rejects it.
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+            Ok(Arc::new(sqlite::SqliteRunStore::open(
+                &dir.join("runs.db"),
+            )?))
+        }
+        "memory" => Ok(Arc::new(InMemoryRunStore::new())),
+        other => Err(StoreError::Backend(format!(
+            "unknown sop run_store_backend: {other:?} (expected \"sqlite\" or \"memory\")"
+        ))),
+    }
 }
 
 // ── In-memory default backend ──────────────────────────────────────
@@ -491,7 +528,7 @@ mod tests {
 
     #[test]
     fn claim_is_single_winner_and_cap_bounded() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         // First claim wins.
         assert!(s.try_claim_run("r1", "deploy", 2, 2).unwrap().is_some());
         // Duplicate claim on the same run is refused.
@@ -514,7 +551,7 @@ mod tests {
 
     #[test]
     fn claim_caps_isolate_per_sop_yet_share_global() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         // per_sop_cap = 1, global_cap = 3.
         // SOP "a" fills its single per-SOP slot.
         assert!(s.try_claim_run("a1", "a", 1, 3).unwrap().is_some());
@@ -530,7 +567,7 @@ mod tests {
 
     #[test]
     fn events_are_append_only_with_monotonic_seq() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         assert_eq!(s.append_event(&ev("r1", "run_started")).unwrap(), 1);
         assert_eq!(s.append_event(&ev("r1", "step_completed")).unwrap(), 2);
         assert_eq!(s.append_event(&ev("r2", "run_started")).unwrap(), 3);
@@ -543,7 +580,7 @@ mod tests {
 
     #[test]
     fn proposals_round_trip_and_filter_by_status() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         s.save_proposal(&proposal("p1", ProposalStatus::Pending))
             .unwrap();
         s.save_proposal(&proposal("p2", ProposalStatus::Applied))
@@ -564,7 +601,7 @@ mod tests {
 
     #[test]
     fn save_run_rejects_stale_revision_but_accepts_same_or_newer() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         s.save_run(&run("r1", 5, None)).unwrap();
         // A lower revision loses the race.
         let err = s.save_run(&run("r1", 4, None)).unwrap_err();
@@ -604,7 +641,7 @@ mod tests {
 
     #[test]
     fn finish_run_marks_terminal_and_releases_claim() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         s.save_run(&run("r1", 0, None)).unwrap();
         let tok = s.try_claim_run("r1", "deploy", 4, 4).unwrap().unwrap();
         assert!(
@@ -631,7 +668,7 @@ mod tests {
 
     #[test]
     fn finish_run_revision_guard_protects_live_state_and_claim() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         s.save_run(&run("r1", 5, None)).unwrap();
         let _tok = s.try_claim_run("r1", "deploy", 4, 4).unwrap().unwrap();
 
@@ -667,7 +704,7 @@ mod tests {
 
     #[test]
     fn prune_evicts_oldest_terminal_runs_first() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         // Three terminal runs with ascending completion timestamps.
         for (id, ts) in [
             ("old", "2020-01-01T00:00:00Z"),
@@ -738,9 +775,49 @@ mod tests {
 
     #[test]
     fn expired_claims_skips_empty_leases_and_matches_past_due() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         // The in-memory backend stamps empty leases — those are never expired.
         s.try_claim_run("r1", "deploy", 4, 4).unwrap().unwrap();
         assert!(s.expired_claims("2999-01-01T00:00:00Z").unwrap().is_empty());
+    }
+
+    fn cfg() -> SopConfig {
+        serde_json::from_str("{}").expect("default SopConfig from empty object")
+    }
+
+    #[test]
+    fn factory_defaults_to_in_memory() {
+        // persist_runs defaults false -> ephemeral, data_dir untouched.
+        let s = build_run_store(&cfg(), Path::new("/nonexistent")).unwrap();
+        assert_eq!(s.backend(), "in-memory");
+    }
+
+    #[test]
+    fn factory_backend_selection_and_unknown_is_error() {
+        let mut c = cfg();
+        c.persist_runs = true;
+        c.run_store_backend = "memory".to_string();
+        assert_eq!(
+            build_run_store(&c, Path::new("/nonexistent"))
+                .unwrap()
+                .backend(),
+            "in-memory"
+        );
+        c.run_store_backend = "bogus".to_string();
+        assert!(build_run_store(&c, Path::new("/nonexistent")).is_err());
+    }
+
+    #[test]
+    fn factory_builds_sqlite_in_configured_dir() {
+        let dir = std::env::temp_dir().join(format!("zc-sop-factory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = cfg();
+        c.persist_runs = true;
+        c.run_store_backend = "sqlite".to_string();
+        c.run_state_dir = Some(dir.to_string_lossy().into_owned());
+        let s = build_run_store(&c, Path::new("/unused")).unwrap();
+        assert_eq!(s.backend(), "sqlite");
+        assert!(dir.join("runs.db").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
