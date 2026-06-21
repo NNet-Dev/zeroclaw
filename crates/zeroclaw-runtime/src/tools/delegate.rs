@@ -1104,6 +1104,23 @@ impl DelegateTool {
             }
         };
 
+        // Runaway backstop: refuse a new background delegation once too many are already in
+        // flight (each is a full agent loop). The in-flight set is the live cancel-token map.
+        if Self::at_background_capacity(
+            Self::background_task_cancels().lock().len(),
+            Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS,
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Too many background delegations in flight (limit {}). Wait for some to \
+                     finish (check_result) or cancel one (cancel_task) before starting more.",
+                    Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS
+                )),
+            });
+        }
+
         let task_id = uuid::Uuid::new_v4().to_string();
         let results_dir = self.results_dir();
         tokio::fs::create_dir_all(&results_dir).await?;
@@ -1697,6 +1714,18 @@ impl DelegateTool {
         static M: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, CancellationToken>>> =
             std::sync::OnceLock::new();
         M.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+    }
+
+    /// Runaway backstop: the maximum number of background delegations allowed in flight at
+    /// once across the process. Each is a full agent loop, so this guards against a model
+    /// (or a runaway loop) spawning unbounded background agent runs; normal use stays well
+    /// under it.
+    const MAX_CONCURRENT_BACKGROUND_DELEGATIONS: usize = 128;
+
+    /// Pure predicate for the runaway backstop — separated from the live token-map read so
+    /// it is unit-testable. `cap == 0` disables the backstop.
+    fn at_background_capacity(in_flight: usize, cap: usize) -> bool {
+        cap != 0 && in_flight >= cap
     }
 
     /// Cancel a running background task by task_id.
@@ -2312,6 +2341,16 @@ mod tests {
                 .remove("test-cancel-missing")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn background_capacity_backstop() {
+        assert!(!DelegateTool::at_background_capacity(0, 128));
+        assert!(!DelegateTool::at_background_capacity(127, 128));
+        assert!(DelegateTool::at_background_capacity(128, 128));
+        assert!(DelegateTool::at_background_capacity(200, 128));
+        // cap 0 disables the backstop
+        assert!(!DelegateTool::at_background_capacity(10_000, 0));
     }
 
     fn test_security() -> Arc<SecurityPolicy> {
