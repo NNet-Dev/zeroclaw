@@ -52,7 +52,9 @@ pub fn build_sop_engine(
         );
         Arc::new(store::InMemoryRunStore::new())
     });
-    let mut engine = SopEngine::new(config).with_store(store);
+    let mut engine = SopEngine::new(config)
+        .with_store(store)
+        .with_metrics(SopMetricsCollector::shared());
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));

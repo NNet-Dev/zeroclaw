@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 
 use super::condition::evaluate_condition;
 use super::load_sops;
+use super::metrics::SopMetricsCollector;
 use super::store::{InMemoryRunStore, PersistedRun, SopRunStore};
 use super::types::{
     DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
@@ -28,6 +29,9 @@ pub struct SopEngine {
     /// Durable run-state store. Defaults to an ephemeral in-memory store
     /// (current behavior); `build_sop_engine` injects the configured backend.
     store: Arc<dyn SopRunStore>,
+    /// Run-execution metrics collector. Per-engine fresh in `new()` (test
+    /// isolation); `build_sop_engine` swaps in the process-shared collector.
+    metrics: Arc<SopMetricsCollector>,
 }
 
 impl SopEngine {
@@ -41,6 +45,7 @@ impl SopEngine {
             run_counter: 0,
             deterministic_savings: DeterministicSavings::default(),
             store: Arc::new(InMemoryRunStore::new()),
+            metrics: Arc::new(SopMetricsCollector::new()),
         }
     }
 
@@ -49,6 +54,14 @@ impl SopEngine {
     /// behavior exactly.
     pub fn with_store(mut self, store: Arc<dyn SopRunStore>) -> Self {
         self.store = store;
+        self
+    }
+
+    /// Inject the metrics collector. `build_sop_engine` passes the process-shared
+    /// collector so the engine's completion metrics and the SOP tools' reports
+    /// observe one set; the default per-engine collector keeps tests isolated.
+    pub fn with_metrics(mut self, metrics: Arc<SopMetricsCollector>) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -926,6 +939,7 @@ impl SopEngine {
         run.completed_at = Some(now_iso8601());
         let sop_name = run.sop_name.clone();
         let run_id_owned = run.run_id.clone();
+        self.metrics.record_run_complete(&run);
         self.persist_terminal(&run);
         self.finished_runs.push(run);
 
