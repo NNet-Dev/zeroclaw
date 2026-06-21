@@ -1193,6 +1193,19 @@ pub async fn handle_map_key(
     let path = q.path.clone();
     let key = q.key.clone();
 
+    // Reserved-agent guard: `default` is the runtime-fallback agent — rename and
+    // delete already refuse it, so creating it would trap the operator with an
+    // agent the UI can't then delete or rename. Refuse the create symmetrically.
+    if path == "agents" && zeroclaw_config::alias_refs::is_reserved_agent_alias(&key) {
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!("alias `{key}` is reserved and cannot be created"),
+            )
+            .with_path(format!("{path}.{key}")),
+        );
+    }
+
     let created = match working.create_map_key(&path, &key) {
         Ok(b) => b,
         Err(msg) => {

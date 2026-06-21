@@ -564,6 +564,16 @@ fn scrub_channel_refs(cfg: &mut Config, target: &str) {
 /// which `rename_map_key` enforces — no separate guard needed here.)
 const RESERVED_DEFAULT_AGENT: &str = "default";
 
+/// True iff `alias` is the reserved AGENT alias (the runtime fallback
+/// `default`). Rename and delete already refuse it; the create surface must
+/// refuse it symmetrically, or an operator can create an agent the UI then
+/// can't delete or rename — a dead-end trap. Reserved only for the agent kind
+/// (`default` is a free, conventional key for providers/channels/profiles).
+#[must_use]
+pub fn is_reserved_agent_alias(alias: &str) -> bool {
+    alias.trim() == RESERVED_DEFAULT_AGENT
+}
+
 /// Outcome of a successful [`rename_with_cascade`].
 #[derive(Debug, Clone)]
 pub struct RenameReport {
@@ -2583,6 +2593,17 @@ mod tests {
         // nothing mutated
         assert!(cfg.agents.contains_key("default"));
         assert!(cfg.agents.contains_key("bot"));
+    }
+
+    #[test]
+    fn is_reserved_agent_alias_flags_only_default() {
+        // The create surface uses this to refuse `default` symmetrically with
+        // rename/delete (so the UI can't create an undeletable agent).
+        assert!(is_reserved_agent_alias("default"));
+        assert!(is_reserved_agent_alias("  default  ")); // trimmed like the rename guard
+        assert!(!is_reserved_agent_alias("default2"));
+        assert!(!is_reserved_agent_alias("cronos"));
+        assert!(!is_reserved_agent_alias(""));
     }
 
     #[test]
