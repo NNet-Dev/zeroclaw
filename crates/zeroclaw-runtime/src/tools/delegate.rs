@@ -1175,6 +1175,11 @@ impl DelegateTool {
         let delegate_config = self.delegate_config.clone();
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
+        // Register the live token so `cancel_task` can actually abort THIS task (removed
+        // when it settles, in the spawned closure below).
+        Self::background_task_cancels()
+            .lock()
+            .insert(task_id.clone(), child_token.clone());
         let task_id_clone = task_id.clone();
         let providers_models = Arc::clone(&self.providers_models);
         let risk_profiles = Arc::clone(&self.risk_profiles);
@@ -1296,6 +1301,9 @@ impl DelegateTool {
                         )
                         .await;
                 }
+
+                // Drop the live cancel token now the task has settled.
+                Self::background_task_cancels().lock().remove(&task_id_clone);
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -1678,6 +1686,19 @@ impl DelegateTool {
         })
     }
 
+    /// Live cancellation tokens for in-flight background delegate tasks, keyed by task_id.
+    /// `execute_background` registers a task's child token here before the detached spawn
+    /// and removes it when the task settles; `cancel_task` looks it up to ACTUALLY abort
+    /// the run. (The prior implementation only marked the result file, so a "cancelled"
+    /// task kept running.) Process-global because a background task outlives the tool
+    /// instance that spawned it.
+    fn background_task_cancels() -> &'static parking_lot::Mutex<HashMap<String, CancellationToken>>
+    {
+        static M: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, CancellationToken>>> =
+            std::sync::OnceLock::new();
+        M.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+    }
+
     /// Cancel a running background task by task_id.
     async fn handle_cancel_task(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let task_id = args
@@ -1727,19 +1748,40 @@ impl DelegateTool {
             });
         }
 
-        // Cancel via the parent token — this will cascade to all child tokens
-        // Note: individual task cancellation uses the shared parent token, which
-        // cancels all background tasks. For per-task cancellation, each background
-        // task uses a child token, and the parent token cancels all.
-        // We update the result file to reflect the cancellation request.
+        // Actually abort the running task by signalling its registered cancel token —
+        // this cascades into the task's `tokio::select!`, which settles it as Cancelled.
+        // Falls back to file-marking when the task already settled (token absent).
+        let aborted = Self::background_task_cancels()
+            .lock()
+            .remove(task_id)
+            .inspect(CancellationToken::cancel)
+            .is_some();
+
         result.status = BackgroundTaskStatus::Cancelled;
         result.error = Some("Cancelled by user request".into());
         result.finished_at = Some(chrono::Utc::now().to_rfc3339());
         Self::write_result_atomic(&result_path, &result).await?;
 
+        // Reconcile the durable supervision registry so the supervised view agrees.
+        if let Some(cp) = crate::control_plane::control_plane() {
+            let _ = cp
+                .store
+                .update_status(
+                    task_id,
+                    crate::control_plane::TaskStatus::Cancelled,
+                    None,
+                    Some("cancelled by user request".into()),
+                )
+                .await;
+        }
+
         Ok(ToolResult {
             success: true,
-            output: format!("Task '{task_id}' cancellation requested."),
+            output: if aborted {
+                format!("Task '{task_id}' cancelled — the running task was aborted.")
+            } else {
+                format!("Task '{task_id}' marked cancelled (it had already settled).")
+            },
             error: None,
         })
     }
@@ -2235,6 +2277,40 @@ mod tests {
             )
             .await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn background_cancel_token_aborts_and_clears() {
+        let token = CancellationToken::new();
+        let key = "test-cancel-unique-1";
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(key.into(), token.clone());
+        // cancel_task-style lookup: remove + signal the live token
+        let aborted = DelegateTool::background_task_cancels()
+            .lock()
+            .remove(key)
+            .inspect(CancellationToken::cancel)
+            .is_some();
+        assert!(aborted, "a registered task token is found and aborted");
+        assert!(
+            token.is_cancelled(),
+            "the running task's token is signalled"
+        );
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(key)
+                .is_none(),
+            "the token is gone after cancellation"
+        );
+        // An unknown id is a no-op (cancel_task falls back to file-marking).
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove("test-cancel-missing")
+                .is_none()
         );
     }
 
