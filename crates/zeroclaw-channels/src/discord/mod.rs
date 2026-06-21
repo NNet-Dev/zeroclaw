@@ -2542,6 +2542,12 @@ impl Channel for DiscordChannel {
                                 // routing happens in the spawned task.
                                 let prompt = interaction_string_option(d, "prompt");
                                 let input = interaction_string_option(d, "input");
+                                // Built-in runtime commands (`/model`, `/models`)
+                                // carry their own optional option; extracted here
+                                // (owned) so the 'static task can reconstruct the
+                                // equivalent text command.
+                                let model_opt = interaction_string_option(d, "model");
+                                let provider_opt = interaction_string_option(d, "provider");
                                 // Extract typed-option values here (owned) so the
                                 // spawned 'static task doesn't borrow `event`.
                                 let submitted = slash_options::extract_submitted_options(d);
@@ -2681,7 +2687,20 @@ impl Channel for DiscordChannel {
                                         // addresses the skill by name. The
                                         // skill is already in the owning
                                         // agent's system prompt and tool set.
-                                        let content = if command == "ask" {
+                                        let content = if BUILTIN_RUNTIME_COMMANDS
+                                            .contains(&command.as_str())
+                                        {
+                                            // Built-in runtime command: hand the
+                                            // orchestrator the equivalent text
+                                            // command so `parse_runtime_command`
+                                            // runs it; the reply routes back via
+                                            // the interaction reply_target below.
+                                            Some(reconstruct_runtime_command(
+                                                &command,
+                                                &model_opt,
+                                                &provider_opt,
+                                            ))
+                                        } else if command == "ask" {
                                             Some(prompt)
                                         } else {
                                             let specs = match resolver {
@@ -4472,7 +4491,8 @@ mod tests {
         }];
         let body = slash_command_registration_body(&specs);
         let commands = body.as_array().unwrap();
-        assert_eq!(commands.len(), 2);
+        // /ask + the skill command + the built-in runtime commands (appended last).
+        assert_eq!(commands.len(), 2 + BUILTIN_RUNTIME_COMMANDS.len());
         assert_eq!(commands[0]["name"], "ask");
         assert_eq!(commands[1]["name"], "deploy-status");
         assert_eq!(commands[1]["options"][0]["name"], "input");
@@ -4624,6 +4644,10 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
+        // Empty guild endpoint → every desired command (`/ask` + the built-in
+        // runtime commands) is upserted with one POST each.
+        let desired = slash_command_registration_body(&[]);
+        let n_cmds = desired.as_array().unwrap().len() as u64;
         Mock::given(method("GET"))
             .and(path("/applications/app1/commands"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
@@ -4639,12 +4663,11 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/applications/app1/guilds/g1/commands"))
             .respond_with(ResponseTemplate::new(200))
-            .expect(1)
+            .expect(n_cmds)
             .mount(&server)
             .await;
 
         let client = reqwest::Client::new();
-        let desired = slash_command_registration_body(&[]);
         reconcile_slash_commands(
             &client,
             "tok",
@@ -4796,22 +4819,34 @@ mod tests {
         // `with_localizations=true`) plus a server-side id - so the projection
         // matches and no upsert fires. Deriving it keeps the test agnostic to
         // the built-in translation table.
-        let mut existing_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
-        existing_ask["id"] = serde_json::json!("a1");
-        let foreign = serde_json::json!({
+        // Echo back exactly what we'd register for the full desired set (/ask +
+        // the built-in runtime commands), each with a server-side id, so every
+        // projection matches and no upsert fires. Derived from the registration
+        // body so the test stays agnostic to the built-in set + translations.
+        let mut existing: Vec<serde_json::Value> = slash_command_registration_body(&[])
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, cmd)| {
+                let mut cmd = cmd.clone();
+                cmd["id"] = serde_json::json!(format!("c{i}"));
+                cmd
+            })
+            .collect();
+        // A foreign command with a generic input option (description does NOT
+        // match the ownership marker) must be left alone.
+        existing.push(serde_json::json!({
             "id": "f1", "name": "run",
             "description": "external tool", "type": 1,
             "options": [{
                 "name": "input", "type": 3, "required": true,
                 "description": "what to run"
             }]
-        });
+        }));
         Mock::given(method("GET"))
             .and(path("/applications/app1/commands"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!([existing_ask, foreign])),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(existing)))
             .expect(1)
             .mount(&server)
             .await;

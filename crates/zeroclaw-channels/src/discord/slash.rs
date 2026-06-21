@@ -64,6 +64,11 @@ pub fn discord_slash_specs_from_skills(
 
     let mut seen = std::collections::HashSet::new();
     seen.insert("ask".to_string());
+    // Reserve the built-in runtime-command names so a skill can't register a
+    // colliding slug (which would 400 the whole registration body).
+    for name in BUILTIN_RUNTIME_COMMANDS {
+        seen.insert((*name).to_string());
+    }
     let mut specs = Vec::new();
     for skill in candidates {
         let slug = discord_command_slug(&skill.name);
@@ -294,10 +299,88 @@ fn map_options_cap(specs: &mut Vec<DiscordSlashCommandSpec>) {
     }
 }
 
-/// The desired global-command set: `/ask` plus one command per skill spec,
-/// each taking a single required string `input`. Also the registration
-/// fingerprint input — its JSON string hashes into the skip-if-unchanged
-/// gate.
+/// Channel runtime commands surfaced as built-in Discord slash commands so they
+/// appear in the native `/`-picker. They are dispatched through the orchestrator's
+/// text runtime-command handler (see the interaction dispatch in `mod.rs`), which
+/// mirrors the same `/new`/`/model`/`/models`/`/config` a user can type as a
+/// message. Names must be valid Discord command names (lowercase, no spaces).
+pub(crate) const BUILTIN_RUNTIME_COMMANDS: &[&str] = &["new", "config", "model", "models"];
+
+/// Reconstruct the channel text runtime-command for a built-in slash interaction
+/// so the orchestrator's `parse_runtime_command` handles it identically to a
+/// typed message. The option is optional, so the no-arg form is preserved (bare
+/// `/model` shows the current model; bare `/models` lists providers).
+pub(crate) fn reconstruct_runtime_command(
+    command: &str,
+    model_opt: &str,
+    provider_opt: &str,
+) -> String {
+    match command {
+        "model" => {
+            let m = model_opt.trim();
+            if m.is_empty() {
+                "/model".to_string()
+            } else {
+                format!("/model {m}")
+            }
+        }
+        "models" => {
+            let p = provider_opt.trim();
+            if p.is_empty() {
+                "/models".to_string()
+            } else {
+                format!("/models {p}")
+            }
+        }
+        // `/new` and `/config` take no options.
+        other => format!("/{other}"),
+    }
+}
+
+/// Registration JSON for the built-in runtime commands, appended to the desired
+/// set alongside `/ask`. Optional options leave the no-arg form valid (e.g. bare
+/// `/model` shows the current model).
+fn builtin_runtime_command_specs() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "name": "new",
+            "description": "Start a new conversation (clear history)",
+            "type": 1, // CHAT_INPUT
+        }),
+        json!({
+            "name": "config",
+            "description": "Show the current model and provider configuration",
+            "type": 1,
+        }),
+        json!({
+            "name": "model",
+            "description": "Switch the chat model (leave empty to show the current one)",
+            "type": 1,
+            "options": [{
+                "name": "model",
+                "description": "Model id to switch to",
+                "type": 3, // STRING
+                "required": false
+            }]
+        }),
+        json!({
+            "name": "models",
+            "description": "Switch the model provider (leave empty to list providers)",
+            "type": 1,
+            "options": [{
+                "name": "provider",
+                "description": "Provider to switch to",
+                "type": 3, // STRING
+                "required": false
+            }]
+        }),
+    ]
+}
+
+/// The desired global-command set: `/ask`, the built-in runtime commands, plus
+/// one command per skill spec, each taking a single required string `input`.
+/// Also the registration fingerprint input — its JSON string hashes into the
+/// skip-if-unchanged gate.
 pub(crate) fn slash_command_registration_body(
     specs: &[DiscordSlashCommandSpec],
 ) -> serde_json::Value {
@@ -351,6 +434,9 @@ pub(crate) fn slash_command_registration_body(
         }
         commands.push(cmd);
     }
+    // Built-in runtime commands appended last (Discord treats the body as a set,
+    // and keeping skills at indices [1..] preserves caller/test expectations).
+    commands.extend(builtin_runtime_command_specs());
     serde_json::Value::Array(commands)
 }
 
@@ -907,6 +993,67 @@ mod typed_option_tests {
             json!(SKILL_COMMAND_OPTION_DESCRIPTION)
         );
         assert!(input["description_localizations"]["zh-CN"].is_string());
+    }
+
+    #[test]
+    fn registration_body_includes_builtin_runtime_commands() {
+        let body = slash_command_registration_body(&[]);
+        let cmds = body.as_array().unwrap();
+        let names: Vec<&str> = cmds.iter().filter_map(|c| c["name"].as_str()).collect();
+        for n in ["ask", "new", "config", "model", "models"] {
+            assert!(
+                names.contains(&n),
+                "registration body must include /{n}; got {names:?}"
+            );
+        }
+        // /model carries an OPTIONAL string option, so bare `/model` (show current) is valid.
+        let model = cmds.iter().find(|c| c["name"] == json!("model")).unwrap();
+        let opt = &model["options"][0];
+        assert_eq!(opt["name"], json!("model"));
+        assert_eq!(opt["type"], json!(3)); // STRING
+        assert_eq!(opt["required"], json!(false));
+        // /new takes no options.
+        let new_cmd = cmds.iter().find(|c| c["name"] == json!("new")).unwrap();
+        assert!(
+            new_cmd
+                .get("options")
+                .and_then(|o| o.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn reconstruct_runtime_command_maps_to_text_commands() {
+        assert_eq!(reconstruct_runtime_command("new", "", ""), "/new");
+        assert_eq!(reconstruct_runtime_command("config", "", ""), "/config");
+        assert_eq!(reconstruct_runtime_command("model", "", ""), "/model");
+        assert_eq!(
+            reconstruct_runtime_command("model", "gpt-4o", ""),
+            "/model gpt-4o"
+        );
+        assert_eq!(
+            reconstruct_runtime_command("model", "  gpt-4o  ", ""),
+            "/model gpt-4o"
+        );
+        assert_eq!(reconstruct_runtime_command("models", "", ""), "/models");
+        assert_eq!(
+            reconstruct_runtime_command("models", "", "openrouter"),
+            "/models openrouter"
+        );
+    }
+
+    #[test]
+    fn builtin_names_are_reserved_against_colliding_skills() {
+        // A `slash` skill literally named "model" must not register a second
+        // command that collides with the built-in (Discord 400s a dup name).
+        let mut skill = skill_with(Vec::new());
+        skill.name = "model".to_string();
+        let specs = discord_slash_specs_from_skills(std::slice::from_ref(&skill));
+        assert!(
+            specs.iter().all(|s| s.slug != "model"),
+            "a skill named 'model' must be skipped (reserved built-in)"
+        );
     }
 
     #[test]
