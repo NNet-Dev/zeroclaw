@@ -8927,115 +8927,133 @@ pub async fn start_channels(
             Vec::new()
         };
         if !agent_mcp_servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"agent": agent_alias})),
-                &format!(
-                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
-                    agent_mcp_servers.len()
-                )
+            use ::zeroclaw_log::Instrument;
+            let mcp_model_provider = agent.model_provider.as_str().to_string();
+            let mcp_model = config
+                .model_provider_for_agent(agent_alias)
+                .and_then(|p| p.model.clone())
+                .unwrap_or_default();
+            let attribution_span = ::zeroclaw_log::attribution_span!(
+                &zeroclaw_runtime::agent::AgentAttribution(agent_alias)
             );
-            match zeroclaw_runtime::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    ch_mcp_elevation_arcs =
-                        zeroclaw_runtime::tools::collect_mcp_elevation_arcs(&registry).await;
-                    // Per-agent MCP tool gate. The channel path previously pushed
-                    // every MCP tool into every agent's registry with no policy
-                    // check, so one agent's MCP server tools leaked into a
-                    // co-resident agent whose `excluded_tools` denied them. Build
-                    // the same policy the runtime `run` / `from_config` /
-                    // `process_message` paths use and gate both the eager and the
-                    // deferred branch through it: the risk-profile denylist is
-                    // enforced while the allowlist still auto-admits MCP names.
-                    let mcp_policy = mcp_tool_access_policy(security.as_ref(), None);
-                    if config.mcp.deferred_loading {
-                        let deferred_set =
-                            zeroclaw_runtime::tools::DeferredMcpToolSet::from_registry(
-                                std::sync::Arc::clone(&registry),
-                            )
-                            .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"agent": agent_alias})),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        deferred_section =
-                            zeroclaw_runtime::tools::build_deferred_tools_section_filtered(
-                                &deferred_set,
-                                mcp_policy.as_ref(),
-                            );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            zeroclaw_runtime::tools::ActivatedToolSet::new(),
-                        ));
-                        ch_activated_handle = Some(std::sync::Arc::clone(&activated));
-                        let mut tool_search =
-                            zeroclaw_runtime::tools::ToolSearchTool::new(deferred_set, activated);
-                        if let Some(policy) = mcp_policy {
-                            tool_search = tool_search.with_access_policy(policy);
-                        }
-                        built_tools.push(Box::new(tool_search));
-                    } else {
-                        // Register only MCP tools the agent's policy admits
-                        // (parity with the runtime eager path): the denylist
-                        // drops excluded tools, the allowlist auto-admits the rest.
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn Tool> = std::sync::Arc::new(
-                                    zeroclaw_runtime::tools::McpToolWrapper::new(
-                                        name,
-                                        def,
+            ::zeroclaw_log::scope!(
+                model_provider: mcp_model_provider,
+                model: mcp_model,
+                =>
+                async {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "Initializing MCP client - {} server(s) granted via mcp_bundles",
+                            agent_mcp_servers.len()
+                        )
+                    );
+                    match zeroclaw_runtime::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                        Ok(registry) => {
+                            let registry = std::sync::Arc::new(registry);
+                            ch_mcp_elevation_arcs =
+                                zeroclaw_runtime::tools::collect_mcp_elevation_arcs(&registry).await;
+                            // Per-agent MCP tool gate. The channel path previously pushed
+                            // every MCP tool into every agent's registry with no policy
+                            // check, so one agent's MCP server tools leaked into a
+                            // co-resident agent whose `excluded_tools` denied them. Build
+                            // the same policy the runtime `run` / `from_config` /
+                            // `process_message` paths use and gate both the eager and the
+                            // deferred branch through it: the risk-profile denylist is
+                            // enforced while the allowlist still auto-admits MCP names.
+                            let mcp_policy = mcp_tool_access_policy(security.as_ref(), None);
+                            if config.mcp.deferred_loading {
+                                let deferred_set =
+                                    zeroclaw_runtime::tools::DeferredMcpToolSet::from_registry(
                                         std::sync::Arc::clone(&registry),
+                                    )
+                                    .await;
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
                                     ),
+                                    &format!(
+                                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                                        deferred_set.len(),
+                                        registry.server_count()
+                                    )
                                 );
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut built_tools,
-                                    delegate_handle_ch.as_ref(),
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
+                                deferred_section =
+                                    zeroclaw_runtime::tools::build_deferred_tools_section_filtered(
+                                        &deferred_set,
+                                        mcp_policy.as_ref(),
+                                    );
+                                let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                                    zeroclaw_runtime::tools::ActivatedToolSet::new(),
+                                ));
+                                ch_activated_handle = Some(std::sync::Arc::clone(&activated));
+                                let mut tool_search =
+                                    zeroclaw_runtime::tools::ToolSearchTool::new(
+                                        deferred_set,
+                                        activated,
+                                    );
+                                if let Some(policy) = mcp_policy {
+                                    tool_search = tool_search.with_access_policy(policy);
                                 }
+                                built_tools.push(Box::new(tool_search));
+                            } else {
+                                // Register only MCP tools the agent's policy admits
+                                // (parity with the runtime eager path): the denylist
+                                // drops excluded tools, the allowlist auto-admits the rest.
+                                let names = registry.tool_names();
+                                let mut registered = 0usize;
+                                let mut skipped = 0usize;
+                                for name in names {
+                                    if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                    if let Some(def) = registry.get_tool_def(&name).await {
+                                        let wrapper: std::sync::Arc<dyn Tool> = std::sync::Arc::new(
+                                            zeroclaw_runtime::tools::McpToolWrapper::new(
+                                                name,
+                                                def,
+                                                std::sync::Arc::clone(&registry),
+                                            ),
+                                        );
+                                        if register_eager_mcp_tool_if_allowed(
+                                            wrapper,
+                                            &mut built_tools,
+                                            delegate_handle_ch.as_ref(),
+                                            mcp_policy.as_ref(),
+                                        ) {
+                                            registered += 1;
+                                        }
+                                    }
+                                }
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({
+                                        "skipped": skipped,
+                                    })),
+                                    &format!(
+                                        "MCP: {} tool(s) registered from {} server(s)",
+                                        registered,
+                                        registry.server_count()
+                                    )
+                                );
                             }
                         }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({
-                                "agent": agent_alias,
-                                "skipped": skipped,
-                            })),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s)",
-                                registered,
-                                registry.server_count()
-                            )
-                        );
+                        Err(e) => {
+                            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "MCP registry failed to initialize");
+                        }
                     }
                 }
-                Err(e) => {
-                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"agent_alias": agent_alias, "error": format!("{}", e)})), "MCP registry failed to initialize");
-                }
-            }
+            )
+            .instrument(attribution_span)
+            .await;
         }
 
         // Skill tools share the workspace-loaded `skills` Vec but each
