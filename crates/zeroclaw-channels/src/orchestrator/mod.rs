@@ -8954,14 +8954,6 @@ pub async fn start_channels(
                             let registry = std::sync::Arc::new(registry);
                             ch_mcp_elevation_arcs =
                                 zeroclaw_runtime::tools::collect_mcp_elevation_arcs(&registry).await;
-                            // Per-agent MCP tool gate. The channel path previously pushed
-                            // every MCP tool into every agent's registry with no policy
-                            // check, so one agent's MCP server tools leaked into a
-                            // co-resident agent whose `excluded_tools` denied them. Build
-                            // the same policy the runtime `run` / `from_config` /
-                            // `process_message` paths use and gate both the eager and the
-                            // deferred branch through it: the risk-profile denylist is
-                            // enforced while the allowlist still auto-admits MCP names.
                             let mcp_policy = mcp_tool_access_policy(security.as_ref(), None);
                             if config.mcp.deferred_loading {
                                 let deferred_set =
@@ -9000,9 +8992,6 @@ pub async fn start_channels(
                                 }
                                 built_tools.push(Box::new(tool_search));
                             } else {
-                                // Register only MCP tools the agent's policy admits
-                                // (parity with the runtime eager path): the denylist
-                                // drops excluded tools, the allowlist auto-admits the rest.
                                 let names = registry.tool_names();
                                 let mut registered = 0usize;
                                 let mut skipped = 0usize;
