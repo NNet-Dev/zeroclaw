@@ -608,9 +608,11 @@ impl std::error::Error for CreateError {}
 /// `PATCH /api/config`, RPC `config/set`) is guarded in `ensure_map_key_for_path`
 /// with the same `is_reserved_agent_alias` predicate, so that path cannot
 /// materialize `agents.default` either.
-/// First-run seeders (quickstart, env-override materialization) and the migration
-/// that synthesizes the fallback call the raw `create_map_key` directly on
-/// purpose: they may legitimately write `agents.default`. Symmetric with
+/// The operator quickstart-apply surface routes through this guard too. The only
+/// raw `create_map_key` writers left are non-operator paths that may legitimately
+/// write `agents.default`: env-override materialization (boot-time, from env
+/// vars) and the v1->v2 migration that synthesizes the fallback agent. Symmetric
+/// with
 /// [`rename_with_cascade`]'s reserved guard: rename refuses renaming to or from
 /// `default`, and this refuses creating it, so no surface can author an
 /// `agents.default` that the rename guard then traps. `create_map_key` still
