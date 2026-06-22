@@ -18005,6 +18005,16 @@ impl Config {
         {
             return;
         }
+        // Never auto-vivify the reserved `default` agent from a set-prop path: a
+        // prop write under a nonexistent `agents.default` must not materialize the
+        // reserved runtime fallback (the operator would get an agent the rename
+        // guard then traps). This is the set-prop analogue of the create guard in
+        // `create_map_key_checked`. The migration that legitimately synthesizes
+        // `agents.default` calls `create_map_key` directly, not this path, and an
+        // already-present `default` is left untouched by the existence check above.
+        if section == "agents" && crate::alias_refs::is_reserved_agent_alias(alias) {
+            return;
+        }
         let _ = self.create_map_key(section, alias);
     }
 

@@ -604,10 +604,13 @@ impl std::error::Error for CreateError {}
 /// the shared config boundary, so every operator-facing create surface (the
 /// gateway config-write handlers, the RPC dispatch, and the alias CLI) inherits
 /// it from one place instead of each re-deriving it, which is how the guard would
-/// drift per surface.
-/// First-run seeders (quickstart, env-override materialization) call the raw
-/// `create_map_key` directly on purpose: they may legitimately seed the fallback
-/// agent. Symmetric with
+/// drift per surface. Set-prop auto-vivification (`PUT /api/config/prop`,
+/// `PATCH /api/config`, RPC `config/set`) is guarded in `ensure_map_key_for_path`
+/// with the same `is_reserved_agent_alias` predicate, so that path cannot
+/// materialize `agents.default` either.
+/// First-run seeders (quickstart, env-override materialization) and the migration
+/// that synthesizes the fallback call the raw `create_map_key` directly on
+/// purpose: they may legitimately write `agents.default`. Symmetric with
 /// [`rename_with_cascade`]'s reserved guard: rename refuses renaming to or from
 /// `default`, and this refuses creating it, so no surface can author an
 /// `agents.default` that the rename guard then traps. `create_map_key` still
@@ -2680,6 +2683,25 @@ mod tests {
             create_map_key_checked(&mut cfg, "not.a.real.section", "x").unwrap_err(),
             CreateError::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn ensure_map_key_for_path_refuses_reserved_default_agent() {
+        let mut cfg = empty_config();
+        // A set-prop on a nonexistent `agents.default` must NOT auto-vivify the
+        // reserved runtime-fallback agent (the set-prop analogue of the create
+        // guard, covering PUT /prop, PATCH /config, and RPC config/set).
+        cfg.ensure_map_key_for_path("agents.default.enabled");
+        assert!(!cfg.agents.contains_key("default"));
+        // A non-reserved agent IS vivified, as normal set-prop-on-new behavior.
+        cfg.ensure_map_key_for_path("agents.scout.enabled");
+        assert!(cfg.agents.contains_key("scout"));
+        // An already-present `default` (e.g. migration-synthesized) is left
+        // intact and still configurable: the guard blocks vivification, not edits.
+        cfg.agents
+            .insert("default".to_string(), AliasedAgentConfig::default());
+        cfg.ensure_map_key_for_path("agents.default.model");
+        assert!(cfg.agents.contains_key("default"));
     }
 
     #[test]
