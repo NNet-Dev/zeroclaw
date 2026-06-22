@@ -1,9 +1,11 @@
 //! RFC #7141 inbound authentication seam: the [`AuthProvider`] trait + a
 //! default-deny [`ProviderRegistry`].
 //!
-//! Each provider verifies ONE credential kind (OIDC token, local password, SSH
-//! signature, peer uid, native pairing bearer) and emits a uniform
-//! [`zeroclaw_api::principal::Principal`] (identity + resolved grants). Dispatch,
+//! Each provider verifies ONE credential kind (OIDC token, SSH signature, peer
+//! uid, native pairing bearer) and emits a uniform
+//! [`zeroclaw_api::principal::Principal`] carrying the identity / claim inputs
+//! (the resolved ZeroClaw grants are added additively in the later
+//! IamPolicy-wiring step, not in this slice). Dispatch,
 //! audit, and per-principal isolation read that `Principal` and never see the
 //! credential, so they are provider-agnostic.
 //!
@@ -79,8 +81,8 @@ impl std::fmt::Debug for Credential {
 /// cannot positively authenticate — never a silent allow.
 #[async_trait]
 pub trait AuthProvider: Send + Sync {
-    /// Stable provider name = its config key (e.g. `"oidc"`, `"password"`,
-    /// `"native"`). Used for enumeration and diagnostics.
+    /// Stable provider name = its config key (e.g. `"oidc"`, `"native"`,
+    /// `"ssh-key"`). Used for enumeration and diagnostics.
     fn name(&self) -> &str;
 
     /// The [`AuthMethod`] this provider attests on success (also what it
