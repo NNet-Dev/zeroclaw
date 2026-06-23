@@ -276,13 +276,13 @@ impl<'a> SkillsService<'a> {
     /// existing skill *inside its bundle directory* — i.e. a real `Bundle`-origin
     /// skill. Workspace/open-skills/plugin skills never have a manifest under the
     /// bundle dir, so this rejects them with [`ServiceError::NotEditable`] rather
-    /// than a misleading [`ServiceError::NotFound`]. The caller checks
-    /// `dir.exists()` first, so a truly-absent target still surfaces as
-    /// `NotFound`; this guard fires for a dir that exists but is not a bundle
-    /// skill. (#7963 write-guard)
-    fn ensure_editable(&self, target: &SkillRef) -> Result<(), ServiceError> {
-        let dir = self.skill_directory(target)?;
-        if has_manifest(&dir) {
+    /// than a misleading [`ServiceError::NotFound`]. Operates on the bundle `dir`
+    /// the caller already resolved and existence-checked, so a truly-absent target
+    /// still surfaces as `NotFound` and this guard fires only for a dir that exists
+    /// but is not a bundle skill (one `skill_directory` resolve per call, no
+    /// assumption that a second resolve returns the same path). (#7963 write-guard)
+    fn ensure_editable(&self, target: &SkillRef, dir: &Path) -> Result<(), ServiceError> {
+        if has_manifest(dir) {
             Ok(())
         } else {
             Err(ServiceError::NotEditable {
@@ -298,7 +298,7 @@ impl<'a> SkillsService<'a> {
         if !dir.exists() {
             return Err(ServiceError::NotFound(target.to_string()));
         }
-        self.ensure_editable(target)?;
+        self.ensure_editable(target, &dir)?;
         std::fs::write(dir.join(SKILL_MANIFEST_FILENAME), doc.serialize())?;
         super::cache::invalidate();
         Ok(())
@@ -323,7 +323,7 @@ impl<'a> SkillsService<'a> {
         if !dir.exists() {
             return Err(ServiceError::NotFound(target.to_string()));
         }
-        self.ensure_editable(target)?;
+        self.ensure_editable(target, &dir)?;
         match mode {
             RemoveMode::Purge => std::fs::remove_dir_all(&dir)?,
             RemoveMode::Archive => {

@@ -541,6 +541,13 @@ pub fn load_skills_for_agent(
 /// `derive_origin` discriminators minus the bundle-dir match (a pre-bundle
 /// skill is never bundle-origin). Used to seed the dedup winner map so the
 /// shadow record can name the winner's source. (#7963)
+///
+/// This is a best-effort, display-only attribution for the shadow badge: the
+/// tag-based heuristic can misclassify a workspace skill whose `tags` happen to
+/// contain `"open-skills"` (or a `plugin:`-prefixed tag). That is acceptable
+/// because the hint never affects which skills load or their precedence — it
+/// only labels the source that already won the dedup. Not an authoritative
+/// origin resolver; use [`super::service`]'s `derive_origin` for that.
 fn origin_hint_of(skill: &Skill) -> &'static str {
     if skill.tags.iter().any(|t| t == "open-skills") {
         "open-skills"
