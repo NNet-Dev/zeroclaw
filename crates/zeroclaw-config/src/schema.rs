@@ -19258,9 +19258,10 @@ pub struct SopConfig {
     #[serde(default = "default_sop_max_finished_runs")]
     pub max_finished_runs: usize,
 
-    /// Persist run state durably across restarts. Default `false` → today's
-    /// ephemeral in-memory behavior (no surprise activation on upgrade). The
-    /// durable store is inert until this is enabled AND the engine is wired to it.
+    /// Persist run state durably across restarts. Default `false` keeps today's
+    /// ephemeral in-memory behavior (no surprise activation on upgrade). When set
+    /// to `true`, `build_sop_engine` selects the configured backend and in-flight
+    /// runs survive a restart.
     #[serde(default)]
     pub persist_runs: bool,
 

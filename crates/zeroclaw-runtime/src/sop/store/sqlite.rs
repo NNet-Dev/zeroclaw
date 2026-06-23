@@ -5,13 +5,14 @@
 //! access, which makes the CAS-claim admission and revision guards atomic without
 //! explicit transactions. Tables:
 //!
-//! - `sop_runs(run_id PK, revision, terminal, last_progress_at, json)` — upsert-by-revision
-//! - `sop_events(seq PK AUTOINCREMENT, run_id, ts, kind, actor, reason, payload)` — append-only
+//! - `sop_runs(run_id PK, revision, terminal, last_progress_at, json)` - upsert-by-revision
+//! - `sop_events(seq PK AUTOINCREMENT, run_id, ts, kind, actor, reason, payload)` - append-only
 //! - `sop_claims(run_id PK, sop_name, lease_expires, json)` - single-winner admission
-//! - `sop_proposals(id PK, status, json)` — procedural-memory namespace
+//! - `sop_proposals(id PK, status, json)` - procedural-memory namespace
 //!
-//! Not yet selected by `build_run_store()` (still in-memory by default); the
-//! config-driven factory + engine wiring are the next slices.
+//! Selected by `build_run_store()` when `[sop] persist_runs = true` with backend
+//! `"sqlite"`; `build_sop_engine` then injects it and calls `restore_runs()` at
+//! startup. The in-memory backend remains the default when persistence is off.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -107,7 +108,8 @@ fn guard_revision(
     Ok(())
 }
 
-/// Durable run store. The default backend once the config-driven factory lands.
+/// Durable run store. Selected by `build_run_store` when `persist_runs = true`
+/// with the default `"sqlite"` backend.
 pub struct SqliteRunStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -478,6 +480,11 @@ impl SopRunStore for SqliteRunStore {
         }
         if let Some(keep) = policy.keep_secs {
             let cutoff = (Utc::now() - Duration::seconds(keep as i64)).to_rfc3339();
+            // `last_progress_at < cutoff` is false for a NULL timestamp, so a row
+            // with no stamp is never age-evicted. That is safe here: terminal
+            // writes always stamp `last_progress_at` (the engine passes
+            // `now_iso8601()` via `PersistedRun::new`), so terminal rows are never
+            // NULL in practice.
             g.execute(
                 "DELETE FROM sop_events WHERE run_id IN
                    (SELECT run_id FROM sop_runs WHERE terminal=1 AND last_progress_at < ?1)",
@@ -720,7 +727,7 @@ mod tests {
             let a = SqliteRunStore::open(&path).unwrap();
             a.save_run(&run("r1", SopRunStatus::WaitingApproval, "1"))
                 .unwrap();
-        } // drop `a` — simulates daemon shutdown
+        } // drop `a` - simulates daemon shutdown
         let b = SqliteRunStore::open(&path).unwrap();
         let active = b.load_active_runs().unwrap();
         assert_eq!(active.len(), 1);

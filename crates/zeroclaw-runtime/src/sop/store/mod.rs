@@ -6,10 +6,12 @@
 //! and the procedural-memory proposal namespace — so those epics ride **one**
 //! abstraction, not three.
 //!
-//! This module currently ships the trait + wire shapes + an in-memory default
-//! impl (mirrors today's in-memory behaviour, zero behaviour change). The
-//! durable `SqliteRunStore`, the `Memory`-backed adapter, boot-rehydrate, and the
-//! engine wiring are follow-on commits — see
+//! This module ships the trait + wire shapes, the in-memory default impl (which
+//! mirrors today's behaviour with persistence off), the durable
+//! [`SqliteRunStore`], and the config-driven `build_run_store` factory.
+//! `build_sop_engine` injects the selected backend and rehydrates in-flight runs
+//! at startup via `restore_runs()`. (A `Memory`-backed adapter was considered and
+//! dropped: the `Memory` trait is async while `SopRunStore` is sync.) See
 //! `epics/B-run-state-store/{03-architecture,04-implementation-plan}.md`.
 
 pub mod model;
@@ -161,8 +163,10 @@ impl From<serde_json::Error> for StoreError {
 /// - `persist_runs = true`, backend `"memory"` -> ephemeral [`InMemoryRunStore`] (degraded/tests).
 /// - any other backend -> fail-loud `StoreError`.
 ///
-/// Not yet called in production; the engine persist-seams that consume this are
-/// the next slice, so the durable store stays inert until then.
+/// Called by `build_sop_engine`, which injects the result via `with_store` and
+/// then calls `restore_runs()` to rehydrate in-flight runs at startup. A
+/// backend-open failure is non-fatal there: the daemon logs and falls back to
+/// the in-memory store rather than failing to boot.
 pub fn build_run_store(
     cfg: &SopConfig,
     data_dir: &Path,
@@ -737,7 +741,7 @@ mod tests {
 
     #[test]
     fn prune_keep_secs_drops_aged_runs_even_under_max_terminal() {
-        let s = build_run_store();
+        let s = InMemoryRunStore::new();
         // Two terminal runs; the count (2) stays well under max_terminal, so only
         // the age bound can evict. One is ancient, one is far-future.
         s.finish_run("old", &run("old", 1, Some("2000-01-01T00:00:00Z")))
