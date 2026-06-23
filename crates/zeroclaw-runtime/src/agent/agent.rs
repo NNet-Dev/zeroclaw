@@ -1769,6 +1769,10 @@ impl Agent {
                                     .and_then(|c| c.as_str())
                                     .unwrap_or_default()
                                     .to_string(),
+                                // Provider-wire tool messages do not carry the
+                                // producing tool name; replayed results fall back
+                                // to blind canonicalization (PR #6183, #7345).
+                                tool_name: String::new(),
                             })
                         })
                         .collect();
@@ -1789,6 +1793,9 @@ impl Agent {
                             .and_then(|c| c.as_str())
                             .unwrap_or_default()
                             .to_string(),
+                        // No provenance on the provider-wire shape; blind canon
+                        // applies as before (PR #6183, #7345).
+                        tool_name: String::new(),
                     };
                     push_tool_results(&mut replayed, vec![result]);
                     continue;
@@ -3869,6 +3876,7 @@ mod tests {
             ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc-1".into(),
                 content: "ok".into(),
+                tool_name: String::new(),
             }]),
             ConversationMessage::Chat(ChatMessage::assistant("done")),
         ];
@@ -4611,6 +4619,7 @@ mod tests {
                     .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: format!("tc{i}"),
                         content: format!("result{i}"),
+                        tool_name: String::new(),
                     }]));
             }
         }
@@ -4716,6 +4725,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc1".into(),
                 content: "result1".into(),
+                tool_name: String::new(),
             }]));
         // AC2, TR2
         agent.history.push(ConversationMessage::AssistantToolCalls {
@@ -4733,6 +4743,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc2".into(),
                 content: "result2".into(),
+                tool_name: String::new(),
             }]));
         // AC3, TR3
         agent.history.push(ConversationMessage::AssistantToolCalls {
@@ -4750,6 +4761,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc3".into(),
                 content: "result3".into(),
+                tool_name: String::new(),
             }]));
 
         assert_eq!(agent.history.len(), 7);
@@ -4868,6 +4880,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc1".into(),
                 content: "result1".into(),
+                tool_name: String::new(),
             }]));
         // AC2, TR2
         agent.history.push(ConversationMessage::AssistantToolCalls {
@@ -4885,6 +4898,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc2".into(),
                 content: "result2".into(),
+                tool_name: String::new(),
             }]));
 
         assert_eq!(agent.history.len(), 5);
@@ -5000,6 +5014,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc1".into(),
                 content: "result1".into(),
+                tool_name: String::new(),
             }]));
         // AC2, TR2
         agent.history.push(ConversationMessage::AssistantToolCalls {
@@ -5017,6 +5032,7 @@ mod tests {
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc2".into(),
                 content: "result2".into(),
+                tool_name: String::new(),
             }]));
 
         assert_eq!(agent.history.len(), 6);
