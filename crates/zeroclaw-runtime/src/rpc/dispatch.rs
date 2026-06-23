@@ -2391,7 +2391,14 @@ impl RpcDispatcher {
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         {
             let mut config = self.ctx.config.write();
-            config.ensure_map_key_for_path(&req.prop);
+            if config.ensure_map_key_for_path(&req.prop) {
+                // Refused to vivify the reserved `default` agent: return a
+                // reserved error rather than a downstream "Unknown property".
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "alias `default` is reserved and cannot be created",
+                ));
+            }
             let info = config
                 .prop_fields()
                 .into_iter()

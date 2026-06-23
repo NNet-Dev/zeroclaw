@@ -2691,18 +2691,18 @@ mod tests {
     fn ensure_map_key_for_path_refuses_reserved_default_agent() {
         let mut cfg = empty_config();
         // A set-prop on a nonexistent `agents.default` must NOT auto-vivify the
-        // reserved runtime-fallback agent (the set-prop analogue of the create
-        // guard, covering PUT /prop, PATCH /config, and RPC config/set).
-        cfg.ensure_map_key_for_path("agents.default.enabled");
+        // reserved runtime-fallback agent, and signals the refusal (true) so the
+        // set-prop surface returns a reserved error (PUT /prop, PATCH, RPC set).
+        assert!(cfg.ensure_map_key_for_path("agents.default.enabled"));
         assert!(!cfg.agents.contains_key("default"));
-        // A non-reserved agent IS vivified, as normal set-prop-on-new behavior.
-        cfg.ensure_map_key_for_path("agents.scout.enabled");
+        // A non-reserved agent IS vivified (not refused), as normal set-prop-on-new.
+        assert!(!cfg.ensure_map_key_for_path("agents.scout.enabled"));
         assert!(cfg.agents.contains_key("scout"));
-        // An already-present `default` (e.g. migration-synthesized) is left
-        // intact and still configurable: the guard blocks vivification, not edits.
+        // An already-present `default` (e.g. migration-synthesized) is left intact
+        // and still configurable: the existence check returns false (not refused).
         cfg.agents
             .insert("default".to_string(), AliasedAgentConfig::default());
-        cfg.ensure_map_key_for_path("agents.default.model");
+        assert!(!cfg.ensure_map_key_for_path("agents.default.model"));
         assert!(cfg.agents.contains_key("default"));
     }
 
