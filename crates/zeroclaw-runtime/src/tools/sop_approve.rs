@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
 use crate::sop::types::SopRunAction;
 use crate::sop::{SopAuditLogger, SopEngine, SopMetricsCollector};
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -12,6 +13,7 @@ pub struct SopApproveTool {
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     collector: Option<Arc<SopMetricsCollector>>,
+    agent_alias: String,
 }
 
 impl SopApproveTool {
@@ -20,6 +22,7 @@ impl SopApproveTool {
             engine,
             audit: None,
             collector: None,
+            agent_alias: "agent".to_string(),
         }
     }
 
@@ -30,6 +33,12 @@ impl SopApproveTool {
 
     pub fn with_collector(mut self, collector: Arc<SopMetricsCollector>) -> Self {
         self.collector = Some(collector);
+        self
+    }
+
+    /// Set the agent alias recorded as the approval principal (default `"agent"`).
+    pub fn with_agent_alias(mut self, alias: impl Into<String>) -> Self {
+        self.agent_alias = alias.into();
         self
     }
 }
@@ -84,38 +93,50 @@ impl Tool for SopApproveTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            match engine.approve_step(run_id) {
-                Ok(action) => {
+            // Route through the single chokepoint as the agent principal. Under
+            // approval_mode=out_of_band_required this returns RejectedSelfApproval
+            // (the gate stays open for a CLI/gateway approver); the ledger row is
+            // recorded inside resolve_gate (no fire-and-forget lost-write).
+            let outcome = engine.resolve_gate(
+                run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::agent(&self.agent_alias),
+            );
+            match outcome {
+                Ok(o) => {
                     let snapshot = engine.get_run(run_id).cloned();
-                    (Ok(action), snapshot)
+                    (Ok(o), snapshot)
                 }
                 Err(e) => (Err(e), None),
             }
         };
 
-        // Audit logging (engine lock dropped, safe to await)
-        if let Some(ref audit) = self.audit
-            && let Some(ref run) = run_snapshot
-            && let Err(e) = audit.log_approval(run, run.current_step).await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "SOP audit log after approve failed"
-            );
-        }
-
-        // Metrics collector (independent of audit)
-        if let Some(ref collector) = self.collector
-            && let Some(ref run) = run_snapshot
-        {
-            collector.record_approval(&run.sop_name, &run.run_id);
+        // Only a genuine approval (Resumed) records the legacy audit + metrics.
+        let approved = matches!(result, Ok(ResolveOutcome::Resumed(_)));
+        if approved {
+            // Audit logging (engine lock dropped, safe to await)
+            if let Some(ref audit) = self.audit
+                && let Some(ref run) = run_snapshot
+                && let Err(e) = audit.log_approval(run, run.current_step).await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "SOP audit log after approve failed"
+                );
+            }
+            // Metrics collector (independent of audit)
+            if let Some(ref collector) = self.collector
+                && let Some(ref run) = run_snapshot
+            {
+                collector.record_approval(&run.sop_name, &run.run_id);
+            }
         }
 
         match result {
-            Ok(action) => {
+            Ok(ResolveOutcome::Resumed(action)) => {
                 let output = match action {
                     SopRunAction::ExecuteStep {
                         run_id, context, ..
@@ -130,6 +151,33 @@ impl Tool for SopApproveTool {
                     error: None,
                 })
             }
+            Ok(ResolveOutcome::RejectedSelfApproval) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "This SOP gate requires an out-of-band approver \
+                     (approval_mode = out_of_band_required). Use `zeroclaw sop approve <run_id>` \
+                     or the dashboard."
+                        .to_string(),
+                ),
+            }),
+            Ok(ResolveOutcome::AlreadyResolved) => Ok(ToolResult {
+                success: true,
+                output: format!("Run {run_id} was already resolved."),
+                error: None,
+            }),
+            Ok(ResolveOutcome::Denied) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Run {run_id} was denied.")),
+            }),
+            Ok(ResolveOutcome::NotWaiting) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Approval failed: run {run_id} is not waiting for approval."
+                )),
+            }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -287,5 +335,33 @@ mod tests {
         // No audit entry for failed approval
         let stored = audit.get_run("nonexistent").await.unwrap();
         assert!(stored.is_none(), "failed approve should not write audit");
+    }
+
+    #[tokio::test]
+    async fn agent_approve_rejected_under_out_of_band_required() {
+        // The agent tool cannot self-satisfy a gate under out_of_band_required; the
+        // gate stays open for a CLI/gateway approver.
+        let cfg = SopConfig {
+            approval_mode: zeroclaw_config::schema::ApprovalMode::OutOfBandRequired,
+            ..SopConfig::default()
+        };
+        let mut engine = SopEngine::new(cfg);
+        engine.set_sops_for_test(vec![test_sop()]);
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-02-19T12:00:00Z".into(),
+        };
+        engine.start_run("test-sop", event).unwrap();
+        let run_id = engine.active_runs().keys().next().unwrap().clone();
+
+        let tool = SopApproveTool::new(Arc::new(Mutex::new(engine)));
+        let result = tool.execute(json!({ "run_id": run_id })).await.unwrap();
+        assert!(!result.success, "agent self-approval is rejected");
+        assert!(
+            result.error.unwrap().contains("out-of-band"),
+            "message points the agent at the out-of-band approver"
+        );
     }
 }
