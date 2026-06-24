@@ -6234,16 +6234,40 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
                 .cloned()
                 .unwrap_or_default();
             if pending.is_empty() {
-                println!("No SOP runs waiting for approval.");
+                println!(
+                    "{}",
+                    t("cli-sop-pending-none", "No SOP runs waiting for approval.")
+                );
             } else {
-                println!("SOP runs waiting for approval:");
+                println!(
+                    "{}",
+                    t("cli-sop-pending-header", "SOP runs waiting for approval:")
+                );
                 for r in pending {
+                    let run_id = r.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let sop_name = r.get("sop_name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let step = r
+                        .get("step")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    let total = r
+                        .get("total_steps")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
                     println!(
-                        "  {} [{}] step {}/{}",
-                        r.get("run_id").and_then(|v| v.as_str()).unwrap_or("?"),
-                        r.get("sop_name").and_then(|v| v.as_str()).unwrap_or("?"),
-                        r.get("step").and_then(|v| v.as_u64()).unwrap_or(0),
-                        r.get("total_steps").and_then(|v| v.as_u64()).unwrap_or(0),
+                        "{}",
+                        ta(
+                            "cli-sop-pending-row",
+                            &[
+                                ("run_id", run_id),
+                                ("sop_name", sop_name),
+                                ("step", &step),
+                                ("total", &total),
+                            ],
+                            "  (sop run)",
+                        )
                     );
                 }
             }
