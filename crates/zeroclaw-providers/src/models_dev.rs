@@ -35,7 +35,7 @@ struct ModelEntry {
     cost: Option<ModelCost>,
 }
 
-/// models.dev `cost` block — USD per 1M tokens (the same unit ZeroClaw's rate
+/// models.dev `cost` block: USD per 1M tokens (the same unit ZeroClaw's rate
 /// sheet uses, so no conversion is needed).
 #[derive(Debug, Deserialize, Clone, Copy, Default)]
 struct ModelCost {
@@ -115,9 +115,9 @@ pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
 }
 
 /// Per-model pricing for one model_provider from a parsed catalog, as a
-/// `model_id -> ModelRates` map. Models with no `cost` block are omitted —
+/// `model_id -> ModelRates` map. Models with no `cost` block are omitted;
 /// like `rates_catalog`, this emptiness filter is load-bearing for downstream
-/// consumers. Pure — unit-testable without the network. Rates are USD per 1M
+/// consumers. Pure, unit-testable without the network. Rates are USD per 1M
 /// tokens verbatim (no conversion).
 pub(crate) fn pricing_from_catalog(
     catalog: &Catalog,
@@ -129,7 +129,7 @@ pub(crate) fn pricing_from_catalog(
     };
     for model in entry.models.values() {
         let Some(cost) = model.cost else { continue };
-        // models.dev `cost` is already USD per 1M tokens — no scaling. Each
+        // models.dev `cost` is already USD per 1M tokens, no scaling. Each
         // dimension is sanity-bounded so a malformed catalog entry can't bill
         // an absurd cost (same ceiling as the gateway path).
         let rates = ModelRates {

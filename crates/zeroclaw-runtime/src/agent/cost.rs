@@ -213,7 +213,7 @@ tokio::task_local! {
 /// Each dimension is `None` when nothing matched (so the caller can tell
 /// "configured absent" from a configured `Some(0.0)` and fill only the gaps
 /// from the live-price fallback). A zero `cached_input` rate means "no
-/// discount" — the per-token caller bills the cached subset at the standard
+/// discount": the per-token caller bills the cached subset at the standard
 /// input rate.
 fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
     let try_lookup = |key: &str| -> Option<ModelRates> {
