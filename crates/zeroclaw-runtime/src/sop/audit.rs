@@ -62,6 +62,13 @@ impl SopAuditLogger {
     }
 
     /// Log an operator approval event for a specific step.
+    ///
+    /// LEGACY (EPIC C): the append-only audit of record for gate resolutions is now
+    /// the durable run-store event log (`SopRunStore::append_event`, written inside
+    /// `engine.resolve_gate` with the transport-derived principal). This Memory key
+    /// is a last-write-wins overwrite keyed by `{run}_{step}` (no who/where, clobbers
+    /// on re-approval); it is kept as a compatibility write only. Prefer the store
+    /// ledger (`engine.run_events`) for audit/compliance reads.
     pub async fn log_approval(&self, run: &SopRun, step_number: u32) -> Result<()> {
         let key = format!("sop_approval_{}_{step_number}", run.run_id);
         let content = serde_json::to_string_pretty(run)?;

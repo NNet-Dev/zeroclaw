@@ -364,4 +364,22 @@ mod tests {
             "message points the agent at the out-of-band approver"
         );
     }
+
+    #[tokio::test]
+    async fn approve_writes_append_only_ledger() {
+        // C5: the audit of record is the append-only store ledger, written inside
+        // resolve_gate with the principal - not the legacy Memory overwrite.
+        let (engine, run_id) = engine_with_run();
+        let tool = SopApproveTool::new(engine.clone());
+        let result = tool.execute(json!({ "run_id": &run_id })).await.unwrap();
+        assert!(result.success);
+
+        let events = engine.lock().unwrap().run_events(&run_id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "gate_resolved" && e.actor.as_deref() == Some("agent")),
+            "approval writes an append-only gate_resolved ledger row attributed to the agent"
+        );
+    }
 }
