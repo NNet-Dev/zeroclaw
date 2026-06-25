@@ -16,6 +16,7 @@ zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.1", default-
 zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.1" }
 zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "0.8.1" }
 zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "0.8.1" }
+zerorelay = { path = "apps/zerorelay", version = "0.8.1" }
 zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.1" }
 zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.1" }
 zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.1" }

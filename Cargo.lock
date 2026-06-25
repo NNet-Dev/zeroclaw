@@ -14682,10 +14682,12 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
+ "zeroclaw-relay-proto",
  "zeroclaw-spawn",
  "zeroclaw-tls",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
+ "zerorelay",
  "zip",
 ]
 
