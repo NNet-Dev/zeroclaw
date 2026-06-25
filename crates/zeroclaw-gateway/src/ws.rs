@@ -623,7 +623,9 @@ async fn handle_socket(
                         let Some(decision) = decision.filter(|_| !run_id.is_empty()) else {
                             let err = serde_json::json!({
                                 "type": "error",
-                                "message": "sop approval_response requires run_id and decision in {approve,deny}",
+                                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                                    "cli-sop-ws-invalid-approval"
+                                ),
                                 "code": "INVALID_APPROVAL_RESPONSE"
                             });
                             let _ = sender.send(Message::Text(err.to_string().into())).await;
@@ -642,21 +644,28 @@ async fn handle_socket(
                                         }),
                                         Err(e) => serde_json::json!({
                                             "type": "error",
-                                            "message": format!("sop resolve failed: {e}"),
+                                            "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                                                "cli-sop-ws-resolve-failed",
+                                                &[("error", &e.to_string())],
+                                            ),
                                             "code": "SOP_RESOLVE_FAILED"
                                         }),
                                     }
                                 }
                                 Err(_) => serde_json::json!({
                                     "type": "error",
-                                    "message": "SOP engine lock poisoned",
+                                    "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                                        "cli-sop-ws-engine-lock-poisoned"
+                                    ),
                                     "code": "SOP_LOCK_POISONED"
                                 }),
                             }
                         } else {
                             serde_json::json!({
                                 "type": "error",
-                                "message": "SOP subsystem not enabled",
+                                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                                    "cli-sop-ws-subsystem-disabled"
+                                ),
                                 "code": "SOP_DISABLED"
                             })
                         };
@@ -1541,6 +1550,32 @@ async fn process_chat_message(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn sop_ws_error_frames_resolve_via_fluent() {
+        // The SOP WebSocket error frames are UI-surfaced and route through the
+        // embedded en/cli.ftl. A renamed/typo'd key would silently ship the
+        // missing-key fallback `{cli-sop-ws-...}` to the browser; guard against it.
+        for key in [
+            "cli-sop-ws-invalid-approval",
+            "cli-sop-ws-engine-lock-poisoned",
+            "cli-sop-ws-subsystem-disabled",
+        ] {
+            let s = zeroclaw_runtime::i18n::get_required_cli_string(key);
+            assert!(
+                !s.starts_with('{') || !s.ends_with('}'),
+                "fluent missing-key fallback leaked for {key}: {s:?}"
+            );
+        }
+        let resolved = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-sop-ws-resolve-failed",
+            &[("error", "boom")],
+        );
+        assert!(
+            resolved.contains("boom"),
+            "the resolve-failed frame must interpolate the error: {resolved:?}"
+        );
+    }
 
     #[test]
     fn extract_ws_token_from_authorization_header() {
