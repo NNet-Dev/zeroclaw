@@ -10,10 +10,15 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use zerorelay::{Admission, RelayConfig, RelayServer};
 
+/// Build-time version: `git describe` (tag + commits-since + short hash, `-dirty`
+/// when modified), or the crate version when git is unavailable. Set by build.rs.
+const VERSION: &str = env!("ZERORELAY_VERSION");
+
 #[derive(Parser, Debug)]
 #[command(
     name = "zerorelay",
-    about = "ZeroClaw nominated relay (blind forwarder)"
+    about = "ZeroClaw nominated relay (blind forwarder)",
+    version = VERSION
 )]
 struct Cli {
     #[command(subcommand)]
