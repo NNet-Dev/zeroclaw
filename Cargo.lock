@@ -14312,7 +14312,6 @@ dependencies = [
  "rcgen",
  "rusqlite",
  "rustls",
- "rustls-pemfile",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -14338,6 +14337,7 @@ dependencies = [
  "zeroclaw-providers",
  "zeroclaw-runtime",
  "zeroclaw-spawn",
+ "zeroclaw-tls",
  "zeroclaw-tools",
 ]
 
@@ -14620,6 +14620,22 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroclaw-log",
+]
+
+[[package]]
+name = "zeroclaw-tls"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "hex",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio-rustls",
  "zeroclaw-log",
 ]
 
