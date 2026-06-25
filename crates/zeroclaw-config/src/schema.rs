@@ -6487,7 +6487,7 @@ impl Default for GatewayClientAuthConfig {
 /// Unlike the gateway's variant there is no `require_client_cert` knob: the
 /// remote WSS plane is *always* mutually authenticated (there is no
 /// server-only-TLS path), so a client certificate is unconditionally required.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "wss.client_auth"]
 pub struct WssClientAuthConfig {
@@ -6501,16 +6501,6 @@ pub struct WssClientAuthConfig {
     /// only client certs matching one of these fingerprints are accepted.
     #[serde(default)]
     pub pinned_certs: Vec<String>,
-}
-
-impl Default for WssClientAuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            ca_cert_path: String::new(),
-            pinned_certs: Vec::new(),
-        }
-    }
 }
 
 /// WebSocket Secure (WSS) transport for remote TUI-to-daemon connections (`[wss]`).

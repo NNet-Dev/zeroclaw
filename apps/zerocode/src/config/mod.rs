@@ -98,6 +98,16 @@ pub(crate) struct WssTlsSection {
     pub skip_verify: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip_verify_routes: Vec<String>,
+    /// PEM CA certificate used to verify the daemon (mutual TLS). When set, the
+    /// server certificate is verified against this CA instead of the system roots.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ca_cert_path: String,
+    /// PEM client certificate presented to the daemon (mutual TLS).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_cert_path: String,
+    /// PEM client private key for `client_cert_path`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_key_path: String,
 }
 
 impl WssTlsSection {
@@ -106,7 +116,11 @@ impl WssTlsSection {
     }
 
     fn is_empty(&self) -> bool {
-        !self.skip_verify && self.skip_verify_routes.is_empty()
+        !self.skip_verify
+            && self.skip_verify_routes.is_empty()
+            && self.ca_cert_path.is_empty()
+            && self.client_cert_path.is_empty()
+            && self.client_key_path.is_empty()
     }
 }
 

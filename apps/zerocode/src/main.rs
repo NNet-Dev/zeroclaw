@@ -83,12 +83,30 @@ struct Cli {
     /// Required for self-signed certificates. Only used with --connect.
     #[arg(long)]
     tls_skip_verify: bool,
+
+    /// PEM CA certificate to verify the daemon (mutual TLS). Only used with --connect.
+    #[arg(long)]
+    tls_ca_cert: Option<String>,
+
+    /// PEM client certificate to present to the daemon (mutual TLS).
+    #[arg(long, requires = "tls_client_key")]
+    tls_client_cert: Option<String>,
+
+    /// PEM client private key for --tls-client-cert.
+    #[arg(long, requires = "tls_client_cert")]
+    tls_client_key: Option<String>,
+}
+
+/// Map an empty path string to `None`.
+fn opt_path(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 /// Where zerocode should connect.
 pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
-    Wss { url: String, skip_verify: bool },
+    Wss { url: String, tls: client::ClientTls },
 }
 
 impl ConnectTarget {
@@ -101,13 +119,7 @@ impl ConnectTarget {
     }
 
     pub(crate) fn insecure_tls(&self) -> bool {
-        matches!(
-            self,
-            Self::Wss {
-                skip_verify: true,
-                ..
-            }
-        )
+        matches!(self, Self::Wss { tls, .. } if tls.skip_verify)
     }
 
     /// Connect to this target, reclaiming a prior TUI identity when
@@ -123,8 +135,8 @@ impl ConnectTarget {
             Self::LocalSocket(socket) => {
                 client::RpcClient::connect(socket, prev_id, prev_sig).await
             }
-            Self::Wss { url, skip_verify } => {
-                client::RpcClient::connect_wss(url, prev_id, prev_sig, *skip_verify).await
+            Self::Wss { url, tls } => {
+                client::RpcClient::connect_wss(url, prev_id, prev_sig, tls).await
             }
         }
     }
@@ -269,10 +281,23 @@ async fn run() -> anyhow::Result<()> {
         if let Some((uri, skip_verify)) =
             resolve_wss_target(cli.connect.clone(), cli.tls_skip_verify, cfg_wss)
         {
-            ConnectTarget::Wss {
-                url: uri,
+            // CLI flags override config for the mutual-TLS material.
+            let tls = client::ClientTls {
                 skip_verify,
-            }
+                ca_cert_path: cli
+                    .tls_ca_cert
+                    .clone()
+                    .or_else(|| opt_path(&cfg_wss.tls.ca_cert_path)),
+                client_cert_path: cli
+                    .tls_client_cert
+                    .clone()
+                    .or_else(|| opt_path(&cfg_wss.tls.client_cert_path)),
+                client_key_path: cli
+                    .tls_client_key
+                    .clone()
+                    .or_else(|| opt_path(&cfg_wss.tls.client_key_path)),
+            };
+            ConnectTarget::Wss { url: uri, tls }
         } else {
             let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
             let socket = client::resolve_socket_path(&config_dir)?;
@@ -298,8 +323,8 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
-        ConnectTarget::Wss { url, skip_verify } => {
-            if *skip_verify && !loaded_config.connection.wss.tls.route_acked(url) {
+        ConnectTarget::Wss { url, tls } => {
+            if tls.skip_verify && !loaded_config.connection.wss.tls.route_acked(url) {
                 match confirm_insecure_tls(url)? {
                     InsecureTlsChoice::Once => {}
                     InsecureTlsChoice::Always => {
@@ -310,7 +335,7 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
-            client::RpcClient::connect_wss(url, None, None, *skip_verify).await?
+            client::RpcClient::connect_wss(url, None, None, tls).await?
         }
     };
 

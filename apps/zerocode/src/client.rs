@@ -414,6 +414,85 @@ pub struct RpcClient {
     transport: Transport,
 }
 
+/// TLS verification + mutual-TLS client identity for a WSS connection.
+#[derive(Debug, Clone, Default)]
+pub struct ClientTls {
+    /// Disable server certificate verification (self-signed dev only).
+    pub skip_verify: bool,
+    /// PEM CA certificate to verify the daemon against (mutual TLS). When unset
+    /// and not skipping, the system / webpki roots are used.
+    pub ca_cert_path: Option<String>,
+    /// PEM client certificate to present to the daemon (mutual TLS).
+    pub client_cert_path: Option<String>,
+    /// PEM private key for `client_cert_path`.
+    pub client_key_path: Option<String>,
+}
+
+impl ClientTls {
+    /// True when no custom TLS material is configured (plain default path).
+    pub fn is_default(&self) -> bool {
+        !self.skip_verify && self.ca_cert_path.is_none() && self.client_cert_path.is_none()
+    }
+}
+
+/// Verifier that accepts every server certificate without checking. Used only on
+/// the explicit `skip_verify` path (insecure; self-signed dev only).
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Load PEM certificates from a file into DER.
+fn load_pem_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let pem = std::fs::read(path).with_context(|| format!("reading certificate file {path}"))?;
+    rustls_pemfile::certs(&mut &pem[..])
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing PEM certificates from {path}"))
+}
+
+/// Load a PEM private key from a file into DER.
+fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let pem = std::fs::read(path).with_context(|| format!("reading key file {path}"))?;
+    rustls_pemfile::private_key(&mut &pem[..])
+        .with_context(|| format!("parsing private key from {path}"))?
+        .ok_or_else(|| anyhow::Error::msg(format!("no private key found in {path}")))
+}
+
 impl RpcClient {
     /// Connect to the daemon's local IPC endpoint and complete the
     /// `initialize` handshake.
@@ -548,23 +627,29 @@ impl RpcClient {
     /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
-    /// When `tls_skip_verify` is true, certificate verification is
-    /// disabled — required for self-signed certs on remote hosts.
+    /// `tls` controls TLS verification and mutual-TLS client identity. When the
+    /// daemon's remote WSS plane requires mutual TLS, set `ca_cert_path` (the
+    /// daemon CA to trust) and `client_cert_path` / `client_key_path` (the client
+    /// certificate to present). `skip_verify` disables server verification
+    /// (self-signed dev only).
     pub async fn connect_wss(
         url: &str,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
-        tls_skip_verify: bool,
+        tls: &ClientTls,
     ) -> Result<Self> {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
-        let connector = if tls_skip_verify {
-            Some(tokio_tungstenite::Connector::Rustls(
-                Self::insecure_tls_config(),
-            ))
-        } else {
+        // Use the built-in (webpki-roots) connector only for the plain default:
+        // no client certificate, no custom CA, no skip-verify. Any custom TLS
+        // material requires our own rustls ClientConfig.
+        let connector = if tls.is_default() {
             None
+        } else {
+            Some(tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(
+                tls,
+            )?))
         };
 
         let (ws_stream, _response) =
@@ -694,63 +779,56 @@ impl RpcClient {
         })
     }
 
-    /// Build a rustls `ClientConfig` that accepts any server certificate.
-    fn insecure_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    /// Build a rustls `ClientConfig` from a [`ClientTls`]: server verification via
+    /// the configured CA (or `NoVerify` when `skip_verify`), presenting the client
+    /// certificate for mutual TLS when one is configured.
+    fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
         use std::sync::Arc;
 
-        /// Verifier that accepts every certificate without checking.
-        #[derive(Debug)]
-        struct NoVerify;
-
-        impl rustls::client::danger::ServerCertVerifier for NoVerify {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &rustls::pki_types::CertificateDer<'_>,
-                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-                _server_name: &rustls::pki_types::ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: rustls::pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls::pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls::pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            }
-        }
-
-        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
-        .expect("ring provider supports the default protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
+        .expect("ring provider supports the default protocol versions");
 
-        Arc::new(config)
+        // Server verification.
+        let verified = if tls.skip_verify {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+        } else if let Some(ca_path) = &tls.ca_cert_path {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in load_pem_certs(ca_path)? {
+                roots
+                    .add(cert)
+                    .context("adding daemon CA to the client root store")?;
+            }
+            builder.with_root_certificates(roots)
+        } else {
+            anyhow::bail!(
+                "WSS client certificate requires either tls.ca_cert_path (the daemon CA to trust) \
+                 or tls.skip_verify"
+            );
+        };
+
+        // Mutual-TLS client identity.
+        let config = match (&tls.client_cert_path, &tls.client_key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let chain = load_pem_certs(cert_path)?;
+                let key = load_pem_key(key_path)?;
+                verified
+                    .with_client_auth_cert(chain, key)
+                    .context("loading client certificate / key for mutual TLS")?
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "WSS mutual TLS requires both tls.client_cert_path and tls.client_key_path"
+                );
+            }
+            (None, None) => verified.with_no_client_auth(),
+        };
+
+        Ok(Arc::new(config))
     }
 
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
@@ -2311,8 +2389,24 @@ mod tls_tests {
     use super::*;
 
     #[test]
-    fn insecure_tls_config_builds_without_panic() {
-        let cfg = RpcClient::insecure_tls_config();
+    fn skip_verify_tls_config_builds_without_panic() {
+        let tls = ClientTls {
+            skip_verify: true,
+            ..Default::default()
+        };
+        let cfg = RpcClient::wss_tls_config(&tls).expect("skip-verify config builds");
         assert!(Arc::strong_count(&cfg) >= 1);
+    }
+
+    #[test]
+    fn client_cert_requires_ca_or_skip() {
+        // A client cert with neither a CA nor skip_verify is a clear error, not
+        // a silent fall-through to system roots.
+        let tls = ClientTls {
+            client_cert_path: Some("/x/cert.pem".into()),
+            client_key_path: Some("/x/key.pem".into()),
+            ..Default::default()
+        };
+        assert!(RpcClient::wss_tls_config(&tls).is_err());
     }
 }
