@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use zerorelay::{Admission, RelayConfig, RelayServer};
 
 #[derive(Parser, Debug)]
@@ -16,6 +16,9 @@ use zerorelay::{Admission, RelayConfig, RelayServer};
     about = "ZeroClaw nominated relay (blind forwarder)"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Address to listen on for daemon and client connections.
     #[arg(long, default_value = "0.0.0.0:8443")]
     bind: String,
@@ -33,9 +36,27 @@ struct Cli {
     deny: Vec<String>,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// TCP-connect to a running relay and exit 0 if reachable. For container
+    /// HEALTHCHECK on shell-less images.
+    Healthcheck {
+        /// Address to probe.
+        #[arg(long, default_value = "127.0.0.1:8443")]
+        addr: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Command::Healthcheck { addr }) = &cli.command {
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("relay not reachable at {addr}"))?;
+        return Ok(());
+    }
 
     let registration_mode = match cli.registration_mode.as_str() {
         "open" => Admission::Open,
