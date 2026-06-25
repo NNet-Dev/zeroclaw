@@ -16,6 +16,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 
+pub mod certgen;
+pub use certgen::{Pem, ServerMaterials, ensure_server_materials, issue_client_cert};
+
 /// Client-certificate verification parameters (transport-neutral).
 ///
 /// Construct this only when client authentication should be enabled; pass it as
@@ -823,5 +826,49 @@ mod tests {
             do_handshake(srv_cfg, cli),
             &["NotValidYet", "InvalidCertificate"],
         );
+    }
+
+    /// End-to-end on the auto-generated + issued materials: a daemon that mints
+    /// its own CA + server cert (ensure_server_materials) and a client cert issued
+    /// from that CA (issue_client_cert) complete a mutually-authenticated TLS 1.3
+    /// handshake. This proves the secure-by-default path produces a working,
+    /// chaining cert set with the right profiles.
+    #[test]
+    fn autogen_materials_and_issued_client_complete_mtls_handshake() {
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let mats = ensure_server_materials(dir.path(), &[]).unwrap();
+
+        let srv_cfg = build_mtls_server_config(
+            mats.server_cert_path.to_str().unwrap(),
+            mats.server_key_path.to_str().unwrap(),
+            mats.ca_cert_path.to_str().unwrap(),
+            &[],
+        )
+        .unwrap();
+
+        let ca_cert_pem = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key_pem = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let client = issue_client_cert(&ca_cert_pem, &ca_key_pem, "device-abc").unwrap();
+
+        let client_cert = load_certs_from_pem(&client.cert_pem);
+        let client_key = load_key_from_pem(&client.key_pem);
+        let ca_der = load_certs_from_pem(&ca_cert_pem)[0].clone();
+
+        let cli = client_config(&ca_der, Some((client_cert[0].clone(), client_key)));
+        let version = do_handshake(srv_cfg, cli).expect("auto-gen + issued client must handshake");
+        assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
+    }
+
+    fn load_certs_from_pem(pem: &str) -> Vec<CertificateDer<'static>> {
+        rustls_pemfile::certs(&mut pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn load_key_from_pem(pem: &str) -> PrivateKeyDer<'static> {
+        rustls_pemfile::private_key(&mut pem.as_bytes())
+            .unwrap()
+            .expect("client key present")
     }
 }

@@ -3988,39 +3988,60 @@ async fn main() -> Result<()> {
 
                 registry.register_wss(Box::new(|ctx, cancel, client_count| {
                     Box::pin(async move {
-                        let wss_cfg = ctx.config.read().wss.clone();
+                        let (wss_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (cfg.wss.clone(), cfg.data_dir.clone())
+                        };
                         if !wss_cfg.enabled {
                             // WSS disabled — park until cancelled.
                             cancel.cancelled().await;
                             return Ok(());
                         }
-                        // The remote WSS plane is always mutually authenticated;
-                        // there is no server-only / plaintext fallback. Require the
-                        // [wss.client_auth] section (CA + optional pinning).
-                        let client_auth = wss_cfg
+                        // The remote WSS plane is ALWAYS mutually authenticated; there
+                        // is no server-only / plaintext fallback. Client-cert pinning,
+                        // if configured, comes from [wss.client_auth].
+                        let pinned = wss_cfg
                             .client_auth
                             .as_ref()
-                            .filter(|ca| ca.enabled)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "[wss] is enabled but [wss.client_auth] is not configured. The \
-                                     remote WSS plane requires mutual TLS: set \
-                                     wss.client_auth.enabled = true and wss.client_auth.ca_cert_path. \
-                                     There is no server-only-TLS fallback."
+                            .map(|c| c.pinned_certs.clone())
+                            .unwrap_or_default();
+                        // Bring-your-own mTLS when an operator CA is configured;
+                        // otherwise auto-generate a per-daemon CA + server certificate
+                        // under the data dir (secure by default, zero config).
+                        let byo_ca = wss_cfg
+                            .client_auth
+                            .as_ref()
+                            .filter(|c| c.enabled && !c.ca_cert_path.is_empty())
+                            .map(|c| c.ca_cert_path.clone());
+                        let (cert_path, key_path, ca_cert_path) = match byo_ca {
+                            Some(ca_cert_path) => {
+                                if wss_cfg.cert_path.is_empty() || wss_cfg.key_path.is_empty() {
+                                    return Err(anyhow::anyhow!(
+                                        "[wss.client_auth].ca_cert_path is set (bring-your-own mTLS) \
+                                         but [wss].cert_path/key_path are not. Provide the server \
+                                         certificate and key, or clear ca_cert_path to auto-generate \
+                                         the CA and server certificate."
+                                    ));
+                                }
+                                (wss_cfg.cert_path.clone(), wss_cfg.key_path.clone(), ca_cert_path)
+                            }
+                            None => {
+                                let mats = zeroclaw_tls::ensure_server_materials(
+                                    &data_dir.join("tls"),
+                                    &[],
+                                )?;
+                                (
+                                    mats.server_cert_path.to_string_lossy().into_owned(),
+                                    mats.server_key_path.to_string_lossy().into_owned(),
+                                    mats.ca_cert_path.to_string_lossy().into_owned(),
                                 )
-                            })?;
-                        if client_auth.ca_cert_path.is_empty() {
-                            return Err(anyhow::anyhow!(
-                                "[wss.client_auth] is enabled but ca_cert_path is empty. Set \
-                                 wss.client_auth.ca_cert_path to the PEM CA certificate that signs \
-                                 client certificates."
-                            ));
-                        }
+                            }
+                        };
                         let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
-                            &wss_cfg.cert_path,
-                            &wss_cfg.key_path,
-                            &client_auth.ca_cert_path,
-                            &client_auth.pinned_certs,
+                            &cert_path,
+                            &key_path,
+                            &ca_cert_path,
+                            &pinned,
                         )?;
                         let bind_addr: std::net::SocketAddr =
                             format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
