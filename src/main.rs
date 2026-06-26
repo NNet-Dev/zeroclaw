@@ -4348,6 +4348,11 @@ async fn main() -> Result<()> {
                                 .filter(|p| !p.is_empty()),
                             relay_insecure: relay_cfg.relay_insecure,
                             max_conns: 256,
+                            // Bridge-side OPEN-flood cap (A6): fast-reject beyond
+                            // ~20 new conns/sec (burst 60) so an OPEN flood cannot
+                            // force unbounded loopback mTLS handshakes.
+                            open_burst: 60,
+                            open_rate_per_sec: 20.0,
                         };
                         zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
                     })

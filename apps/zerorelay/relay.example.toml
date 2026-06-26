@@ -36,3 +36,12 @@ max_conns_per_node = 256
 idle_timeout_secs = 300
 # Lease TTL (seconds) advertised to daemons at registration.
 lease_ttl_secs = 300
+# Abuse caps (A6). Per-source-IP connection-handshake rate: a burst allowance
+# plus a steady refill per second; excess connections from one IP are dropped
+# before the TLS handshake.
+accept_burst_per_ip = 30
+accept_rate_per_ip = 10.0
+# Per-node-id client-connect rate: excess Connects to one node-id are rejected
+# with `rate_limited`.
+connect_burst_per_node = 60
+connect_rate_per_node = 20.0

@@ -227,6 +227,71 @@ impl ConnWindow {
     }
 }
 
+/// A simple monotonic token-bucket rate limiter (std only, no background timer).
+///
+/// Refills continuously at `refill_per_sec` up to `capacity`; each admitted event
+/// costs one token. Used to cap abusive rates (A6): connection handshakes per
+/// source IP at the relay, and per-node `OPEN` handshakes at the daemon bridge so
+/// a flood cannot force unbounded loopback mTLS handshakes. Cheap and lock-guarded
+/// by the caller; not payload-aware (it counts events, never bytes).
+#[derive(Debug, Clone)]
+pub struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    refill_per_sec: f64,
+    last_refill: std::time::Instant,
+}
+
+impl TokenBucket {
+    /// A bucket that starts full with room for `capacity` burst events, refilling
+    /// at `refill_per_sec`. A zero/negative rate makes a fixed `capacity`-event
+    /// allowance that never refills.
+    pub fn new(capacity: u32, refill_per_sec: f64) -> Self {
+        Self::new_at(capacity, refill_per_sec, std::time::Instant::now())
+    }
+
+    /// Construct with an explicit start instant (deterministic tests).
+    pub fn new_at(capacity: u32, refill_per_sec: f64, now: std::time::Instant) -> Self {
+        let capacity = f64::from(capacity);
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_per_sec: refill_per_sec.max(0.0),
+            last_refill: now,
+        }
+    }
+
+    /// Try to admit one event now, debiting a token. Returns false when the bucket
+    /// is empty (the caller should reject / rate-limit).
+    pub fn try_take(&mut self) -> bool {
+        self.try_take_at(std::time::Instant::now())
+    }
+
+    /// Try to admit one event at `now` (deterministic tests).
+    pub fn try_take_at(&mut self, now: std::time::Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True when the bucket is at full capacity (no recent activity) - the relay
+    /// uses this to prune idle per-source entries so the tracking map stays bounded.
+    pub fn is_full_at(&self, now: std::time::Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        (self.tokens + elapsed * self.refill_per_sec) >= self.capacity
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +467,51 @@ mod tests {
         w.set(INITIAL_WINDOW);
         assert!(!w.is_blocked());
         assert_eq!(w.available(), INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn token_bucket_allows_burst_then_blocks() {
+        let t0 = std::time::Instant::now();
+        let mut b = TokenBucket::new_at(3, 1.0, t0); // 3 burst, 1/sec
+        assert!(b.try_take_at(t0));
+        assert!(b.try_take_at(t0));
+        assert!(b.try_take_at(t0));
+        assert!(!b.try_take_at(t0), "4th in the same instant is rejected");
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let t0 = std::time::Instant::now();
+        let mut b = TokenBucket::new_at(2, 10.0, t0); // 10 tokens/sec
+        assert!(b.try_take_at(t0));
+        assert!(b.try_take_at(t0));
+        assert!(!b.try_take_at(t0));
+        // 0.2s later -> ~2 tokens refilled (capped at capacity 2).
+        let later = t0 + std::time::Duration::from_millis(200);
+        assert!(b.try_take_at(later));
+        assert!(b.try_take_at(later));
+        assert!(!b.try_take_at(later));
+    }
+
+    #[test]
+    fn token_bucket_zero_rate_is_a_fixed_allowance() {
+        let t0 = std::time::Instant::now();
+        let mut b = TokenBucket::new_at(2, 0.0, t0);
+        assert!(b.try_take_at(t0));
+        assert!(b.try_take_at(t0));
+        // Never refills, even much later.
+        let later = t0 + std::time::Duration::from_secs(3600);
+        assert!(!b.try_take_at(later));
+    }
+
+    #[test]
+    fn token_bucket_full_marks_idle_for_pruning() {
+        let t0 = std::time::Instant::now();
+        let mut b = TokenBucket::new_at(4, 4.0, t0);
+        assert!(b.try_take_at(t0));
+        assert!(!b.is_full_at(t0), "just used a token, not full");
+        // After enough time it refills to full -> prunable.
+        let later = t0 + std::time::Duration::from_secs(2);
+        assert!(b.is_full_at(later));
     }
 }

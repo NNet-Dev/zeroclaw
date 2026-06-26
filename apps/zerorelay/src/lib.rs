@@ -27,8 +27,10 @@ use base64::engine::general_purpose::STANDARD as B64;
 use futures_util::{SinkExt, StreamExt};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -39,7 +41,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use zeroclaw_relay_proto::{
-    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data, encode_data,
+    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, TokenBucket, decode_data,
+    encode_data,
 };
 
 /// How far a client may drive its send window negative before the relay treats it
@@ -117,6 +120,15 @@ pub struct RelayConfig {
     pub max_conns_per_node: usize,
     /// Drop a client connection after this much inactivity.
     pub idle_timeout: Duration,
+    /// Per-source-IP connection-handshake rate cap (A6): burst allowance and
+    /// steady refill per second. Excess connections from one IP are dropped
+    /// before the WebSocket handshake.
+    pub accept_burst_per_ip: u32,
+    pub accept_rate_per_ip: f64,
+    /// Per-node-id client-connect rate cap (A6): burst + refill per second. Excess
+    /// `Connect`s to one node-id get `rate_limited`.
+    pub connect_burst_per_node: u32,
+    pub connect_rate_per_node: f64,
 }
 
 impl RelayConfig {
@@ -141,6 +153,10 @@ impl Default for RelayConfig {
             lease_ttl: Duration::from_secs(300),
             max_conns_per_node: 256,
             idle_timeout: Duration::from_secs(300),
+            accept_burst_per_ip: 30,
+            accept_rate_per_ip: 10.0,
+            connect_burst_per_node: 60,
+            connect_rate_per_node: 20.0,
         }
     }
 }
@@ -160,6 +176,57 @@ enum ConnEvent {
     Ack(u32),
 }
 
+/// Per-node usage counters for the read-only status surface. Counts only - never
+/// payload bytes (the relay must not log or store DATA content).
+#[derive(Debug, Default)]
+struct NodeMetrics {
+    /// Client connections opened against this node over its lifetime.
+    conns_total: AtomicU64,
+    /// Client connections currently live.
+    conns_live: AtomicU64,
+    /// `DATA` frames forwarded in either direction (a count, never bytes).
+    frames_relayed: AtomicU64,
+    /// `Connect`s rejected by the per-node rate cap.
+    connects_rejected: AtomicU64,
+}
+
+/// Counts a live client conn against a node for as long as it exists: increments
+/// `conns_total` + `conns_live` on construction and decrements `conns_live` on
+/// drop, so every exit path (pair timeout, Open failure, normal teardown) keeps
+/// the live count exact.
+struct LiveConnGuard(Arc<NodeMetrics>);
+
+impl LiveConnGuard {
+    fn new(metrics: Arc<NodeMetrics>) -> Self {
+        metrics.conns_total.fetch_add(1, Ordering::Relaxed);
+        metrics.conns_live.fetch_add(1, Ordering::Relaxed);
+        Self(metrics)
+    }
+}
+
+impl Drop for LiveConnGuard {
+    fn drop(&mut self) {
+        self.0.conns_live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A point-in-time view of one node's routing + usage, for `zerorelay status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub node_id: String,
+    pub fpr: String,
+    pub conns_live: u64,
+    pub conns_total: u64,
+    pub frames_relayed: u64,
+    pub connects_rejected: u64,
+}
+
+/// A read-only snapshot of the relay's live routing table + per-node counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayStatus {
+    pub nodes: Vec<NodeStatus>,
+}
+
 /// A registered daemon's routing handle.
 struct DaemonHandle {
     /// Pubkey fingerprint that owns this node-id (anti-hijack binding).
@@ -171,7 +238,16 @@ struct DaemonHandle {
     to_daemon: mpsc::Sender<Message>,
     /// Live client connections multiplexed over this daemon link.
     conns: Arc<Mutex<HashMap<u64, mpsc::Sender<ConnEvent>>>>,
+    /// Per-node usage counters (status surface).
+    metrics: Arc<NodeMetrics>,
+    /// Per-node client-connect rate limiter (A6).
+    connect_bucket: Arc<Mutex<TokenBucket>>,
 }
+
+/// How many distinct source IPs the accept-rate map tracks before it prunes idle
+/// (full-bucket) entries, so the map itself cannot grow unboundedly under a
+/// spoofed-source flood.
+const MAX_TRACKED_IPS: usize = 4096;
 
 struct Inner {
     /// Hot-reloadable admission slice (swapped on SIGHUP). A `std::sync::RwLock`
@@ -181,6 +257,12 @@ struct Inner {
     lease_ttl: Duration,
     max_conns_per_node: usize,
     idle_timeout: Duration,
+    /// Per-source-IP connection-handshake rate limiter state + parameters (A6).
+    ip_buckets: std::sync::Mutex<HashMap<IpAddr, TokenBucket>>,
+    accept_burst_per_ip: u32,
+    accept_rate_per_ip: f64,
+    connect_burst_per_node: u32,
+    connect_rate_per_node: f64,
     daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
@@ -190,6 +272,22 @@ impl Inner {
     /// Snapshot the current admission policy (cheap `Arc` clone).
     fn admission(&self) -> Arc<AdmissionPolicy> {
         self.admission.read().expect("admission lock").clone()
+    }
+
+    /// Admit one connection from `ip` under the per-source handshake rate cap.
+    /// Returns false when that IP is over its rate (the caller drops the socket).
+    /// Prunes idle (refilled-to-full) entries when the map grows large.
+    fn admit_ip(&self, ip: IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self.ip_buckets.lock().expect("ip bucket lock");
+        if map.len() > MAX_TRACKED_IPS {
+            map.retain(|_, b| !b.is_full_at(now));
+        }
+        map.entry(ip)
+            .or_insert_with(|| {
+                TokenBucket::new_at(self.accept_burst_per_ip, self.accept_rate_per_ip, now)
+            })
+            .try_take_at(now)
     }
 }
 
@@ -207,6 +305,11 @@ impl RelayServer {
                 lease_ttl: cfg.lease_ttl,
                 max_conns_per_node: cfg.max_conns_per_node,
                 idle_timeout: cfg.idle_timeout,
+                ip_buckets: std::sync::Mutex::new(HashMap::new()),
+                accept_burst_per_ip: cfg.accept_burst_per_ip,
+                accept_rate_per_ip: cfg.accept_rate_per_ip,
+                connect_burst_per_node: cfg.connect_burst_per_node,
+                connect_rate_per_node: cfg.connect_rate_per_node,
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
                 next_epoch: AtomicU64::new(1),
@@ -220,13 +323,38 @@ impl RelayServer {
         *self.inner.admission.write().expect("admission lock") = Arc::new(policy);
     }
 
+    /// A read-only snapshot of the live routing table + per-node counters. Counts
+    /// only (no payloads). Drives `zerorelay status` / the SIGUSR1 dump.
+    pub async fn status(&self) -> RelayStatus {
+        let daemons = self.inner.daemons.lock().await;
+        let mut nodes: Vec<NodeStatus> = daemons
+            .iter()
+            .map(|(node_id, h)| NodeStatus {
+                node_id: node_id.clone(),
+                fpr: h.fpr.clone(),
+                conns_live: h.metrics.conns_live.load(Ordering::Relaxed),
+                conns_total: h.metrics.conns_total.load(Ordering::Relaxed),
+                frames_relayed: h.metrics.frames_relayed.load(Ordering::Relaxed),
+                connects_rejected: h.metrics.connects_rejected.load(Ordering::Relaxed),
+            })
+            .collect();
+        nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        RelayStatus { nodes }
+    }
+
     /// Accept TLS + WebSocket connections forever, dispatching daemon vs client.
     pub async fn serve(self, listener: TcpListener, acceptor: TlsAcceptor) -> Result<()> {
         loop {
-            let (sock, _peer) = match listener.accept().await {
+            let (sock, peer) = match listener.accept().await {
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            // Per-source-IP handshake rate cap (A6): drop a flooding IP before
+            // spending a TLS handshake on it.
+            if !self.inner.admit_ip(peer.ip()) {
+                drop(sock);
+                continue;
+            }
             let inner = self.inner.clone();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
@@ -404,6 +532,11 @@ where
                 epoch,
                 to_daemon: to_daemon.clone(),
                 conns: conns.clone(),
+                metrics: Arc::new(NodeMetrics::default()),
+                connect_bucket: Arc::new(Mutex::new(TokenBucket::new(
+                    inner.connect_burst_per_node,
+                    inner.connect_rate_per_node,
+                ))),
             },
         );
     }
@@ -496,16 +629,33 @@ async fn handle_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (to_daemon, conns) = {
+    let (to_daemon, conns, metrics, connect_bucket) = {
         let daemons = inner.daemons.lock().await;
         match daemons.get(&node_id) {
-            Some(h) => (h.to_daemon.clone(), h.conns.clone()),
+            Some(h) => (
+                h.to_daemon.clone(),
+                h.conns.clone(),
+                h.metrics.clone(),
+                h.connect_bucket.clone(),
+            ),
             None => {
                 let _ = send_control(&mut ws, &Control::error("no_such_node", node_id)).await;
                 return Ok(());
             }
         }
     };
+
+    // Per-node client-connect rate cap (A6): a flood of Connects to one node-id
+    // is rejected before any conn state is allocated.
+    if !connect_bucket.lock().await.try_take() {
+        metrics.connects_rejected.fetch_add(1, Ordering::Relaxed);
+        let _ = send_control(
+            &mut ws,
+            &Control::error("rate_limited", "too many connects to this node"),
+        )
+        .await;
+        return Ok(());
+    }
 
     let conn_id = inner.next_conn.fetch_add(1, Ordering::Relaxed);
     let (conn_tx, mut conn_rx) = mpsc::channel::<ConnEvent>(256);
@@ -518,6 +668,8 @@ where
         }
         cs.insert(conn_id, conn_tx);
     }
+    // Account the live conn for every exit path (drops decrement conns_live).
+    let _live = LiveConnGuard::new(metrics.clone());
 
     // Ask the daemon to open the logical connection.
     if to_daemon
@@ -595,6 +747,7 @@ where
                     if sink.send(Message::binary(encode_data(conn_id, &payload))).await.is_err() {
                         break;
                     }
+                    metrics.frames_relayed.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(ConnEvent::Window(credit)) => {
                     c2d_window.set(credit);
@@ -650,6 +803,7 @@ where
                     {
                         break;
                     }
+                    metrics.frames_relayed.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(Ok(Message::Text(t))) => match Control::from_json(&t) {
                     Ok(Control::Close { .. }) => break,

@@ -72,6 +72,12 @@ fn fingerprint(pkcs8: &[u8]) -> String {
 
 /// Start a relay with the given policy and its own (self-signed) outer TLS cert.
 async fn start_relay(cfg: RelayConfig) -> std::net::SocketAddr {
+    start_relay_handle(cfg).await.0
+}
+
+/// Like [`start_relay`] but also returns the live `RelayServer` handle so a test
+/// can read its status snapshot.
+async fn start_relay_handle(cfg: RelayConfig) -> (std::net::SocketAddr, RelayServer) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
     let mats = zeroclaw_tls::ensure_server_materials(dir.path(), &[]).unwrap();
@@ -90,8 +96,9 @@ async fn start_relay(cfg: RelayConfig) -> std::net::SocketAddr {
     std::mem::forget(dir);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(RelayServer::new(cfg).serve(listener, acceptor));
-    addr
+    let server = RelayServer::new(cfg);
+    tokio::spawn(server.clone().serve(listener, acceptor));
+    (addr, server)
 }
 
 fn insecure_client_config() -> Arc<rustls::ClientConfig> {
@@ -444,4 +451,102 @@ async fn node_id_is_bound_to_pubkey() {
         matches!(term_b, Control::Error { ref code, .. } if code == "node_taken"),
         "a different key must not hijack a live node-id, got {term_b:?}"
     );
+}
+
+/// Try to open an outer TLS + WS connection, returning Err when the relay refuses
+/// it (e.g. the per-source-IP rate cap drops the socket pre-handshake).
+async fn try_connect_ws(
+    relay_addr: std::net::SocketAddr,
+) -> Result<RelayWs, Box<dyn std::error::Error>> {
+    let tcp = tokio::net::TcpStream::connect(relay_addr).await?;
+    let connector = tokio_rustls::TlsConnector::from(insecure_client_config());
+    let sni = rustls::pki_types::ServerName::try_from("localhost")?;
+    let tls = connector.connect(sni, tcp).await?;
+    let req = ClientRequestBuilder::new("wss://localhost/".parse()?).with_sub_protocol(SUBPROTOCOL);
+    let (ws, _) = tokio_tungstenite::client_async_with_config(req, tls, None).await?;
+    Ok(ws)
+}
+
+#[tokio::test]
+async fn per_source_ip_accept_cap_drops_excess() {
+    // A6: a single source IP cannot open unbounded handshakes. With a burst of 3
+    // and no refill, only the first few connections from 127.0.0.1 complete; the
+    // rest are dropped before the WebSocket handshake.
+    let addr = start_relay(RelayConfig {
+        accept_burst_per_ip: 3,
+        accept_rate_per_ip: 0.0,
+        ..Default::default()
+    })
+    .await;
+
+    let mut ok = 0;
+    let mut refused = 0;
+    for _ in 0..10 {
+        match try_connect_ws(addr).await {
+            Ok(ws) => {
+                ok += 1;
+                drop(ws);
+            }
+            Err(_) => refused += 1,
+        }
+    }
+    assert!(
+        ok <= 3,
+        "the per-IP burst (3) must cap completed handshakes, got {ok}"
+    );
+    assert!(
+        refused > 0,
+        "excess connections from one IP must be refused"
+    );
+}
+
+#[tokio::test]
+async fn status_counts_live_conns_per_node() {
+    // The read-only status surface reflects a live client conn (counts only).
+    let (addr, server) = start_relay_handle(RelayConfig::default()).await;
+    let (_daemon, _client, _conn_id) = pair_daemon_and_client(addr, "node-metered").await;
+
+    let status = server.status().await;
+    let node = status
+        .nodes
+        .iter()
+        .find(|n| n.node_id == "node-metered")
+        .expect("the registered node appears in status");
+    assert!(node.conns_live >= 1, "a paired client is counted live");
+    assert!(
+        node.conns_total >= 1,
+        "the conn is counted in the lifetime total"
+    );
+}
+
+#[tokio::test]
+async fn per_node_connect_cap_rate_limits() {
+    // A6: a flood of Connects to one node-id is rate-limited. With burst 0 the
+    // per-node bucket rejects the first connect outright (a 0 allowance disables
+    // connects), proving the cap is wired on the Connect path.
+    let addr = start_relay(RelayConfig {
+        connect_burst_per_node: 0,
+        connect_rate_per_node: 0.0,
+        ..Default::default()
+    })
+    .await;
+    let key = gen_key();
+    let (mut daemon, term) = handshake(addr, "node-capped", &key, None, true).await;
+    assert!(matches!(term, Control::Registered { .. }));
+    tokio::spawn(async move { while next_control(&mut daemon).await.is_some() {} });
+
+    let mut client = connect_ws(addr).await;
+    client
+        .send(Message::text(
+            Control::Connect {
+                node_id: "node-capped".into(),
+            }
+            .to_json(),
+        ))
+        .await
+        .unwrap();
+    match next_wire(&mut client).await {
+        Some(Wire::Ctrl(Control::Error { code, .. })) => assert_eq!(code, "rate_limited"),
+        other => panic!("expected rate_limited, got {other:?}"),
+    }
 }

@@ -29,7 +29,8 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_relay_proto::{
-    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data, encode_data,
+    ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, TokenBucket, decode_data,
+    encode_data,
 };
 
 /// What the demux loop routes to a per-conn `bridge_conn` task: inbound inner
@@ -74,6 +75,12 @@ pub struct RelayBridgeConfig {
     pub relay_insecure: bool,
     /// Cap on simultaneously-bridged client connections (bridge-side DoS cap).
     pub max_conns: usize,
+    /// Per-node `OPEN` handshake-rate cap (A6): burst allowance + steady refill
+    /// per second. A flood of `OPEN`s beyond this is fast-rejected with `Close`
+    /// BEFORE a loopback mTLS handshake is spun up, so the relay's caps are not
+    /// the only line of defense.
+    pub open_burst: u32,
+    pub open_rate_per_sec: f64,
 }
 
 /// Load (or create + persist) the daemon's Ed25519 relay-registration key.
@@ -290,6 +297,11 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
         });
     }
 
+    // Per-node OPEN handshake-rate cap (A6). Single-threaded reader loop, so a
+    // plain local bucket suffices (no lock). A flood of OPENs is fast-rejected
+    // before any loopback mTLS handshake is dialed.
+    let mut open_bucket = TokenBucket::new(cfg.open_burst, cfg.open_rate_per_sec);
+
     // Reader loop: react to Open/Close + demux DATA to per-conn loopback bridges.
     let result = loop {
         tokio::select! {
@@ -302,6 +314,17 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
                     Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => {
                         match Control::from_json(t.as_str()) {
                             Ok(Control::Open { conn_id, .. }) => {
+                                // Fast-reject an OPEN flood before allocating conn
+                                // state or dialing a loopback mTLS handshake (A6).
+                                if !open_bucket.try_take() {
+                                    let _ = to_relay
+                                        .send(tungstenite_text(&Control::Close {
+                                            conn_id,
+                                            reason: "rate_limited".into(),
+                                        }))
+                                        .await;
+                                    continue;
+                                }
                                 let mut cs = conns.lock().await;
                                 if cs.len() >= cfg.max_conns {
                                     drop(cs);

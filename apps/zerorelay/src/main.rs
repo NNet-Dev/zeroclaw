@@ -22,7 +22,7 @@ use clap::{Parser, Subcommand};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
-use zerorelay::{Admission, AdmissionPolicy, RelayConfig, RelayServer};
+use zerorelay::{Admission, AdmissionPolicy, RelayConfig, RelayServer, RelayStatus};
 
 /// Build-time version: `git describe` (tag + commits-since + short hash, `-dirty`
 /// when modified), or the crate version when git is unavailable. Set by build.rs.
@@ -98,6 +98,11 @@ struct Cli {
     /// Lease TTL (seconds) advertised to daemons at registration. [default: 300]
     #[arg(long)]
     lease_ttl_secs: Option<u64>,
+
+    /// Write a per-node metrics snapshot (JSON) to this path, refreshed on a timer
+    /// and on SIGUSR1. Read it back with `zerorelay status --file <path>`.
+    #[arg(long)]
+    status_file: Option<String>,
 }
 
 /// A `relay.toml`: every value optional, CLI flags override. The `[admission]`
@@ -142,6 +147,12 @@ struct LimitsFile {
     max_conns_per_node: Option<usize>,
     idle_timeout_secs: Option<u64>,
     lease_ttl_secs: Option<u64>,
+    /// Per-source-IP connection-handshake rate cap (A6).
+    accept_burst_per_ip: Option<u32>,
+    accept_rate_per_ip: Option<f64>,
+    /// Per-node-id client-connect rate cap (A6).
+    connect_burst_per_node: Option<u32>,
+    connect_rate_per_node: Option<f64>,
 }
 
 /// The CLI admission overrides, captured so SIGHUP can re-apply them on top of a
@@ -187,6 +198,30 @@ fn load_file_config(path: &str) -> Result<FileConfig> {
     toml::from_str(&text).with_context(|| format!("parsing relay config {path}"))
 }
 
+/// Read a relay `--status-file` snapshot and print it as a per-node table.
+fn print_status(path: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!("reading status file {path} (is --status-file set on the relay?)")
+    })?;
+    let status: RelayStatus =
+        serde_json::from_str(text.trim()).with_context(|| format!("parsing status file {path}"))?;
+    if status.nodes.is_empty() {
+        println!("no registered nodes");
+        return Ok(());
+    }
+    println!(
+        "{:<34}  {:>5}  {:>6}  {:>8}  {:>8}",
+        "node_id", "live", "total", "frames", "rejected"
+    );
+    for n in &status.nodes {
+        println!(
+            "{:<34}  {:>5}  {:>6}  {:>8}  {:>8}",
+            n.node_id, n.conns_live, n.conns_total, n.frames_relayed, n.connects_rejected
+        );
+    }
+    Ok(())
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// TCP-connect to a running relay and exit 0 if reachable. For container
@@ -195,6 +230,13 @@ enum Command {
         /// Address to probe.
         #[arg(long, default_value = "127.0.0.1:8443")]
         addr: String,
+    },
+    /// Print the running relay's per-node metrics from its --status-file snapshot
+    /// (counts only, never payloads). Send the relay SIGUSR1 first to refresh it.
+    Status {
+        /// Path to the relay's --status-file.
+        #[arg(long)]
+        file: String,
     },
 }
 
@@ -207,6 +249,10 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("relay not reachable at {addr}"))?;
         return Ok(());
+    }
+
+    if let Some(Command::Status { file }) = &cli.command {
+        return print_status(file);
     }
 
     // relay.toml is the base; CLI flags override. Absent --config => an empty
@@ -267,6 +313,10 @@ async fn main() -> Result<()> {
                 .or(file.limits.idle_timeout_secs)
                 .unwrap_or(300),
         ),
+        accept_burst_per_ip: file.limits.accept_burst_per_ip.unwrap_or(30),
+        accept_rate_per_ip: file.limits.accept_rate_per_ip.unwrap_or(10.0),
+        connect_burst_per_node: file.limits.connect_burst_per_node.unwrap_or(60),
+        connect_rate_per_node: file.limits.connect_rate_per_node.unwrap_or(20.0),
     };
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -280,7 +330,58 @@ async fn main() -> Result<()> {
 
     let server = RelayServer::new(cfg);
     spawn_sighup_reloader(server.clone(), cli.config.clone(), overlay);
+    spawn_status_dumper(server.clone(), cli.status_file.clone());
     server.serve(listener, acceptor).await
+}
+
+/// On SIGUSR1, snapshot per-node metrics to stderr (and to `--status-file` when
+/// set) - a read-only operational surface for a shell-less/stateless relay. Also
+/// refreshes the status file on a slow timer so `zerorelay status --file` stays
+/// reasonably current. No-op for the signal half on non-unix.
+#[cfg(unix)]
+fn spawn_status_dumper(server: RelayServer, status_file: Option<String>) {
+    use std::time::Duration as StdDuration;
+    tokio::spawn(async move {
+        let mut usr1 =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("zerorelay: cannot install SIGUSR1 handler ({e}); status dump off");
+                    return;
+                }
+            };
+        let mut tick = tokio::time::interval(StdDuration::from_secs(15));
+        loop {
+            let on_signal = tokio::select! {
+                _ = usr1.recv() => true,
+                _ = tick.tick() => false,
+            };
+            let status = server.status().await;
+            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+            if let Some(path) = status_file.as_deref() {
+                let _ = std::fs::write(path, format!("{json}\n"));
+            }
+            if on_signal {
+                eprintln!("zerorelay status: {json}");
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_status_dumper(server: RelayServer, status_file: Option<String>) {
+    use std::time::Duration as StdDuration;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(StdDuration::from_secs(15));
+        loop {
+            tick.tick().await;
+            if let Some(path) = status_file.as_deref() {
+                let status = server.status().await;
+                let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+                let _ = std::fs::write(path, format!("{json}\n"));
+            }
+        }
+    });
 }
 
 /// On SIGHUP, re-read the config file's `[admission]` section and swap the live
