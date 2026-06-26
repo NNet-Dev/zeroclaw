@@ -234,6 +234,87 @@ async fn resolve_routed_approval(
     }
 }
 
+/// A route-only approval bridge for the channel-less turn path
+/// (`process_message`): gateway chat/webhook dispatch and agent-to-agent peer
+/// messages run an agent turn with no originating channel handle, so a gated
+/// tool there can only reach a human through a configured
+/// [`ApprovalRoute`](zeroclaw_config::autonomy::ApprovalRoute).
+///
+/// Unlike the per-turn `AskUserApprovalBridge`, this carries NO originating
+/// fan-out — there is nothing to fall through to on this path. `request_approval`
+/// asks the named approver via [`resolve_routed_approval`]; a `Decided` outcome
+/// (including the fail-closed `Deny` synthesized when the approver is
+/// unreachable/unregistered/silent/timed-out under the default policy) is
+/// returned to the gate, and `InheritOriginator` returns `None` so the gate
+/// applies the non-interactive default (auto-deny) — "inherit the originator"
+/// degrades to today's channel-less behavior when there is no originator.
+pub(crate) struct RoutedApprovalChannel {
+    handles: tools::PerToolChannelHandle,
+    route: zeroclaw_config::autonomy::ApprovalRoute,
+    last_decision: parking_lot::Mutex<Option<String>>,
+}
+
+impl RoutedApprovalChannel {
+    pub(crate) fn new(
+        handles: tools::PerToolChannelHandle,
+        route: zeroclaw_config::autonomy::ApprovalRoute,
+    ) -> Self {
+        Self {
+            handles,
+            route,
+            last_decision: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for RoutedApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Cli)
+    }
+    fn alias(&self) -> &str {
+        "approval-route"
+    }
+}
+
+#[async_trait::async_trait]
+impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
+    fn name(&self) -> &str {
+        "approval-route"
+    }
+
+    fn last_decision_channel(&self) -> Option<String> {
+        self.last_decision.lock().clone()
+    }
+
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        *self.last_decision.lock() = None;
+        match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
+            RoutedApproval::Decided { response, decider } => {
+                *self.last_decision.lock() = decider;
+                Ok(Some(response))
+            }
+            // No originating channel to inherit on this path; let the gate apply
+            // the non-interactive default (auto-deny).
+            RoutedApproval::Fallthrough => Ok(None),
+        }
+    }
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
@@ -7698,5 +7779,53 @@ mod approval_route_tests {
                 ..
             }
         ));
+    }
+
+    // ── RoutedApprovalChannel (the channel-less / process_message bridge) ──
+    // Proves the route is CONSULTED on the non-interactive path: the bridge the
+    // gate sees as `ctx.channel` returns the approver's decision, fails closed
+    // by default, and yields `None` (gate auto-denies) when opted into
+    // inherit-originator on a path that has no originator.
+    use zeroclaw_api::channel::Channel as _;
+
+    #[tokio::test]
+    async fn routed_channel_returns_and_attributes_approver_decision() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        }]);
+        let bridge = RoutedApprovalChannel::new(h, route("ops", OnNoApprover::Deny));
+        let out = bridge.request_approval("r", &req()).await.unwrap();
+        assert_eq!(out, Some(ChannelApprovalResponse::Approve));
+        assert_eq!(
+            bridge.last_decision_channel().as_deref(),
+            Some("ops"),
+            "the gate attributes the approval to the deciding channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_channel_fails_closed_when_approver_unregistered() {
+        let bridge = RoutedApprovalChannel::new(registry(vec![]), route("ops", OnNoApprover::Deny));
+        let out = bridge.request_approval("r", &req()).await.unwrap();
+        assert_eq!(
+            out,
+            Some(ChannelApprovalResponse::Deny),
+            "unreachable approver denies, not auto-approves"
+        );
+        assert!(bridge.last_decision_channel().is_none());
+    }
+
+    #[tokio::test]
+    async fn routed_channel_inherit_returns_none_on_channelless_path() {
+        let bridge = RoutedApprovalChannel::new(
+            registry(vec![]),
+            route("ops", OnNoApprover::InheritOriginator),
+        );
+        let out = bridge.request_approval("r", &req()).await.unwrap();
+        assert_eq!(
+            out, None,
+            "no originator to inherit; gate applies the non-interactive auto-deny"
+        );
     }
 }

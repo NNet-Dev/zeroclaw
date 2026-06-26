@@ -10538,6 +10538,12 @@ pub struct RiskProfileConfig {
     /// Route this profile's tool approvals to a DISTINCT approver channel instead of the
     /// channel that triggered the run (closes the cross-channel-HITL gap). Absent ⇒ the
     /// originating channel approves (today's behavior). See [`crate::autonomy::ApprovalRoute`].
+    ///
+    /// Honored on both the interactive channel-driven path and the non-interactive turn path
+    /// (gateway chat/webhook dispatch and agent-to-agent peer messages). On the non-interactive
+    /// path the approver is resolved from the live daemon channel registry; if no registry is
+    /// available or the approver is not live, the gate keeps the non-interactive default
+    /// (fail-closed deny under the default `on_no_approver`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_route: Option<crate::autonomy::ApprovalRoute>,
     /// Tools the agent may call in agentic mode. Empty = inherit / no

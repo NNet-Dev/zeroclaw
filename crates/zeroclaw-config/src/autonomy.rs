@@ -100,6 +100,12 @@ fn default_approval_timeout_secs() -> u64 {
 /// `Option<ApprovalRoute>` on a risk profile: ABSENT ⇒ today's behavior (the originating
 /// channel approves). Present ⇒ the gate asks `approver_channel` (a registered channel
 /// name, NOT the originator), bounded by `timeout_secs`, fail-closed by default.
+///
+/// Consulted on both the interactive channel-driven path and the non-interactive turn path
+/// (gateway chat/webhook dispatch and agent-to-agent peer messages, which run without an
+/// originating channel). The non-interactive path resolves `approver_channel` from the live
+/// daemon channel registry; with no live registry/approver it keeps the non-interactive
+/// default (fail-closed deny under the default `on_no_approver`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ApprovalRoute {
