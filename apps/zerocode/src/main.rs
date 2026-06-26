@@ -30,6 +30,7 @@ mod dashboard;
 mod diff;
 mod doctor;
 mod editor;
+mod enroll;
 mod file_explorer;
 mod help;
 mod i18n;
@@ -119,6 +120,21 @@ struct Cli {
     /// Skip verification of the relay's outer certificate (self-signed dev only).
     #[arg(long)]
     relay_insecure: bool,
+
+    /// Enroll for a client certificate before connecting: prompt for the daemon
+    /// pairing code, generate a key + CSR locally, fetch the signed cert, and
+    /// cache it under <config-dir>/tls. The host defaults to --connect's host; the
+    /// port defaults to the daemon's enrollment port (9782).
+    #[arg(long)]
+    enroll: bool,
+
+    /// Host of the daemon enrollment endpoint (defaults to --connect's host).
+    #[arg(long)]
+    enroll_host: Option<String>,
+
+    /// Port of the daemon enrollment endpoint (default 9782).
+    #[arg(long)]
+    enroll_port: Option<u16>,
 }
 
 /// Map an empty path string to `None`.
@@ -187,6 +203,19 @@ const DEFAULT_RELAY_INNER_URL: &str = "wss://127.0.0.1:9781";
 fn default_tls_path(config_dir: &std::path::Path, name: &str) -> Option<String> {
     let p = config_dir.join("tls").join(name);
     p.exists().then(|| p.to_string_lossy().into_owned())
+}
+
+/// Parse the host out of a `--connect` / `[wss].uri` value (`wss://host:port`,
+/// `host:port`, or a bare `host`) for the enrollment endpoint. Naive for IPv6.
+fn enroll_host_from(uri: Option<&str>) -> Option<String> {
+    let uri = uri?.trim();
+    let s = uri
+        .strip_prefix("wss://")
+        .or_else(|| uri.strip_prefix("ws://"))
+        .unwrap_or(uri);
+    let s = s.split('/').next().unwrap_or(s);
+    let host = s.rsplit_once(':').map(|(h, _)| h).unwrap_or(s);
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 #[tokio::main]
@@ -310,6 +339,41 @@ async fn run() -> anyhow::Result<()> {
                 path.display()
             );
             std::process::exit(1);
+        }
+    }
+
+    // Enrollment: if a remote (WSS) connection is intended but no client cert is
+    // available, obtain one first (explicitly via --enroll, or automatically on an
+    // interactive --connect). The cert is cached under <config-dir>/tls, so the
+    // target block below picks it up with no --tls-* flags.
+    {
+        use std::io::IsTerminal as _;
+        let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+        let cfg_wss = &loaded_config.connection.wss;
+        let wss_intended = cli.connect.is_some()
+            || cfg_wss.uri.is_some()
+            || cli.relay.is_some()
+            || cfg_wss.relay_url.is_some();
+        let certless = enroll::is_certless(
+            &config_dir,
+            cli.tls_client_cert.as_deref(),
+            &cfg_wss.tls.client_cert_path,
+        );
+        let auto =
+            wss_intended && certless && cli.connect.is_some() && std::io::stderr().is_terminal();
+        if cli.enroll || auto {
+            let host = cli
+                .enroll_host
+                .clone()
+                .or_else(|| enroll_host_from(cli.connect.as_deref()))
+                .or_else(|| enroll_host_from(cfg_wss.uri.as_deref()))
+                .ok_or_else(|| {
+                    anyhow::Error::msg(
+                        "enrollment needs a host: pass --enroll-host or --connect wss://<host>:<port>",
+                    )
+                })?;
+            let port = cli.enroll_port.unwrap_or(enroll::DEFAULT_ENROLL_PORT);
+            enroll::enroll(&host, port, &config_dir).await?;
         }
     }
 

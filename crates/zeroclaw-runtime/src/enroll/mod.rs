@@ -98,6 +98,9 @@ struct EnrollResponse {
     ca_chain_pem: String,
     /// The daemon-assigned stable device id (cert subject CN / ledger key).
     device_id: String,
+    /// Certificate `notAfter` (unix seconds) so the client can schedule renewal
+    /// at ~50% of the TTL.
+    not_after: i64,
     /// Where to reach this daemon through a relay (empty fields when no relay).
     relay_profile: RelayProfile,
 }
@@ -197,6 +200,7 @@ impl EnrollServer {
             cert_pem: issued.cert_pem,
             ca_chain_pem: self.ca_cert_pem.clone(),
             device_id,
+            not_after: issued.not_after,
             relay_profile: self.relay_profile.clone(),
         })
     }

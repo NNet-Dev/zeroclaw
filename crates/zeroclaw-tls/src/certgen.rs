@@ -335,6 +335,25 @@ pub fn sign_csr(
     })
 }
 
+/// Generate a fresh client keypair (ECDSA P-256, hardware-keystore-backable) and
+/// a CSR for it. The CSR subject is only a hint; the daemon issuer overrides it
+/// with the device id it assigns (so a requester cannot choose its identity, A7).
+/// The private key is returned [`Zeroizing`] - the caller persists it locally and
+/// the in-memory copy is wiped on drop; it never leaves the device (only the CSR
+/// is transmitted). This is the client half of the [`sign_csr`] enrollment flow.
+pub fn generate_client_csr(subject_hint: &str) -> Result<(String, Zeroizing<String>)> {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .context("generating client key")?;
+    let mut params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).context("building CSR params")?;
+    params.distinguished_name = distinguished_name(subject_hint);
+    let csr = params
+        .serialize_request(&key)
+        .context("serializing certificate signing request")?;
+    let csr_pem = csr.pem().context("encoding CSR as PEM")?;
+    Ok((csr_pem, Zeroizing::new(key.serialize_pem())))
+}
+
 // --- CA private-key at-rest protection (threat A4) ---------------------------
 
 /// At-rest protection for the daemon CA private key.
@@ -538,6 +557,19 @@ mod tests {
         // The bound device id appears in the issued cert; no private key is returned.
         assert!(leaf.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(!leaf.cert_pem.contains("PRIVATE KEY"));
+    }
+
+    #[test]
+    fn generated_client_csr_is_signable() {
+        // The client half (generate_client_csr) round-trips with the daemon half
+        // (sign_csr): a freshly generated P-256 CSR signs into a usable leaf.
+        let (ca_cert, ca_key) = crate::testing::gen_ca();
+        let (csr, key_pem) = generate_client_csr("zerocode").unwrap();
+        assert!(csr.contains("CERTIFICATE REQUEST"));
+        assert!(key_pem.contains("PRIVATE KEY"));
+        let leaf = sign_csr(&ca_cert, &ca_key, "dev-xyz", &csr).unwrap();
+        assert!(leaf.cert_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(leaf.fingerprint.len(), 64);
     }
 
     #[test]

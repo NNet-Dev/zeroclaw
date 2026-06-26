@@ -894,6 +894,7 @@ impl RpcDispatcher {
             "cert_pem": issued.cert_pem,
             "ca_chain_pem": ca_cert_pem,
             "device_id": device_id,
+            "not_after": issued.not_after,
             "relay_profile": relay_profile,
         }))
     }

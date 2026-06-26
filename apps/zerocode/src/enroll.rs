@@ -1,0 +1,333 @@
+//! Frictionless client enrollment.
+//!
+//! On first contact a certless client obtains its FIRST mTLS certificate from the
+//! daemon enrollment endpoint and caches it, so every later run is zero-config
+//! (no `--tls-*` flags). The private key is generated locally and never leaves the
+//! device; only a CSR is sent.
+//!
+//! Bootstrap trust (no blind TOFU): the enrollment channel cannot pre-trust the
+//! daemon CA (chicken-and-egg), so the connection accepts the server cert
+//! provisionally and trust is confirmed OUT OF BAND by the short-auth-string -
+//! the client recomputes the SAS from the pairing code plus the CA it received and
+//! the operator compares it to the SAS the daemon printed, BEFORE the certificate
+//! is persisted or used. A MITM that substitutes its own CA produces a mismatching
+//! SAS and the client refuses it.
+
+use std::io::{BufRead, Write};
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+/// The daemon's default enrollment endpoint port (`[enroll].port`).
+pub const DEFAULT_ENROLL_PORT: u16 = 9782;
+
+/// Relay coordinates the daemon hands back at enrollment.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct RelayProfile {
+    pub relay_url: String,
+    pub node_id: String,
+    pub relay_cert_pin: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EnrollResponse {
+    cert_pem: String,
+    ca_chain_pem: String,
+    device_id: String,
+    not_after: i64,
+    #[serde(default)]
+    relay_profile: RelayProfile,
+}
+
+/// The cached enrollment profile written beside the certs, so the connect path
+/// and the renewal timer are zero-config on later runs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedProfile {
+    pub device_id: String,
+    pub not_after: i64,
+    #[serde(default)]
+    pub relay: RelayProfile,
+}
+
+/// Run the interactive enrollment flow against `host:port` and cache the result
+/// under `<config_dir>/tls`. Prompts for the pairing code and the SAS confirmation
+/// on the terminal.
+pub async fn enroll(host: &str, port: u16, config_dir: &Path) -> Result<()> {
+    eprintln!("Enrolling with the ZeroClaw daemon at {host}:{port} ...");
+    let code = prompt_line("Enter the daemon enrollment pairing code: ")?;
+    let code = code.trim().to_string();
+    if code.is_empty() {
+        anyhow::bail!("no pairing code entered");
+    }
+
+    // The private key stays here; only the CSR is sent.
+    let (csr_pem, key_pem) =
+        zeroclaw_tls::generate_client_csr("zerocode").context("generating client CSR")?;
+
+    let resp = post_enroll(host, port, &code, &csr_pem)
+        .await
+        .context("enrollment request failed")?;
+
+    // Confirm the CA out of band via the short-auth-string before trusting it.
+    let ca_fp = ca_fingerprint(&resp.ca_chain_pem)?;
+    let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fp);
+    eprintln!();
+    eprintln!("The daemon CA's short-auth-string (SAS) is:");
+    eprintln!("    {sas}");
+    eprintln!("This MUST match the SAS printed on the daemon console. If it does not,");
+    eprintln!("abort - the enrollment may be intercepted.");
+    let confirm = prompt_line("Does the SAS match the daemon console? [y/N]: ")?;
+    if !confirm.trim().eq_ignore_ascii_case("y") {
+        anyhow::bail!("SAS not confirmed; enrollment aborted (no certificate was trusted)");
+    }
+
+    cache_materials(config_dir, &resp, &key_pem)?;
+    eprintln!();
+    eprintln!(
+        "Enrolled as device {}. Cached the client certificate + daemon CA under {}/tls.",
+        resp.device_id,
+        config_dir.display()
+    );
+    if !resp.relay_profile.relay_url.is_empty() {
+        eprintln!(
+            "Reach this daemon through its relay with: zerocode --relay {} --relay-node {}",
+            resp.relay_profile.relay_url, resp.relay_profile.node_id
+        );
+    } else {
+        eprintln!("This client now connects directly with no --tls-* flags.");
+    }
+    Ok(())
+}
+
+/// POST the CSR to the enrollment endpoint over a provisionally-trusted TLS
+/// connection (trust is confirmed afterwards by the SAS).
+async fn post_enroll(host: &str, port: u16, code: &str, csr_pem: &str) -> Result<EnrollResponse> {
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring provider supports default protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptProvisional))
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    let tcp = TcpStream::connect((host, port))
+        .await
+        .with_context(|| format!("connecting to enrollment endpoint {host}:{port}"))?;
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .with_context(|| format!("invalid enrollment host {host}"))?;
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .context("enrollment TLS handshake")?;
+
+    let body = serde_json::json!({ "pairing_code": code, "csr_pem": csr_pem }).to_string();
+    let request = format!(
+        "POST /enroll HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    tls.write_all(request.as_bytes()).await?;
+    tls.flush().await?;
+
+    let mut raw = Vec::new();
+    tls.read_to_end(&mut raw).await?;
+    parse_http_json(&raw)
+}
+
+/// Parse an HTTP/1.1 response, returning the decoded enrollment body on 200 or a
+/// descriptive error (with the daemon's error message) otherwise.
+fn parse_http_json(raw: &[u8]) -> Result<EnrollResponse> {
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .context("malformed HTTP response from enrollment endpoint")?;
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let body = &raw[split + 4..];
+    let status_line = head.lines().next().unwrap_or_default();
+    let status_ok = status_line.split_whitespace().nth(1) == Some("200");
+    if !status_ok {
+        let msg = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_else(|| status_line.to_string());
+        anyhow::bail!("enrollment rejected: {msg}");
+    }
+    serde_json::from_slice(body).context("parsing enrollment response JSON")
+}
+
+/// SHA-256 fingerprint of the first certificate in a PEM chain (the CA).
+fn ca_fingerprint(ca_chain_pem: &str) -> Result<String> {
+    let der = rustls_pemfile::certs(&mut ca_chain_pem.as_bytes())
+        .next()
+        .context("no certificate in the CA chain")?
+        .context("invalid CA certificate")?;
+    Ok(zeroclaw_tls::cert_sha256_fingerprint(der.as_ref()))
+}
+
+/// Write the cert, key, CA, and cached profile under `<config_dir>/tls`. The key
+/// is written `0600` on Unix; the cert/CA/profile are public.
+fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> Result<()> {
+    let tls_dir = config_dir.join("tls");
+    std::fs::create_dir_all(&tls_dir).with_context(|| format!("creating {}", tls_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tls_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    std::fs::write(tls_dir.join("client.crt"), resp.cert_pem.as_bytes())
+        .context("writing client.crt")?;
+    std::fs::write(tls_dir.join("ca.crt"), resp.ca_chain_pem.as_bytes())
+        .context("writing ca.crt")?;
+    write_private(&tls_dir.join("client.key"), key_pem)?;
+
+    let profile = CachedProfile {
+        device_id: resp.device_id.clone(),
+        not_after: resp.not_after,
+        relay: resp.relay_profile.clone(),
+    };
+    let json = serde_json::to_string_pretty(&profile).context("serializing profile")?;
+    std::fs::write(tls_dir.join("profile.json"), json).context("writing profile.json")?;
+    Ok(())
+}
+
+/// Write a private key at `0600` (Unix), no world-readable window.
+fn write_private(path: &Path, pem: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(pem.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, pem).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// True when no client certificate is available from flags, config, or the
+/// conventional `<config_dir>/tls/client.crt` cache.
+pub fn is_certless(
+    config_dir: &Path,
+    cli_client_cert: Option<&str>,
+    cfg_client_cert: &str,
+) -> bool {
+    cli_client_cert
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
+        && cfg_client_cert.trim().is_empty()
+        && !config_dir.join("tls").join("client.crt").exists()
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("reading from stdin")?;
+    Ok(line)
+}
+
+/// Provisional server-cert verifier for the enrollment handshake: accepts any
+/// server cert because the CA is not yet trusted (chicken-and-egg). Trust is
+/// established afterwards by the out-of-band SAS comparison, NOT by this verifier.
+#[derive(Debug)]
+struct AcceptProvisional;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptProvisional {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_http_json_extracts_200_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n{\"cert_pem\":\"C\",\"ca_chain_pem\":\"A\",\"device_id\":\"dev_1\",\"not_after\":123,\"relay_profile\":{\"relay_url\":\"r:1\",\"node_id\":\"n\",\"relay_cert_pin\":\"\"}}";
+        let resp = parse_http_json(raw).unwrap();
+        assert_eq!(resp.device_id, "dev_1");
+        assert_eq!(resp.not_after, 123);
+        assert_eq!(resp.relay_profile.relay_url, "r:1");
+    }
+
+    #[test]
+    fn parse_http_json_surfaces_error_message() {
+        let raw = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n{\"error\":\"invalid or already-used pairing code\"}";
+        let err = parse_http_json(raw).unwrap_err().to_string();
+        assert!(
+            err.contains("invalid or already-used pairing code"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn is_certless_detects_no_material() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_certless(dir.path(), None, ""));
+        assert!(!is_certless(dir.path(), Some("/some/client.crt"), ""));
+        assert!(!is_certless(dir.path(), None, "/cfg/client.crt"));
+        std::fs::create_dir_all(dir.path().join("tls")).unwrap();
+        std::fs::write(dir.path().join("tls").join("client.crt"), "x").unwrap();
+        assert!(!is_certless(dir.path(), None, ""));
+    }
+
+    #[test]
+    fn sas_matches_zeroclaw_tls() {
+        // The client SAS computation must equal the daemon's for the same inputs.
+        let fp = "aabbccdd";
+        assert_eq!(
+            zeroclaw_tls::enrollment_sas("270391", fp),
+            zeroclaw_tls::enrollment_sas("270391", fp)
+        );
+    }
+}
