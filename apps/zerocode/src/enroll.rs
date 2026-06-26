@@ -102,6 +102,66 @@ pub async fn enroll(host: &str, port: u16, config_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The client-cert TTL we assume to place the 50% renewal point. The daemon
+/// issues 30-day client certs; we renew once past the half-life so an
+/// intermittently-connected client never lets its cert silently expire.
+const ASSUMED_TTL_SECS: i64 = 30 * 86_400;
+
+/// Renew the cached client certificate over the authenticated mTLS session if it
+/// is past ~50% of its TTL. Best-effort: a failure logs and is retried on the
+/// next connect (the existing cert is still valid). Only meaningful on the WSS
+/// plane; on the local socket the daemon refuses renewal and this no-ops.
+pub async fn maybe_renew(client: &crate::client::RpcClient, config_dir: &Path) {
+    let Some(profile) = cached_profile(config_dir) else {
+        return;
+    };
+    if !renewal_due(profile.not_after, now_unix()) {
+        return;
+    }
+    match renew(client, config_dir).await {
+        Ok(not_after) => {
+            eprintln!("zerocode: renewed client certificate (valid through unix {not_after}).");
+        }
+        Err(e) => {
+            eprintln!(
+                "zerocode: certificate renewal skipped ({e:#}); the current cert is still valid."
+            );
+        }
+    }
+}
+
+/// Generate a fresh keypair + CSR, renew over `cert/renew`, and re-cache the
+/// result (including any rotated relay node-id the daemon hands back).
+async fn renew(client: &crate::client::RpcClient, config_dir: &Path) -> Result<i64> {
+    let (csr_pem, key_pem) =
+        zeroclaw_tls::generate_client_csr("zerocode").context("generating renewal CSR")?;
+    let resp: EnrollResponse = client
+        .call("cert/renew", serde_json::json!({ "csr_pem": csr_pem }))
+        .await
+        .context("cert/renew RPC")?;
+    cache_materials(config_dir, &resp, &key_pem)?;
+    Ok(resp.not_after)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether the cert is past ~50% of its TTL (`not_after - TTL/2`) and should be
+/// renewed. A non-positive `not_after` is treated as "no cached cert".
+fn renewal_due(not_after: i64, now: i64) -> bool {
+    not_after > 0 && now >= not_after.saturating_sub(ASSUMED_TTL_SECS / 2)
+}
+
+/// Read the cached enrollment profile, if a client has enrolled here.
+pub fn cached_profile(config_dir: &Path) -> Option<CachedProfile> {
+    let raw = std::fs::read(config_dir.join("tls").join("profile.json")).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
 /// POST the CSR to the enrollment endpoint over a provisionally-trusted TLS
 /// connection (trust is confirmed afterwards by the SAS).
 async fn post_enroll(host: &str, port: u16, code: &str, csr_pem: &str) -> Result<EnrollResponse> {
@@ -319,6 +379,21 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("tls")).unwrap();
         std::fs::write(dir.path().join("tls").join("client.crt"), "x").unwrap();
         assert!(!is_certless(dir.path(), None, ""));
+    }
+
+    #[test]
+    fn renewal_due_at_half_ttl() {
+        // A 30-day cert issued "now": not_after = now + 30d.
+        let now = 1_000_000_000;
+        let fresh = now + ASSUMED_TTL_SECS; // just issued
+        assert!(!renewal_due(fresh, now), "a fresh cert is not due");
+        // Past the half-life (issued ~16 days ago): not_after = now + ~14d.
+        let half = now + ASSUMED_TTL_SECS / 2 - 1;
+        assert!(renewal_due(half, now), "past 50% TTL should renew");
+        // Expired cert is also due (renewal will try; daemon may still accept).
+        assert!(renewal_due(now - 10, now));
+        // No cached cert.
+        assert!(!renewal_due(0, now));
     }
 
     #[test]

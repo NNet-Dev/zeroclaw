@@ -484,6 +484,13 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
+    // On the mTLS plane, renew the cached client cert if it is past ~50% of its
+    // TTL (before the terminal is taken over, so any output is visible). No-op
+    // when the client never enrolled here.
+    if matches!(target, ConnectTarget::Wss { .. }) {
+        enroll::maybe_renew(&rpc, &local_config_dir).await;
+    }
+
     let mut term = config_manager::init_terminal()?;
     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
 
