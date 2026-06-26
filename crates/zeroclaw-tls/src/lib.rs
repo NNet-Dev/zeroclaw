@@ -282,6 +282,115 @@ impl ClientCertVerifier for PinnedCertVerifier {
     }
 }
 
+/// A rustls SERVER-certificate verifier that PINS the relay's OUTER leaf cert by
+/// its SHA-256 fingerprint instead of chaining to a CA (threat A2: the outer TLS
+/// is a metadata boundary, not the RPC boundary; the inner mTLS is the real one).
+///
+/// Two modes:
+/// - [`RelayPinVerifier::pinned`]: the presented leaf MUST match the expected
+///   fingerprint, else the connection is refused. The handshake signature is still
+///   verified against the leaf's key, so a pin is a real cryptographic bind.
+/// - [`RelayPinVerifier::tofu`]: trust-on-first-use - accept the first leaf seen
+///   and RECORD its fingerprint (read back with [`observed_pin`] and persist it),
+///   so the next connection is pinned. Opt-in only; never a silent default.
+///
+/// The server NAME is intentionally not checked: pinning the exact leaf already
+/// fixes the identity, which suits a self-hosted relay reached by IP.
+///
+/// [`observed_pin`]: RelayPinVerifier::observed_pin
+#[derive(Debug)]
+pub struct RelayPinVerifier {
+    /// Expected leaf SHA-256 (hex). `None` in TOFU mode.
+    expected: Option<String>,
+    /// Accept + record the first leaf when no pin is set.
+    tofu: bool,
+    /// The leaf fingerprint observed during the handshake (TOFU persistence).
+    observed: std::sync::Mutex<Option<String>>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl RelayPinVerifier {
+    /// Require the relay's outer leaf to match `expected_sha256_hex`.
+    pub fn pinned(expected_sha256_hex: impl Into<String>) -> Self {
+        Self {
+            expected: Some(expected_sha256_hex.into()),
+            tofu: false,
+            observed: std::sync::Mutex::new(None),
+            algs: Self::algs(),
+        }
+    }
+
+    /// Trust-on-first-use: accept the first leaf and record its fingerprint.
+    pub fn tofu() -> Self {
+        Self {
+            expected: None,
+            tofu: true,
+            observed: std::sync::Mutex::new(None),
+            algs: Self::algs(),
+        }
+    }
+
+    /// The leaf fingerprint observed during a TOFU handshake, if any. Persist it so
+    /// later connections pin instead of re-trusting.
+    pub fn observed_pin(&self) -> Option<String> {
+        self.observed.lock().expect("pin lock").clone()
+    }
+
+    fn algs() -> rustls::crypto::WebPkiSupportedAlgorithms {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for RelayPinVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let fp = cert_sha256_fingerprint(end_entity.as_ref());
+        if let Some(want) = &self.expected {
+            if fp.eq_ignore_ascii_case(want) {
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+            return Err(rustls::Error::General(format!(
+                "relay outer-cert pin mismatch (expected {want}, got {fp})"
+            )));
+        }
+        if self.tofu {
+            *self.observed.lock().expect("pin lock") = Some(fp);
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        Err(rustls::Error::General(
+            "relay pin verifier requires a pin or TOFU".into(),
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
 /// Load PEM-encoded certificates from a file.
 pub fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = std::fs::File::open(path)
@@ -323,6 +432,44 @@ mod tests {
     /// Ensure the rustls `CryptoProvider` is installed (idempotent).
     fn ensure_crypto_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn relay_pin_verifier_matches_rejects_and_tofu_records() {
+        use rustls::client::danger::ServerCertVerifier as _;
+        ensure_crypto_provider();
+
+        let (ca_crt, ca_key) = testing::gen_ca();
+        let (server_pem, _key) = testing::gen_server_cert(&ca_crt, &ca_key, &["localhost".into()]);
+        let der = rustls_pemfile::certs(&mut server_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let fp = cert_sha256_fingerprint(der.as_ref());
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+
+        // Pinned to the right leaf -> accepted.
+        let pinned = RelayPinVerifier::pinned(fp.clone());
+        assert!(
+            pinned
+                .verify_server_cert(&der, &[], &name, &[], now)
+                .is_ok()
+        );
+
+        // Pinned to a different leaf -> rejected (no chaining to a CA).
+        let wrong = RelayPinVerifier::pinned("00".repeat(32));
+        assert!(
+            wrong
+                .verify_server_cert(&der, &[], &name, &[], now)
+                .is_err()
+        );
+
+        // TOFU -> accepts and records the observed fingerprint for persistence.
+        let tofu = RelayPinVerifier::tofu();
+        assert!(tofu.observed_pin().is_none());
+        assert!(tofu.verify_server_cert(&der, &[], &name, &[], now).is_ok());
+        assert_eq!(tofu.observed_pin().as_deref(), Some(fp.as_str()));
     }
 
     #[test]

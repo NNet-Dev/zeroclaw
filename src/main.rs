@@ -4357,6 +4357,7 @@ async fn main() -> Result<()> {
                             relay_ca_path: Some(relay_cfg.relay_ca_path)
                                 .filter(|p| !p.is_empty()),
                             relay_insecure: relay_cfg.relay_insecure,
+                            relay_tofu: relay_cfg.tofu,
                             max_conns: 256,
                             // Bridge-side OPEN-flood cap (A6): fast-reject beyond
                             // ~20 new conns/sec (burst 60) so an OPEN flood cannot

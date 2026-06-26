@@ -429,6 +429,15 @@ pub struct RelayDial {
     pub relay_ca_path: Option<String>,
     /// Skip verification of the relay's outer certificate (self-signed dev only).
     pub relay_insecure: bool,
+    /// Expected relay OUTER-leaf SHA-256 pin (`--relay-pin` or the enrollment-
+    /// delivered `relay_cert_pin`). When set, the relay's outer cert must match it
+    /// (A2). Takes precedence over a CA / public roots.
+    pub relay_pin: Option<String>,
+    /// Opt-in trust-on-first-use for the relay's outer leaf: accept the first cert
+    /// and persist its pin to `pin_store` so later runs pin it. Never silent.
+    pub relay_tofu: bool,
+    /// Where to persist a TOFU-observed pin (`<config_dir>/relay/relay_pin`).
+    pub pin_store: Option<std::path::PathBuf>,
 }
 
 /// TLS verification + mutual-TLS client identity for a WSS connection.
@@ -499,6 +508,33 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
+/// Persist a TOFU-observed relay outer-leaf pin (sha256 hex) to `path` at `0600`,
+/// creating parent dirs. Best-effort: a write failure just means we TOFU again
+/// next run (the connection already succeeded).
+fn persist_relay_pin(path: &std::path::Path, pin: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            let _ = f.write_all(pin.as_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, pin.as_bytes());
+    }
+}
+
 /// Load PEM certificates from a file into DER.
 fn load_pem_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let pem = std::fs::read(path).with_context(|| format!("reading certificate file {path}"))?;
@@ -536,29 +572,46 @@ async fn dial_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream
         .with_context(|| format!("connecting to relay {}", relay.relay_addr))?;
 
     // Outer TLS connector verifying the relay's OWN certificate (distinct from the
-    // inner mTLS to the daemon). `None` falls back to the built-in public roots.
-    let outer = if relay.relay_insecure {
-        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+    // inner mTLS to the daemon). Precedence: insecure (dev) > a leaf pin (explicit
+    // or enrollment-delivered) > opt-in TOFU > a CA file > the public roots
+    // (`None`). The outer TLS is a metadata boundary, not the RPC boundary (A2).
+    let builder = || {
+        rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .expect("ring provider supports default protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
+    };
+    let mut tofu_verifier: Option<Arc<zeroclaw_tls::RelayPinVerifier>> = None;
+    let outer = if relay.relay_insecure {
+        let cfg = builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        Some(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
+    } else if let Some(pin) = relay.relay_pin.as_deref().filter(|p| !p.is_empty()) {
+        let v = Arc::new(zeroclaw_tls::RelayPinVerifier::pinned(pin.to_string()));
+        let cfg = builder()
+            .dangerous()
+            .with_custom_certificate_verifier(v)
+            .with_no_client_auth();
+        Some(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
+    } else if relay.relay_tofu {
+        let v = Arc::new(zeroclaw_tls::RelayPinVerifier::tofu());
+        tofu_verifier = Some(v.clone());
+        let cfg = builder()
+            .dangerous()
+            .with_custom_certificate_verifier(v)
+            .with_no_client_auth();
         Some(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
     } else if let Some(ca) = &relay.relay_ca_path {
         let mut roots = rustls::RootCertStore::empty();
         for cert in load_pem_certs(ca)? {
             roots.add(cert).context("adding relay CA to root store")?;
         }
-        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("ring provider supports default protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let cfg = builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         Some(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
     } else {
         None
@@ -574,6 +627,14 @@ async fn dial_through_relay(relay: &RelayDial) -> Result<tokio::io::DuplexStream
         tokio_tungstenite::client_async_tls_with_config(request, tcp, None, outer)
             .await
             .with_context(|| format!("relay outer WSS to {}", relay.relay_addr))?;
+
+    // Persist a TOFU-observed relay pin so later runs pin this leaf instead of
+    // re-trusting (opt-in path only).
+    if let Some(v) = &tofu_verifier
+        && let (Some(observed), Some(store)) = (v.observed_pin(), &relay.pin_store)
+    {
+        persist_relay_pin(store, &observed);
+    }
 
     let (mut sink, mut stream) = relay_ws.split();
 

@@ -121,6 +121,17 @@ struct Cli {
     #[arg(long)]
     relay_insecure: bool,
 
+    /// Pin the relay's OUTER leaf certificate to this SHA-256 fingerprint (hex).
+    /// Overrides --relay-ca / public roots. Usually delivered automatically at
+    /// enrollment; pass it to pin a manually configured relay.
+    #[arg(long)]
+    relay_pin: Option<String>,
+
+    /// Trust the relay's outer certificate on first use and remember its pin (for
+    /// a self-hosted relay without enrollment). Opt-in; a known pin takes priority.
+    #[arg(long)]
+    relay_tofu: bool,
+
     /// Enroll for a client certificate before connecting: prompt for the daemon
     /// pairing code, generate a key + CSR locally, fetch the signed cert, and
     /// cache it under <config-dir>/tls. The host defaults to --connect's host; the
@@ -545,6 +556,24 @@ async fn run() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
             });
 
+        // Relay outer-leaf pin: --relay-pin -> the enrollment-delivered pin -> a
+        // previously TOFU'd pin. TOFU persists here for the next run.
+        let pin_store = config_dir.join("relay").join("relay_pin");
+        let relay_pin = cli
+            .relay_pin
+            .clone()
+            .or_else(|| {
+                cached_relay
+                    .map(|r| r.relay_cert_pin.clone())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| {
+                std::fs::read_to_string(&pin_store)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+
         let relay = match (relay_addr, relay_node) {
             (Some(relay_addr), Some(node_id)) => {
                 // Default the relay's expected cert name to its host:port host.
@@ -560,6 +589,9 @@ async fn run() -> anyhow::Result<()> {
                     node_id,
                     relay_ca_path: cli.relay_ca.clone(),
                     relay_insecure: cli.relay_insecure,
+                    relay_pin: relay_pin.clone(),
+                    relay_tofu: cli.relay_tofu,
+                    pin_store: Some(pin_store.clone()),
                 })
             }
             (None, None) => None,

@@ -79,6 +79,10 @@ pub struct RelayBridgeConfig {
     pub relay_ca_path: Option<String>,
     /// Skip relay outer-cert verification (test only).
     pub relay_insecure: bool,
+    /// Opt-in trust-on-first-use for the relay's OUTER leaf cert (A2): accept the
+    /// first leaf and record its pin to `<data_dir>/relay/relay_pin`, pinning it
+    /// thereafter. Never silently enabled; a stored/explicit pin takes precedence.
+    pub relay_tofu: bool,
     /// Cap on simultaneously-bridged client connections (bridge-side DoS cap).
     pub max_conns: usize,
     /// Per-node `OPEN` handshake-rate cap (A6): burst allowance + steady refill
@@ -193,6 +197,36 @@ pub fn persist_node_id(data_dir: &std::path::Path, id: &str) -> Result<()> {
 /// touches it; the running bridge polls for it and rotates when it appears.
 pub fn rotate_trigger_path(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("relay").join("rotate-now")
+}
+
+/// The relay outer-leaf pin store (`<data_dir>/relay/relay_pin`). Once recorded
+/// (explicitly or by TOFU) the bridge pins the relay's outer cert, AND enrollment
+/// delivers this value to clients so they pin the same leaf (R-E contract).
+pub fn relay_pin_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("relay").join("relay_pin")
+}
+
+/// Persist the relay outer-leaf pin (sha256 hex) atomically at `0600`.
+pub fn persist_relay_pin(data_dir: &std::path::Path, pin: &str) -> Result<()> {
+    let dir = data_dir.join("relay");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join("relay_pin.tmp");
+    {
+        use std::io::Write as _;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.write_all(pin.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, dir.join("relay_pin")).context("atomically replacing relay_pin")?;
+    Ok(())
 }
 
 /// Request an on-demand node-id rotation by touching the trigger file. The running
@@ -352,8 +386,18 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
         .map_err(|e| anyhow::Error::msg(format!("loading relay signing key: {e}")))?;
     let pubkey = keypair.public_key().as_ref().to_vec();
 
-    // Outer TLS + WS to the relay.
-    let tls_config = relay_client_config(cfg.relay_ca_path.as_deref(), cfg.relay_insecure)?;
+    // Outer TLS + WS to the relay. A stored pin (explicit or previously TOFU'd)
+    // wins; otherwise opt-in TOFU records the leaf for next time (A2).
+    let stored_pin = std::fs::read_to_string(relay_pin_path(&cfg.data_dir))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (tls_config, pin_verifier) = relay_client_config(
+        cfg.relay_ca_path.as_deref(),
+        cfg.relay_insecure,
+        stored_pin.as_deref(),
+        cfg.relay_tofu,
+    )?;
     let connector = TlsConnector::from(tls_config);
     let tcp = TcpStream::connect(&cfg.relay_addr)
         .await
@@ -364,6 +408,19 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
         .connect(server_name, tcp)
         .await
         .context("relay outer TLS handshake")?;
+    // Persist a TOFU-observed pin so the next connection pins this leaf, and so
+    // enrollment can deliver it to clients.
+    if let Some(observed) = pin_verifier.as_ref().and_then(|v| v.observed_pin())
+        && let Err(e) = persist_relay_pin(&cfg.data_dir, &observed)
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
+            "relay outer-cert TOFU: failed to persist the observed pin"
+        );
+    }
     let uri: tokio_tungstenite::tungstenite::http::Uri = format!("wss://{}/", cfg.relay_host)
         .parse()
         .context("building relay ws uri")?;
@@ -664,31 +721,69 @@ where
     None
 }
 
-/// Build the client TLS config used to verify the relay's outer certificate.
-fn relay_client_config(ca_path: Option<&str>, insecure: bool) -> Result<Arc<rustls::ClientConfig>> {
+/// Build the client TLS config used to verify the relay's OUTER certificate, plus
+/// the pin verifier handle when one is used (so the caller can persist a
+/// TOFU-observed pin after the handshake). Precedence: insecure (test) > an
+/// explicit/stored leaf pin > opt-in TOFU > a CA file > the built-in public roots.
+fn relay_client_config(
+    ca_path: Option<&str>,
+    insecure: bool,
+    pin: Option<&str>,
+    tofu: bool,
+) -> Result<(
+    Arc<rustls::ClientConfig>,
+    Option<Arc<zeroclaw_tls::RelayPinVerifier>>,
+)> {
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .context("ring provider supports default protocol versions")?;
 
-    let config = if insecure {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify))
-            .with_no_client_auth()
+    let (config, verifier) = if insecure {
+        (
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth(),
+            None,
+        )
+    } else if let Some(pin) = pin.filter(|p| !p.is_empty()) {
+        let v = Arc::new(zeroclaw_tls::RelayPinVerifier::pinned(pin.to_string()));
+        (
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(v.clone())
+                .with_no_client_auth(),
+            Some(v),
+        )
+    } else if tofu {
+        let v = Arc::new(zeroclaw_tls::RelayPinVerifier::tofu());
+        (
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(v.clone())
+                .with_no_client_auth(),
+            None.or(Some(v)),
+        )
     } else if let Some(ca) = ca_path {
         let mut roots = rustls::RootCertStore::empty();
         for cert in zeroclaw_tls::load_certs(ca)? {
             roots.add(cert).context("adding relay CA to root store")?;
         }
-        builder.with_root_certificates(roots).with_no_client_auth()
+        (
+            builder.with_root_certificates(roots).with_no_client_auth(),
+            None,
+        )
     } else {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        builder.with_root_certificates(roots).with_no_client_auth()
+        (
+            builder.with_root_certificates(roots).with_no_client_auth(),
+            None,
+        )
     };
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), verifier))
 }
 
 /// Skip-verify server verifier for the relay's outer cert (test only).

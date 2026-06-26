@@ -6610,6 +6610,13 @@ pub struct RelayConfig {
     /// Skip verification of the relay's outer certificate (self-signed dev only).
     #[serde(default)]
     pub relay_insecure: bool,
+    /// Trust-on-first-use for the relay's OUTER certificate (default false): accept
+    /// the first leaf seen and pin it at `<data_dir>/relay/relay_pin` thereafter
+    /// (the pin is also handed to enrolling clients). Opt-in; ignored once a pin is
+    /// stored or `relay_ca_path` is set. The outer TLS is a metadata boundary, not
+    /// the RPC boundary (the inner mTLS is); see threat A2.
+    #[serde(default)]
+    pub tofu: bool,
     /// Auto-rotate the auto-minted node-id every N days (default 0 = never).
     /// Rotation mints a fresh id, registers it alongside the old one for a short
     /// grace window (so in-flight clients keep working), then retires the old id;
