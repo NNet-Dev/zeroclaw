@@ -61,6 +61,45 @@ pub enum Admission {
     Allowlist,
 }
 
+/// The hot-reloadable slice of relay policy: who may register and the optional
+/// shared-secret gate. Swapped atomically on SIGHUP so an operator can edit the
+/// allow/deny lists without dropping live connections. Deny always wins.
+#[derive(Debug, Clone)]
+pub struct AdmissionPolicy {
+    pub registration_mode: Admission,
+    /// Daemon pubkey fingerprints (sha256 hex) allowed to register (Allowlist).
+    pub allow: HashSet<String>,
+    /// Daemon pubkey fingerprints always rejected.
+    pub deny: HashSet<String>,
+    /// Optional shared-secret gate presented in `Hello.relay_token`.
+    pub relay_token: Option<String>,
+}
+
+impl Default for AdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            registration_mode: Admission::Open,
+            allow: HashSet::new(),
+            deny: HashSet::new(),
+            relay_token: None,
+        }
+    }
+}
+
+impl AdmissionPolicy {
+    /// True when `fpr` may register: not denied, and either open mode or on the
+    /// allow list. Deny always wins.
+    fn admit(&self, fpr: &str) -> bool {
+        if self.deny.contains(fpr) {
+            return false;
+        }
+        match self.registration_mode {
+            Admission::Open => true,
+            Admission::Allowlist => self.allow.contains(fpr),
+        }
+    }
+}
+
 /// Relay admission + abuse policy. Deny always wins.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -78,6 +117,18 @@ pub struct RelayConfig {
     pub max_conns_per_node: usize,
     /// Drop a client connection after this much inactivity.
     pub idle_timeout: Duration,
+}
+
+impl RelayConfig {
+    /// The admission slice (the part that hot-reloads on SIGHUP).
+    pub fn admission_policy(&self) -> AdmissionPolicy {
+        AdmissionPolicy {
+            registration_mode: self.registration_mode.clone(),
+            allow: self.allow.clone(),
+            deny: self.deny.clone(),
+            relay_token: self.relay_token.clone(),
+        }
+    }
 }
 
 impl Default for RelayConfig {
@@ -123,21 +174,22 @@ struct DaemonHandle {
 }
 
 struct Inner {
-    cfg: RelayConfig,
+    /// Hot-reloadable admission slice (swapped on SIGHUP). A `std::sync::RwLock`
+    /// is fine: reads are brief and never held across an await.
+    admission: std::sync::RwLock<Arc<AdmissionPolicy>>,
+    /// Static operational knobs (not hot-reloaded).
+    lease_ttl: Duration,
+    max_conns_per_node: usize,
+    idle_timeout: Duration,
     daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
 }
 
 impl Inner {
-    fn admit(&self, fpr: &str) -> bool {
-        if self.cfg.deny.contains(fpr) {
-            return false;
-        }
-        match self.cfg.registration_mode {
-            Admission::Open => true,
-            Admission::Allowlist => self.cfg.allow.contains(fpr),
-        }
+    /// Snapshot the current admission policy (cheap `Arc` clone).
+    fn admission(&self) -> Arc<AdmissionPolicy> {
+        self.admission.read().expect("admission lock").clone()
     }
 }
 
@@ -151,12 +203,21 @@ impl RelayServer {
     pub fn new(cfg: RelayConfig) -> Self {
         Self {
             inner: Arc::new(Inner {
-                cfg,
+                admission: std::sync::RwLock::new(Arc::new(cfg.admission_policy())),
+                lease_ttl: cfg.lease_ttl,
+                max_conns_per_node: cfg.max_conns_per_node,
+                idle_timeout: cfg.idle_timeout,
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
                 next_epoch: AtomicU64::new(1),
             }),
         }
+    }
+
+    /// Swap the admission policy live (SIGHUP reload). Existing connections are
+    /// untouched; the new policy applies to subsequent registrations.
+    pub fn reload_admission(&self, policy: AdmissionPolicy) {
+        *self.inner.admission.write().expect("admission lock") = Arc::new(policy);
     }
 
     /// Accept TLS + WebSocket connections forever, dispatching daemon vs client.
@@ -250,8 +311,12 @@ async fn handle_daemon<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Snapshot the admission policy once so the token gate and the allow/deny
+    // check are consistent even if a SIGHUP reload lands mid-registration.
+    let policy = inner.admission();
+
     // Optional shared-secret gate.
-    if let Some(required) = &inner.cfg.relay_token
+    if let Some(required) = &policy.relay_token
         && relay_token.as_deref() != Some(required.as_str())
     {
         let _ = send_control(&mut ws, &Control::error("forbidden", "bad relay token")).await;
@@ -266,7 +331,7 @@ where
         }
     };
     let fpr = hex::encode(Sha256::digest(&pubkey));
-    if !inner.admit(&fpr) {
+    if !policy.admit(&fpr) {
         let _ = send_control(&mut ws, &Control::error("forbidden", "registration denied")).await;
         return Ok(());
     }
@@ -346,7 +411,7 @@ where
         &mut ws,
         &Control::Registered {
             node_id: node_id.clone(),
-            lease_ttl_secs: inner.cfg.lease_ttl.as_secs(),
+            lease_ttl_secs: inner.lease_ttl.as_secs(),
         },
     )
     .await?;
@@ -446,7 +511,7 @@ where
     let (conn_tx, mut conn_rx) = mpsc::channel::<ConnEvent>(256);
     {
         let mut cs = conns.lock().await;
-        if cs.len() >= inner.cfg.max_conns_per_node {
+        if cs.len() >= inner.max_conns_per_node {
             drop(cs);
             let _ = send_control(&mut ws, &Control::error("busy", "node at capacity")).await;
             return Ok(());
@@ -519,7 +584,7 @@ where
     // DATA frame debits it. A client that drives it far past zero is ignoring
     // flow control and flooding the shared link, so the relay tears the conn
     // down (A6). The relay never originates credit; it only forwards + watches.
-    let idle = inner.cfg.idle_timeout;
+    let idle = inner.idle_timeout;
     let mut c2d_window = ConnWindow::new(INITIAL_WINDOW);
     loop {
         let deadline = tokio::time::Instant::now() + idle;
