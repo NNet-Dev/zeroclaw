@@ -453,6 +453,62 @@ async fn node_id_is_bound_to_pubkey() {
     );
 }
 
+#[tokio::test]
+async fn replayed_register_over_a_stale_nonce_is_rejected() {
+    // A9 (replay): the REGISTER signature is bound to the relay's per-handshake
+    // challenge nonce. A signature captured from a prior/forged session (over a
+    // stale nonce) does not verify against the fresh challenge, so a replayed
+    // REGISTER is refused with bad_sig rather than accepted.
+    let addr = start_relay(RelayConfig::default()).await;
+    let pkcs8 = gen_key();
+    let kp = Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
+    let pubkey = kp.public_key().as_ref().to_vec();
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(insecure_client_config());
+    let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(sni, tcp).await.unwrap();
+    let req = ClientRequestBuilder::new("wss://localhost/".parse().unwrap())
+        .with_sub_protocol(SUBPROTOCOL);
+    let (mut ws, _) = tokio_tungstenite::client_async_with_config(req, tls, None)
+        .await
+        .unwrap();
+
+    ws.send(Message::text(
+        Control::Hello {
+            daemon_pubkey: B64.encode(&pubkey),
+            node_id: "node-replay".into(),
+            relay_token: None,
+        }
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+
+    // Consume the FRESH challenge but sign a stale/captured nonce instead.
+    match next_control(&mut ws).await {
+        Some(Control::Challenge { .. }) => {}
+        other => panic!("expected a challenge, got {other:?}"),
+    }
+    let stale_nonce = [7u8; 32]; // a nonce from a prior session / forged
+    let sig = kp.sign(&stale_nonce);
+    ws.send(Message::text(
+        Control::Register {
+            node_id: "node-replay".into(),
+            sig: B64.encode(sig.as_ref()),
+        }
+        .to_json(),
+    ))
+    .await
+    .unwrap();
+
+    let term = next_control(&mut ws).await.expect("terminal frame");
+    assert!(
+        matches!(term, Control::Error { ref code, .. } if code == "bad_sig"),
+        "a signature over a stale nonce (replay) must be refused, got {term:?}"
+    );
+}
+
 /// Try to open an outer TLS + WS connection, returning Err when the relay refuses
 /// it (e.g. the per-source-IP rate cap drops the socket pre-handshake).
 async fn try_connect_ws(
