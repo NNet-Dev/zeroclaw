@@ -3,6 +3,10 @@
 Connect zerocode on your workstation to a daemon running on another machine
 (Raspberry Pi, home server, VPS, etc.).
 
+> For the full knob-by-knob guide covering all three topologies (direct,
+> daemon-to-relay, and client-through-relay), see
+> [Secure transport (end-to-end config)](./secure-transport.md).
+
 > **The WSS plane is mutually authenticated (mTLS).** Every client presents a
 > certificate; there is no server-only / unauthenticated path. The easy way to
 > get a client certificate is **enrollment** (below) - you do not hand-manage
