@@ -149,26 +149,6 @@ pub fn decode_data(bytes: &[u8]) -> Option<(u64, &[u8])> {
 /// assume this default; a [`Control::Window`] frame can change it explicitly.
 pub const INITIAL_WINDOW: u32 = 4 * MAX_DATA_PAYLOAD as u32;
 
-/// Split `payload` into `<= MAX_DATA_PAYLOAD` slices for DATA framing, so one
-/// inner write can never produce an oversized frame that monopolizes the
-/// multiplexed link (the relay rejects frames larger than `MAX_DATA_PAYLOAD`).
-/// Yields a single (possibly empty) slice when the payload already fits.
-pub fn chunk_payload(payload: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut emitted_empty = false;
-    payload
-        .chunks(MAX_DATA_PAYLOAD)
-        .chain(std::iter::from_fn(move || {
-            // `[].chunks(_)` yields nothing; preserve a zero-length DATA frame
-            // (used as an inner half-close / flush signal) by emitting once.
-            if payload.is_empty() && !emitted_empty {
-                emitted_empty = true;
-                Some(&payload[..0])
-            } else {
-                None
-            }
-        }))
-}
-
 /// Credit-based send window for one logical connection in one direction.
 ///
 /// The sender debits the window by each DATA chunk it transmits and pauses when
@@ -409,28 +389,6 @@ mod tests {
         assert!(Control::from_json("not json").is_err());
         // Known tag but missing required field is a parse error, not a panic.
         assert!(Control::from_json("{\"t\":\"open\"}").is_err());
-    }
-
-    #[test]
-    fn chunk_payload_splits_at_max() {
-        let big = vec![0u8; MAX_DATA_PAYLOAD * 2 + 7];
-        let chunks: Vec<&[u8]> = chunk_payload(&big).collect();
-        assert_eq!(chunks.len(), 3, "two full chunks + remainder");
-        assert_eq!(chunks[0].len(), MAX_DATA_PAYLOAD);
-        assert_eq!(chunks[1].len(), MAX_DATA_PAYLOAD);
-        assert_eq!(chunks[2].len(), 7);
-        assert!(chunks.iter().all(|c| c.len() <= MAX_DATA_PAYLOAD));
-    }
-
-    #[test]
-    fn chunk_payload_small_and_empty() {
-        // A payload that already fits yields exactly one slice.
-        assert_eq!(chunk_payload(b"hi").count(), 1);
-        // An empty payload still yields one (zero-length) slice, preserving an
-        // explicit zero-length DATA frame as a flush/half-close signal.
-        let empty: Vec<&[u8]> = chunk_payload(&[]).collect();
-        assert_eq!(empty.len(), 1);
-        assert!(empty[0].is_empty());
     }
 
     #[test]
