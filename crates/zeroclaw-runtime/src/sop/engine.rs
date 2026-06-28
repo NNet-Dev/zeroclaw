@@ -1370,19 +1370,21 @@ impl SopEngine {
         })?;
 
         let mut step_outputs = HashMap::new();
+        let mut last_completed_step = 0;
         for result in &run.step_results {
             if result.status == SopStepStatus::Completed {
                 // Try to parse output as JSON, fall back to string value.
                 let value = serde_json::from_str(&result.output)
                     .unwrap_or_else(|_| serde_json::Value::String(result.output.clone()));
                 step_outputs.insert(result.step_number, value);
+                last_completed_step = result.step_number;
             }
         }
 
         let state = DeterministicRunState {
             run_id: run_id.to_string(),
             sop_name: run.sop_name.clone(),
-            last_completed_step: run.current_step.saturating_sub(1),
+            last_completed_step,
             total_steps: run.total_steps,
             step_outputs,
             persisted_at: now_iso8601(),
@@ -3652,6 +3654,47 @@ type = "manual"
             matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
             "deterministic routing should select explicit step 3"
         );
+    }
+
+    #[test]
+    fn deterministic_routed_checkpoint_persists_actual_last_completed_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sop = deterministic_sop_all_execute("det-route-cp");
+        sop.location = Some(tmp.path().to_path_buf());
+        sop.steps.push(SopStep {
+            number: 3,
+            title: "Checkpoint three".into(),
+            body: "Pause at step three".into(),
+            kind: SopStepKind::Checkpoint,
+            ..SopStep::default()
+        });
+        sop.steps[0].routing.next = Some(3);
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("det-route-cp", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"step": 1}), None)
+            .unwrap();
+        let (state_file, step_number) = match action {
+            SopRunAction::CheckpointWait {
+                state_file, step, ..
+            } => (state_file, step.number),
+            other => {
+                assert!(
+                    matches!(other, SopRunAction::CheckpointWait { .. }),
+                    "expected routed checkpoint wait"
+                );
+                return;
+            }
+        };
+        assert_eq!(step_number, 3);
+
+        let state = SopEngine::load_deterministic_state(&state_file).unwrap();
+
+        assert_eq!(state.last_completed_step, 1);
+        assert!(state.step_outputs.contains_key(&1));
+        assert!(!state.step_outputs.contains_key(&2));
     }
 
     #[test]
