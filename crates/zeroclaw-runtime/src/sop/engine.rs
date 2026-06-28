@@ -8,6 +8,8 @@ use anyhow::{Result, bail};
 use super::condition::evaluate_condition;
 use super::load_sops;
 use super::metrics::SopMetricsCollector;
+use super::route::{self, NextStep, RouteCtx};
+use super::rundata::RunData;
 use super::schema;
 use super::store::{InMemoryRunStore, PersistedRun, SopEventRecord, SopRunStore, StoreError};
 use super::types::{
@@ -307,31 +309,13 @@ impl SopEngine {
             &format!("SOP run {} started for '{}'", run_id, sop_name)
         );
 
-        // Determine first action based on execution mode
-        let step = sop.steps[0].clone();
-        let input = step_input_value(&self.active_runs[&run_id], step.number);
-        if let Some(action) = self.schema_input_failure_action(&run_id, &step, &input) {
-            return Ok(action);
-        }
-        let context = format_step_context(&sop, &self.active_runs[&run_id], &step);
-        let action = resolve_step_action(&sop, &step, run_id.clone(), context);
-
-        // If the action is WaitApproval, update run status and record timestamp
-        if matches!(action, SopRunAction::WaitApproval { .. })
-            && let Some(run) = self.active_runs.get_mut(&run_id)
-        {
-            run.status = SopRunStatus::WaitingApproval;
-            run.waiting_since = Some(now_iso8601());
-        }
-
-        self.persist_active(&run_id);
-        Ok(action)
+        self.dispatch_llm_step(&run_id, &sop, 1, None)
     }
 
     /// Report the result of the current step and advance the run.
     /// Returns the next action to take.
     pub fn advance_step(&mut self, run_id: &str, result: SopStepResult) -> Result<SopRunAction> {
-        let (sop_name, current_step_number, total_steps) = {
+        let (sop_name, current_step_number) = {
             let run = self.active_runs.get(run_id).ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -342,7 +326,7 @@ impl SopEngine {
                 );
                 anyhow::Error::msg(format!("Active run not found: {run_id}"))
             })?;
-            (run.sop_name.clone(), run.current_step, run.total_steps)
+            (run.sop_name.clone(), run.current_step)
         };
 
         let sop = self
@@ -381,12 +365,24 @@ impl SopEngine {
             })?;
 
         // Deterministic runs are driven through the dedicated piping path so the
-        // same `sop_advance` tool advances every execution mode. A failed step
-        // fails the run; otherwise the step output is piped to the next step.
+        // same `sop_advance` tool advances every execution mode.
         if sop.execution_mode == SopExecutionMode::Deterministic {
             if result.status == SopStepStatus::Failed {
-                let reason = format!("Step {} failed: {}", result.step_number, result.output);
-                return Ok(self.finish_run(run_id, SopRunStatus::Failed, Some(reason)));
+                self.record_step_result(run_id, result.clone())?;
+                return self.route_recorded_step(
+                    run_id,
+                    &sop,
+                    &current_step,
+                    SopStepStatus::Failed,
+                    true,
+                    Some(retry_input_value(
+                        self.active_runs.get(run_id).ok_or_else(|| {
+                            anyhow::Error::msg(format!("Active run not found: {run_id}"))
+                        })?,
+                        current_step.number,
+                    )),
+                    Some(step_result_value(&result)),
+                );
             }
             let piped = step_result_value(&result);
             return self.advance_deterministic_step(
@@ -396,81 +392,39 @@ impl SopEngine {
             );
         }
 
+        let mut recorded = result.clone();
         if result.status == SopStepStatus::Completed {
             let output = step_result_value(&result);
-            if let Some(action) = self.schema_output_failure_action(run_id, &current_step, &output)
-            {
-                return Ok(action);
+            if let Err(reason) = self.validate_step_output(&current_step, &output) {
+                recorded.status = SopStepStatus::Failed;
+                recorded.output = format!(
+                    "Step {} output schema validation failed: {reason}",
+                    current_step.number
+                );
             }
         }
 
-        let run = self.active_runs.get_mut(run_id).ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"run_id": run_id})),
-                "SOP engine: active run not found"
-            );
-            anyhow::Error::msg(format!("Active run not found: {run_id}"))
-        })?;
+        let retry_input = if recorded.status == SopStepStatus::Failed {
+            Some(retry_input_value(
+                self.active_runs
+                    .get(run_id)
+                    .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?,
+                current_step.number,
+            ))
+        } else {
+            None
+        };
 
-        // Record step result
-        run.step_results.push(result.clone());
-
-        // Check if step failed
-        if result.status == SopStepStatus::Failed {
-            let reason = format!("Step {} failed: {}", result.step_number, result.output);
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"run_id": run_id, "reason": reason.to_string()})
-                    ),
-                "SOP run : "
-            );
-            return Ok(self.finish_run(run_id, SopRunStatus::Failed, Some(reason)));
-        }
-
-        // Advance to next step
-        let next_step_num = current_step_number + 1;
-        if next_step_num > total_steps {
-            // All steps completed
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"run_id": run_id})),
-                "SOP run  completed successfully"
-            );
-            return Ok(self.finish_run(run_id, SopRunStatus::Completed, None));
-        }
-
-        // Update run state
-        let run = self.active_runs.get_mut(run_id).unwrap();
-        run.current_step = next_step_num;
-
-        let step_idx = (next_step_num - 1) as usize;
-        let step = sop.steps[step_idx].clone();
-        let input = step_input_value(run, step.number);
-        if let Some(action) = self.schema_input_failure_action(run_id, &step, &input) {
-            return Ok(action);
-        }
-        let run = self.active_runs.get(run_id).unwrap();
-        let context = format_step_context(&sop, run, &step);
-        let run_id_str = run_id.to_string();
-        let action = resolve_step_action(&sop, &step, run_id_str.clone(), context);
-
-        // If the action is WaitApproval, update run status and record timestamp
-        if matches!(action, SopRunAction::WaitApproval { .. })
-            && let Some(run) = self.active_runs.get_mut(&run_id_str)
-        {
-            run.status = SopRunStatus::WaitingApproval;
-            run.waiting_since = Some(now_iso8601());
-        }
-
-        self.persist_active(run_id);
-        Ok(action)
+        self.record_step_result(run_id, recorded.clone())?;
+        self.route_recorded_step(
+            run_id,
+            &sop,
+            &current_step,
+            recorded.status,
+            false,
+            retry_input,
+            None,
+        )
     }
 
     fn schema_input_failure_action(
@@ -483,20 +437,6 @@ impl SopEngine {
             Ok(()) => None,
             Err(reason) => {
                 Some(self.fail_step_schema_validation(run_id, step.number, "input", reason))
-            }
-        }
-    }
-
-    fn schema_output_failure_action(
-        &mut self,
-        run_id: &str,
-        step: &SopStep,
-        output: &Value,
-    ) -> Option<SopRunAction> {
-        match self.validate_step_output(step, output) {
-            Ok(()) => None,
-            Err(reason) => {
-                Some(self.fail_step_schema_validation(run_id, step.number, "output", reason))
             }
         }
     }
@@ -550,6 +490,354 @@ impl SopEngine {
             "SOP step schema validation failed"
         );
         self.finish_run(run_id, SopRunStatus::Failed, Some(reason))
+    }
+
+    fn record_step_result(&mut self, run_id: &str, result: SopStepResult) -> Result<()> {
+        let run = self.active_runs.get_mut(run_id).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"run_id": run_id})),
+                "SOP engine: active run not found"
+            );
+            anyhow::Error::msg(format!("Active run not found: {run_id}"))
+        })?;
+        run.step_results.push(result);
+        Ok(())
+    }
+
+    fn route_recorded_step(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        current_step: &SopStep,
+        last_status: SopStepStatus,
+        deterministic: bool,
+        retry_input: Option<Value>,
+        routed_input: Option<Value>,
+    ) -> Result<SopRunAction> {
+        let decision =
+            self.route_decision_after_recorded_step(run_id, sop, current_step, last_status)?;
+        self.apply_route_decision(
+            run_id,
+            sop,
+            current_step.number,
+            decision,
+            deterministic,
+            retry_input,
+            routed_input,
+        )
+    }
+
+    fn route_decision_after_recorded_step(
+        &self,
+        run_id: &str,
+        sop: &Sop,
+        current_step: &SopStep,
+        last_status: SopStepStatus,
+    ) -> Result<NextStep> {
+        let run = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+
+        if last_status == SopStepStatus::Failed {
+            let attempts = run
+                .step_results
+                .iter()
+                .filter(|result| {
+                    result.step_number == current_step.number
+                        && result.status == SopStepStatus::Failed
+                })
+                .count()
+                .try_into()
+                .unwrap_or(u32::MAX);
+            let decision = route::failure::route_failure(
+                &current_step.on_failure,
+                attempts,
+                self.config.max_step_retries,
+            );
+            return Ok(match decision {
+                NextStep::Fail(reason) if reason == "step failed" => {
+                    let detail = run
+                        .step_results
+                        .iter()
+                        .rev()
+                        .find(|result| {
+                            result.step_number == current_step.number
+                                && result.status == SopStepStatus::Failed
+                        })
+                        .map(|result| result.output.as_str())
+                        .unwrap_or("step failed");
+                    NextStep::Fail(format!("Step {} failed: {detail}", current_step.number))
+                }
+                other => other,
+            });
+        }
+
+        let run_data = RunData::from_step_results(&run.step_results);
+        Ok(route::resolve_next(&RouteCtx {
+            sop,
+            run,
+            run_data: &run_data,
+            last_status,
+            max_step_visits: self.config.max_step_visits,
+        }))
+    }
+
+    fn apply_route_decision(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        current_step_number: u32,
+        decision: NextStep,
+        deterministic: bool,
+        retry_input: Option<Value>,
+        routed_input: Option<Value>,
+    ) -> Result<SopRunAction> {
+        match decision {
+            NextStep::Step(step_number) => {
+                if let Some(action) = self.visit_bound_failure(run_id, step_number)? {
+                    return Ok(action);
+                }
+                if deterministic {
+                    let input = routed_input.unwrap_or_default();
+                    self.dispatch_deterministic_step(run_id, sop, step_number, input)
+                } else {
+                    self.dispatch_llm_step(run_id, sop, step_number, None)
+                }
+            }
+            NextStep::Retry => {
+                if let Some(action) = self.visit_bound_failure(run_id, current_step_number)? {
+                    return Ok(action);
+                }
+                if deterministic {
+                    self.dispatch_deterministic_step(
+                        run_id,
+                        sop,
+                        current_step_number,
+                        retry_input.unwrap_or_default(),
+                    )
+                } else {
+                    self.dispatch_llm_step(run_id, sop, current_step_number, retry_input)
+                }
+            }
+            NextStep::Complete => {
+                if deterministic {
+                    Ok(self.finish_deterministic_run(run_id))
+                } else {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"run_id": run_id})),
+                        "SOP run completed successfully"
+                    );
+                    Ok(self.finish_run(run_id, SopRunStatus::Completed, None))
+                }
+            }
+            NextStep::Fail(reason) => {
+                Ok(self.finish_run(run_id, SopRunStatus::Failed, Some(reason)))
+            }
+            NextStep::Wait(step_number) => Ok(self.mark_step_pending(
+                run_id,
+                sop,
+                step_number,
+                format!("step {step_number} dependencies not satisfied"),
+            )),
+        }
+    }
+
+    fn visit_bound_failure(
+        &mut self,
+        run_id: &str,
+        step_number: u32,
+    ) -> Result<Option<SopRunAction>> {
+        let run = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        if route::guard::within_visit_bound(run, step_number, self.config.max_step_visits) {
+            return Ok(None);
+        }
+
+        Ok(Some(self.finish_run(
+            run_id,
+            SopRunStatus::Failed,
+            Some(format!("step {step_number} visit limit reached")),
+        )))
+    }
+
+    fn dispatch_llm_step(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        step_number: u32,
+        input_override: Option<Value>,
+    ) -> Result<SopRunAction> {
+        let step = self.resolve_sop_step(sop, step_number)?;
+        if let Some(action) = self.visit_bound_failure(run_id, step_number)? {
+            return Ok(action);
+        }
+
+        if let Some(run) = self.active_runs.get_mut(run_id) {
+            run.current_step = step_number;
+            run.status = SopRunStatus::Running;
+            run.waiting_since = None;
+        }
+
+        let run_data = {
+            let run = self
+                .active_runs
+                .get(run_id)
+                .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+            RunData::from_step_results(&run.step_results)
+        };
+        if !route::eligible(&step, &run_data) {
+            return Ok(self.mark_step_pending(
+                run_id,
+                sop,
+                step.number,
+                format!("step {} dependencies not satisfied", step.number),
+            ));
+        }
+
+        let input = match input_override {
+            Some(input) => input,
+            None => {
+                let run = self
+                    .active_runs
+                    .get(run_id)
+                    .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+                step_input_value(run, step.number)
+            }
+        };
+        if let Some(action) = self.schema_input_failure_action(run_id, &step, &input) {
+            return Ok(action);
+        }
+
+        let context = {
+            let run = self
+                .active_runs
+                .get(run_id)
+                .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+            format_step_context(sop, run, &step)
+        };
+        let action = resolve_step_action(sop, &step, run_id.to_string(), context);
+        if matches!(action, SopRunAction::WaitApproval { .. })
+            && let Some(run) = self.active_runs.get_mut(run_id)
+        {
+            run.status = SopRunStatus::WaitingApproval;
+            run.waiting_since = Some(now_iso8601());
+        }
+
+        self.persist_active(run_id);
+        Ok(action)
+    }
+
+    fn dispatch_deterministic_step(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        step_number: u32,
+        input: Value,
+    ) -> Result<SopRunAction> {
+        let step = self.resolve_sop_step(sop, step_number)?;
+        if let Some(action) = self.visit_bound_failure(run_id, step_number)? {
+            return Ok(action);
+        }
+
+        if let Some(run) = self.active_runs.get_mut(run_id) {
+            run.current_step = step_number;
+            run.status = SopRunStatus::Running;
+            run.waiting_since = None;
+        }
+
+        self.resolve_deterministic_action(sop, run_id, &step, input)
+    }
+
+    fn resolve_sop_step(&self, sop: &Sop, step_number: u32) -> Result<SopStep> {
+        sop.steps
+            .iter()
+            .find(|step| step.number == step_number)
+            .cloned()
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"sop_name": sop.name, "step": step_number})
+                        ),
+                    "SOP engine: step no longer exists (definition changed mid-run)"
+                );
+                anyhow::Error::msg(format!(
+                    "SOP '{}' step {step_number} no longer exists (definition changed mid-run)",
+                    sop.name
+                ))
+            })
+    }
+
+    fn mark_step_pending(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        step_number: u32,
+        reason: String,
+    ) -> SopRunAction {
+        let now = now_iso8601();
+        if let Some(run) = self.active_runs.get_mut(run_id) {
+            run.current_step = step_number;
+            run.status = SopRunStatus::Pending;
+            run.waiting_since = Some(now.clone());
+            let last_is_same_skip = run.step_results.last().is_some_and(|result| {
+                result.step_number == step_number && result.status == SopStepStatus::Skipped
+            });
+            if !last_is_same_skip {
+                run.step_results.push(SopStepResult {
+                    step_number,
+                    status: SopStepStatus::Skipped,
+                    output: reason.clone(),
+                    started_at: now.clone(),
+                    completed_at: Some(now.clone()),
+                });
+            }
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "sop_name": sop.name,
+                    "step": step_number,
+                    "reason": reason,
+                })),
+            "SOP run pending on step dependencies"
+        );
+        self.persist_active(run_id);
+        SopRunAction::Pending {
+            run_id: run_id.to_string(),
+            sop_name: sop.name.clone(),
+            step: step_number,
+            reason,
+        }
+    }
+
+    fn finish_deterministic_run(&mut self, run_id: &str) -> SopRunAction {
+        let saved = self
+            .active_runs
+            .get(run_id)
+            .map(|run| run.llm_calls_saved)
+            .unwrap_or(0);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Deterministic SOP run {run_id} completed ({saved} LLM calls saved)")
+        );
+        self.deterministic_savings.total_llm_calls_saved += saved;
+        self.deterministic_savings.total_runs += 1;
+        self.finish_run(run_id, SopRunStatus::Completed, None)
     }
 
     /// Cancel an active run.
@@ -658,6 +946,22 @@ impl SopEngine {
                 "SOP '{sop_name}' step {current_step} no longer exists (definition changed mid-run)"
             ))
         })?;
+
+        let run_data = {
+            let run = self
+                .active_runs
+                .get(run_id)
+                .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+            RunData::from_step_results(&run.step_results)
+        };
+        if !route::eligible(&step, &run_data) {
+            return Ok(self.mark_step_pending(
+                run_id,
+                &sop,
+                step.number,
+                format!("step {} dependencies not satisfied", step.number),
+            ));
+        }
 
         let input = {
             let run = self
@@ -775,10 +1079,7 @@ impl SopEngine {
             )
         );
 
-        // Produce first step action
-        let step = sop.steps[0].clone();
-        let input = serde_json::Value::Null;
-        self.resolve_deterministic_action(&sop, &run_id, &step, input)
+        self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null)
     }
 
     /// Advance a deterministic run with the output of the current step.
@@ -838,11 +1139,6 @@ impl SopEngine {
                 ))
             })?;
 
-        if let Some(action) = self.schema_output_failure_action(run_id, &current_step, &step_output)
-        {
-            return Ok(action);
-        }
-
         let run = self.active_runs.get_mut(run_id).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -866,36 +1162,38 @@ impl SopEngine {
             started_at,
             completed_at,
         };
+        let retry_input = retry_input_value(run, current_step.number);
         run.step_results.push(step_result);
 
-        // Each deterministic step saves one LLM call
-        run.llm_calls_saved += 1;
-
-        // Advance to next step
-        let next_step_num = run.current_step + 1;
-        if next_step_num > run.total_steps {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Deterministic SOP run {run_id} completed ({} LLM calls saved)",
-                    run.llm_calls_saved
-                )
-            );
-            let saved = run.llm_calls_saved;
-            self.deterministic_savings.total_llm_calls_saved += saved;
-            self.deterministic_savings.total_runs += 1;
-            return Ok(self.finish_run(run_id, SopRunStatus::Completed, None));
+        let mut last_status = SopStepStatus::Completed;
+        if let Err(reason) = self.validate_step_output(&current_step, &step_output) {
+            last_status = SopStepStatus::Failed;
+            if let Some(recorded) = self
+                .active_runs
+                .get_mut(run_id)
+                .and_then(|run| run.step_results.last_mut())
+            {
+                recorded.status = SopStepStatus::Failed;
+                recorded.output = format!(
+                    "Step {} output schema validation failed: {reason}",
+                    current_step.number
+                );
+            }
+        } else if let Some(run) = self.active_runs.get_mut(run_id) {
+            // Each deterministic step saves one LLM call only when the step
+            // produced a valid completed output.
+            run.llm_calls_saved += 1;
         }
 
-        let run = self.active_runs.get_mut(run_id).unwrap();
-        run.current_step = next_step_num;
-
-        let step_idx = (next_step_num - 1) as usize;
-        let step = sop.steps[step_idx].clone();
-        let run_id_owned = run_id.to_string();
-
-        self.resolve_deterministic_action(&sop, &run_id_owned, &step, step_output)
+        self.route_recorded_step(
+            run_id,
+            &sop,
+            &current_step,
+            last_status,
+            true,
+            Some(retry_input),
+            Some(step_output),
+        )
     }
 
     /// Resume a deterministic run from persisted state.
@@ -943,38 +1241,47 @@ impl SopEngine {
         run.status = SopRunStatus::Running;
         run.waiting_since = None;
         run.llm_calls_saved = state.llm_calls_saved;
-
-        // Resume from the step after the last completed one
-        let next_step_num = state.last_completed_step + 1;
-        if next_step_num > state.total_steps {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Deterministic SOP run {} completed on resume ({} LLM calls saved)",
-                    state.run_id, state.llm_calls_saved
-                )
-            );
-            self.deterministic_savings.total_llm_calls_saved += state.llm_calls_saved;
-            self.deterministic_savings.total_runs += 1;
-            return Ok(self.finish_run(&state.run_id, SopRunStatus::Completed, None));
+        for (step_number, output) in &state.step_outputs {
+            let already_recorded = run
+                .step_results
+                .iter()
+                .any(|result| result.step_number == *step_number);
+            if !already_recorded {
+                run.step_results.push(SopStepResult {
+                    step_number: *step_number,
+                    status: SopStepStatus::Completed,
+                    output: output.to_string(),
+                    started_at: state.persisted_at.clone(),
+                    completed_at: Some(state.persisted_at.clone()),
+                });
+            }
         }
 
-        let run = self.active_runs.get_mut(&state.run_id).unwrap();
-        run.current_step = next_step_num;
-
-        let step_idx = (next_step_num - 1) as usize;
-        let step = sop.steps[step_idx].clone();
-
-        // Use last step's output as input, or Null
         let last_output = state
             .step_outputs
             .get(&state.last_completed_step)
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-
         let run_id = state.run_id.clone();
-        self.resolve_deterministic_action(&sop, &run_id, &step, last_output)
+
+        if state.last_completed_step == 0 {
+            return self.dispatch_deterministic_step(&run_id, &sop, 1, last_output);
+        }
+
+        {
+            let run = self.active_runs.get_mut(&run_id).unwrap();
+            run.current_step = state.last_completed_step;
+        }
+        let current_step = self.resolve_sop_step(&sop, state.last_completed_step)?;
+        self.route_recorded_step(
+            &run_id,
+            &sop,
+            &current_step,
+            SopStepStatus::Completed,
+            true,
+            None,
+            Some(last_output),
+        )
     }
 
     /// Resolve the action for a deterministic step (execute or checkpoint).
@@ -985,6 +1292,22 @@ impl SopEngine {
         step: &SopStep,
         input: serde_json::Value,
     ) -> Result<SopRunAction> {
+        let run_data = {
+            let run = self
+                .active_runs
+                .get(run_id)
+                .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+            RunData::from_step_results(&run.step_results)
+        };
+        if !route::eligible(step, &run_data) {
+            return Ok(self.mark_step_pending(
+                run_id,
+                sop,
+                step.number,
+                format!("step {} dependencies not satisfied", step.number),
+            ));
+        }
+
         if let Some(action) = self.schema_input_failure_action(run_id, step, &input) {
             return Ok(action);
         }
@@ -1048,10 +1371,12 @@ impl SopEngine {
 
         let mut step_outputs = HashMap::new();
         for result in &run.step_results {
-            // Try to parse output as JSON, fall back to string value
-            let value = serde_json::from_str(&result.output)
-                .unwrap_or_else(|_| serde_json::Value::String(result.output.clone()));
-            step_outputs.insert(result.step_number, value);
+            if result.status == SopStepStatus::Completed {
+                // Try to parse output as JSON, fall back to string value.
+                let value = serde_json::from_str(&result.output)
+                    .unwrap_or_else(|_| serde_json::Value::String(result.output.clone()));
+                step_outputs.insert(result.step_number, value);
+            }
         }
 
         let state = DeterministicRunState {
@@ -1488,6 +1813,26 @@ fn step_input_value(run: &SopRun, step_number: u32) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn retry_input_value(run: &SopRun, step_number: u32) -> Value {
+    if step_number <= 1 {
+        return run
+            .trigger_event
+            .payload
+            .as_deref()
+            .map(jsonish_value)
+            .unwrap_or(Value::Null);
+    }
+
+    run.step_results
+        .iter()
+        .rev()
+        .find(|result| {
+            result.status == SopStepStatus::Completed && result.step_number != step_number
+        })
+        .map(step_result_value)
+        .unwrap_or(Value::Null)
+}
+
 fn step_result_value(result: &SopStepResult) -> Value {
     jsonish_value(&result.output)
 }
@@ -1579,6 +1924,7 @@ fn parse_iso8601_secs(input: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
+    use crate::sop::step_contract::StepFailure;
     use crate::sop::types::{SopExecutionMode, StepSchema};
 
     /// Clear a WaitingApproval gate through the production out-of-band chokepoint
@@ -1677,6 +2023,7 @@ mod tests {
             | SopRunAction::WaitApproval { run_id, .. }
             | SopRunAction::DeterministicStep { run_id, .. }
             | SopRunAction::CheckpointWait { run_id, .. }
+            | SopRunAction::Pending { run_id, .. }
             | SopRunAction::Completed { run_id, .. }
             | SopRunAction::Failed { run_id, .. } => run_id,
         }
@@ -2180,6 +2527,191 @@ mod tests {
 
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
         assert_eq!(engine.active_runs()[&run_id].current_step, 2);
+    }
+
+    #[test]
+    fn explicit_next_routes_llm_run_over_linear_successor() {
+        let mut sop = test_sop("route-next", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps.push(SopStep {
+            number: 3,
+            title: "Step three".into(),
+            body: "Do step three".into(),
+            ..SopStep::default()
+        });
+        sop.steps[0].routing.next = Some(3);
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("route-next", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: r#"{"ok":true}"#.into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 3),
+            "explicit routing should select step 3 instead of the linear step 2"
+        );
+        assert_eq!(engine.active_runs()[&run_id].current_step, 3);
+    }
+
+    #[test]
+    fn failed_step_retries_until_policy_limit() {
+        let mut sop = test_sop("route-retry", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[0].on_failure = StepFailure::Retry { max: 2 };
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("route-retry", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Failed,
+                    output: "first failure".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 1),
+            "first failed attempt should retry step 1"
+        );
+        assert_eq!(engine.active_runs()[&run_id].current_step, 1);
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Failed,
+                    output: "second failure".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::Failed { ref reason, .. } if reason.contains("retry limit"))
+        );
+        assert!(engine.active_runs().is_empty());
+    }
+
+    #[test]
+    fn failed_step_goto_routes_to_compensating_step() {
+        let mut sop = test_sop("route-goto", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[0].on_failure = StepFailure::Goto { step: 2 };
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("route-goto", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Failed,
+                    output: "needs compensation".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2));
+        assert_eq!(engine.active_runs()[&run_id].current_step, 2);
+    }
+
+    #[test]
+    fn ineligible_routed_step_is_marked_skipped_and_pending() {
+        let mut sop = test_sop("route-pending", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[1].routing.depends_on = vec![42];
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("route-pending", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: r#"{"ok":true}"#.into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::Pending { step: 2, ref reason, .. } if reason.contains("dependencies"))
+        );
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.status, SopRunStatus::Pending);
+        assert_eq!(run.current_step, 2);
+        assert!(
+            run.step_results
+                .iter()
+                .any(|result| result.step_number == 2 && result.status == SopStepStatus::Skipped)
+        );
+    }
+
+    #[test]
+    fn output_schema_failure_can_retry_through_on_failure_policy() {
+        let mut sop = test_sop("schema-retry", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[0].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[0].on_failure = StepFailure::Retry { max: 2 };
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("schema-retry", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "{}".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 1),
+            "schema output failure should route through on_failure retry"
+        );
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: r#"{"ok":true}"#.into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2));
     }
 
     #[test]
@@ -3091,6 +3623,34 @@ type = "manual"
         assert!(
             matches!(action, SopRunAction::Completed { .. }),
             "deterministic run should complete after its final step"
+        );
+    }
+
+    #[test]
+    fn deterministic_run_uses_explicit_next_routing() {
+        let mut sop = deterministic_sop_all_execute("det-route");
+        sop.steps.push(SopStep {
+            number: 3,
+            title: "Step three".into(),
+            body: "Do step three".into(),
+            kind: SopStepKind::Execute,
+            ..SopStep::default()
+        });
+        sop.steps[0].routing.next = Some(3);
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("det-route", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 1)
+        );
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"ok": true}), None)
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
+            "deterministic routing should select explicit step 3"
         );
     }
 

@@ -41,8 +41,10 @@ Parser behavior:
 - `- requires_confirmation: true` enforces approval for that step.
 - `- allow-tools:` and `- deny-tools:` define an explicit per-step tool scope.
 - `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
-- `- next:` and `- depends_on:` declare route metadata for non-linear runs.
-- `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>`.
+- `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
+  are marked `skipped` and leave the run `pending` instead of dispatching.
+- `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
+  enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
 
 ### Step Contract Enforcement
@@ -63,9 +65,11 @@ The `[sop]` config controls enforcement:
 | `max_step_retries` | `2` | Limit retries requested by a step failure policy. |
 
 Schema enforcement fails closed: invalid step input prevents the step from
-starting, and invalid step output prevents the run from advancing. Tool-scope
-enforcement is available as config, but the current runtime still treats scopes
-as advisory until the turn-loop filter is wired.
+starting, and invalid step output is routed through the step's `on_failure`
+policy. Routing enforcement replaces linear `current_step + 1` advancement in
+LLM and deterministic runs. Tool-scope enforcement is available as config, but
+the current runtime still treats scopes as advisory until the turn-loop filter
+is wired.
 
 ## 4. Trigger Types
 
