@@ -39,6 +39,12 @@ pub fn resolve_excluded(
     let mut excluded = Vec::new();
     for name in registry_names {
         let normalized = normalize(name);
+        let policy_allows = security.is_none_or(|policy| policy.is_tool_allowed(name));
+        if !policy_allows {
+            excluded.push(name.clone());
+            continue;
+        }
+
         if mandatory.contains(&normalized) {
             continue;
         }
@@ -47,9 +53,8 @@ pub fn resolve_excluded(
             .as_ref()
             .is_none_or(|allowed| allowed.contains(&normalized));
         let step_denies = deny.contains(&normalized);
-        let policy_allows = security.is_none_or(|policy| policy.is_tool_allowed(name));
 
-        if !step_allows || step_denies || !policy_allows {
+        if !step_allows || step_denies {
             excluded.push(name.clone());
         }
     }
@@ -154,6 +159,25 @@ mod tests {
                 "shell".to_string(),
                 "write_file".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn mandatory_infra_cannot_restore_policy_denied_tools() {
+        let policy = SecurityPolicy {
+            allowed_tools: Some(vec!["read_file".into(), "shell".into()]),
+            excluded_tools: Some(vec!["sop_advance".into()]),
+            ..Default::default()
+        };
+        let scope = StepToolScope {
+            allow: None,
+            deny: Vec::new(),
+        };
+        let mandatory = vec!["sop_advance".to_string()];
+
+        assert_eq!(
+            resolve_excluded(&registry(), &scope, Some(&policy), &mandatory),
+            vec!["sop_advance".to_string(), "write_file".to_string()]
         );
     }
 }
