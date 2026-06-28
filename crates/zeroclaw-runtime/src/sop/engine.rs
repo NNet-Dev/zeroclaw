@@ -2157,8 +2157,10 @@ mod tests {
             input: None,
             output: Some(required_object_schema("ok")),
         });
-        let mut config = SopConfig::default();
-        config.step_schema_enforce = false;
+        let config = SopConfig {
+            step_schema_enforce: false,
+            ..SopConfig::default()
+        };
         let mut engine = engine_with_config_sops(config, vec![sop]);
         let action = engine.start_run("schema-off", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
