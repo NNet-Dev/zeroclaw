@@ -4452,6 +4452,7 @@ mod tests {
             cancellation_token: None,
             attachments: Vec::new(),
             in_reply_to: None,
+            suppress_voice: false,
         };
         let err = ch.send(&msg).await.unwrap_err();
         assert!(err.to_string().contains("unknown or expired"));
