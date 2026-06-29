@@ -143,6 +143,9 @@ mod tests {
             self.inner
                 .try_claim_run(run_id, sop_name, per_sop_cap, global_cap)
         }
+        fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
+            self.inner.claim_counts(sop_name)
+        }
         fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
             self.inner.heartbeat_claim(token)
         }

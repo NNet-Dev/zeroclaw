@@ -12,7 +12,8 @@ use super::route::{self, NextStep, RouteCtx};
 use super::rundata::RunData;
 use super::schema;
 use super::store::{
-    InMemoryRunStore, PersistedRun, RetentionPolicy, SopEventRecord, SopRunStore, StoreError,
+    ClaimToken, InMemoryRunStore, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy,
+    SopEventRecord, SopRunStore, StoreError,
 };
 use super::types::{
     DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
@@ -103,6 +104,14 @@ impl SopEngine {
             Ok(runs) => {
                 let mut restored = 0usize;
                 for pr in runs {
+                    if let Some(sop) = self.sops.iter().find(|s| s.name == pr.run.sop_name) {
+                        let _ = self.store.try_claim_run(
+                            &pr.run.run_id,
+                            &pr.run.sop_name,
+                            sop.max_concurrent as usize,
+                            self.config.max_concurrent_total,
+                        );
+                    }
                     if self
                         .active_runs
                         .insert(pr.run.run_id.clone(), pr.run)
@@ -144,6 +153,7 @@ impl SopEngine {
     /// effect for the in-memory default.
     fn persist_active(&self, run_id: &str) {
         if let Some(run) = self.active_runs.get(run_id) {
+            self.heartbeat_claim_for_run(run);
             let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
             // Each persist is a new state revision; the store rejects a
             // same-revision divergent write, so advance past what is stored.
@@ -159,6 +169,74 @@ impl SopEngine {
                     "SOP engine: failed to persist run"
                 );
             }
+        }
+    }
+
+    /// Admit a run through the store CAS claim before it becomes locally active.
+    /// The durable store is the concurrency source of truth; `active_runs` is the
+    /// execution cache/status surface.
+    fn claim_admission(&self, run_id: &str, sop: &Sop) -> Result<ClaimToken> {
+        match self.store.try_claim_run(
+            run_id,
+            &sop.name,
+            sop.max_concurrent as usize,
+            self.config.max_concurrent_total,
+        ) {
+            Ok(Some(token)) => Ok(token),
+            Ok(None) => {
+                bail!(
+                    "Cannot start SOP '{}': cooldown or concurrency limit reached",
+                    sop.name
+                );
+            }
+            Err(e) => Err(anyhow::Error::new(e)),
+        }
+    }
+
+    fn release_claim_best_effort(&self, token: &ClaimToken) {
+        if let Err(e) = self.store.release_claim(token) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": token.run_id.as_str(),
+                        "error": e.to_string(),
+                    })),
+                "SOP engine: failed to release run admission claim"
+            );
+        }
+    }
+
+    fn claim_handle_for_run(run: &SopRun) -> ClaimToken {
+        ClaimToken {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            claimed_at: String::new(),
+            lease_expires: String::new(),
+            holder: "engine".to_string(),
+        }
+    }
+
+    fn heartbeat_claim_for_run(&self, run: &SopRun) {
+        let token = Self::claim_handle_for_run(run);
+        if let Err(e) = self.store.heartbeat_claim(&token) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run.run_id.as_str(),
+                        "error": e.to_string(),
+                    })),
+                "SOP engine: failed to heartbeat run admission claim"
+            );
+        }
+    }
+
+    fn heartbeat_active_claims(&self) {
+        for run in self.active_runs.values() {
+            self.heartbeat_claim_for_run(run);
         }
     }
 
@@ -272,18 +350,21 @@ impl SopEngine {
             None => return false,
         };
 
-        // Per-SOP concurrency limit
-        let active_for_sop = self
-            .active_runs
-            .values()
-            .filter(|r| r.sop_name == sop_name)
-            .count();
-        if active_for_sop >= sop.max_concurrent as usize {
-            return false;
-        }
-
-        // Global concurrency limit
-        if self.active_runs.len() >= self.config.max_concurrent_total {
+        // Concurrency limits are backed by the store's live CAS claims so
+        // multiple engine holders observe the same admission source.
+        let (active_for_sop, active_total) = match self.store.claim_counts(sop_name) {
+            Ok(counts) => counts,
+            Err(_) => (
+                self.active_runs
+                    .values()
+                    .filter(|r| r.sop_name == sop_name)
+                    .count(),
+                self.active_runs.len(),
+            ),
+        };
+        if active_for_sop >= sop.max_concurrent as usize
+            || active_total >= self.config.max_concurrent_total
+        {
             return false;
         }
 
@@ -339,8 +420,8 @@ impl SopEngine {
         let dur = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let epoch_ms = dur.as_secs() * 1000 + u64::from(dur.subsec_millis());
-        let run_id = format!("run-{epoch_ms}-{:04}", self.run_counter);
+        let epoch_ns = dur.as_nanos();
+        let run_id = format!("run-{epoch_ns}-{:04}", self.run_counter);
         let now = now_iso8601();
 
         let run = SopRun {
@@ -358,6 +439,7 @@ impl SopEngine {
             llm_calls_saved: 0,
         };
 
+        let claim = self.claim_admission(&run_id, &sop)?;
         self.active_runs.insert(run_id.clone(), run);
 
         ::zeroclaw_log::record!(
@@ -366,7 +448,14 @@ impl SopEngine {
             &format!("SOP run {} started for '{}'", run_id, sop_name)
         );
 
-        self.dispatch_llm_step(&run_id, &sop, 1, None)
+        match self.dispatch_llm_step(&run_id, &sop, 1, None) {
+            Ok(action) => Ok(action),
+            Err(e) => {
+                self.active_runs.remove(&run_id);
+                self.release_claim_best_effort(&claim);
+                Err(e)
+            }
+        }
     }
 
     /// Report the result of the current step and advance the run.
@@ -1113,6 +1202,25 @@ impl SopEngine {
         &self.deterministic_savings
     }
 
+    /// Save a procedural-memory proposal into the shared SOP store. This is the
+    /// production-facing engine surface EPIC F consumes for approval/write-back.
+    pub fn save_proposal(&self, proposal: &ProposalRecord) -> Result<(), StoreError> {
+        self.store.save_proposal(proposal)
+    }
+
+    /// Load a procedural-memory proposal by id from the shared SOP store.
+    pub fn load_proposal(&self, id: &str) -> Result<Option<ProposalRecord>, StoreError> {
+        self.store.load_proposal(id)
+    }
+
+    /// List procedural-memory proposals, optionally filtered by lifecycle status.
+    pub fn list_proposals(
+        &self,
+        status: Option<ProposalStatus>,
+    ) -> Result<Vec<ProposalRecord>, StoreError> {
+        self.store.list_proposals(status)
+    }
+
     // ── Deterministic execution ─────────────────────────────────
 
     /// Start a deterministic SOP run. Steps execute sequentially without LLM
@@ -1159,8 +1267,8 @@ impl SopEngine {
         let dur = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let epoch_ms = dur.as_secs() * 1000 + u64::from(dur.subsec_millis());
-        let run_id = format!("det-{epoch_ms}-{:04}", self.run_counter);
+        let epoch_ns = dur.as_nanos();
+        let run_id = format!("det-{epoch_ns}-{:04}", self.run_counter);
         let now = now_iso8601();
 
         let total_steps = u32::try_from(sop.steps.len()).unwrap_or(u32::MAX);
@@ -1179,6 +1287,7 @@ impl SopEngine {
             llm_calls_saved: 0,
         };
 
+        let claim = self.claim_admission(&run_id, &sop)?;
         self.active_runs.insert(run_id.clone(), run);
         ::zeroclaw_log::record!(
             INFO,
@@ -1189,7 +1298,14 @@ impl SopEngine {
             )
         );
 
-        self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null)
+        match self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null) {
+            Ok(action) => Ok(action),
+            Err(e) => {
+                self.active_runs.remove(&run_id);
+                self.release_claim_best_effort(&claim);
+                Err(e)
+            }
+        }
     }
 
     /// Advance a deterministic run with the output of the current step.
@@ -1591,6 +1707,7 @@ impl SopEngine {
         // alone would under-report the escalations.
         let timed_out = self.overdue_waiting_run_ids().len();
         let timeout_actions = self.check_approval_timeouts();
+        self.heartbeat_active_claims();
         let reaped_claims = self.reap_expired_claims();
         let pruned_runs = self.prune_terminal_runs();
         MaintenanceSummary {
@@ -3211,6 +3328,85 @@ mod tests {
 
         engine.start_run("s1", manual_event()).unwrap();
         assert!(!engine.can_start("s2"));
+    }
+
+    #[test]
+    fn start_run_uses_store_claims_across_engine_instances() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let sops = vec![test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal)];
+        let mut first = engine_with_sops(sops.clone()).with_store(store.clone());
+        let mut second = engine_with_sops(sops).with_store(store.clone());
+
+        let action = first.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        assert!(
+            !second.can_start("s1"),
+            "read-only admission check must see the shared store claim"
+        );
+        assert!(
+            second.start_run("s1", manual_event()).is_err(),
+            "CAS claim must block a second engine with an empty local active map"
+        );
+
+        first.cancel_run(&run_id).unwrap();
+        assert!(
+            second.can_start("s1"),
+            "finishing the first run releases the shared claim slot"
+        );
+        assert!(second.start_run("s1", manual_event()).is_ok());
+    }
+
+    #[test]
+    fn deterministic_start_uses_store_claims() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let sops = vec![deterministic_sop("det-sop")];
+        let mut first = engine_with_sops(sops.clone()).with_store(store.clone());
+        let mut second = engine_with_sops(sops).with_store(store);
+
+        first.start_run("det-sop", manual_event()).unwrap();
+
+        assert!(
+            second.start_run("det-sop", manual_event()).is_err(),
+            "deterministic runs must use the same CAS admission gate"
+        );
+    }
+
+    #[test]
+    fn proposals_round_trip_through_engine_store_surface() {
+        let engine = SopEngine::new(SopConfig::default());
+        let now = now_iso8601();
+        let proposal = ProposalRecord {
+            id: "prop-1".to_string(),
+            status: ProposalStatus::Pending,
+            source_run_id: Some("run-1".to_string()),
+            sop_name: "s1".to_string(),
+            target_content_hash: Some("sha256:abc".to_string()),
+            provenance: serde_json::json!({"producer": "test"}),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        engine.save_proposal(&proposal).unwrap();
+
+        assert_eq!(
+            engine.load_proposal("prop-1").unwrap().unwrap().sop_name,
+            "s1"
+        );
+        assert_eq!(engine.list_proposals(None).unwrap().len(), 1);
+        assert_eq!(
+            engine
+                .list_proposals(Some(ProposalStatus::Pending))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            engine
+                .list_proposals(Some(ProposalStatus::Applied))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ── Cooldown ────────────────────────────────────────

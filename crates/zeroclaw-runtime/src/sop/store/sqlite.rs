@@ -305,6 +305,21 @@ impl SopRunStore for SqliteRunStore {
         Ok(Some(token))
     }
 
+    fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
+        let g = self.lock()?;
+        let per_sop: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM sop_claims WHERE sop_name=?1",
+                params![sop_name],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        let total: i64 = g
+            .query_row("SELECT COUNT(*) FROM sop_claims", [], |r| r.get(0))
+            .map_err(sql_err)?;
+        Ok((per_sop as usize, total as usize))
+    }
+
     fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
         let g = self.lock()?;
         let lease = (Utc::now() + Duration::seconds(DEFAULT_CLAIM_LEASE_SECS)).to_rfc3339();

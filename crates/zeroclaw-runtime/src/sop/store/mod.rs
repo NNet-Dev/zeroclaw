@@ -66,6 +66,9 @@ pub trait SopRunStore: Send + Sync {
         per_sop_cap: usize,
         global_cap: usize,
     ) -> Result<Option<ClaimToken>, StoreError>;
+    /// Live claim counts as `(for_sop, total)`, used by read-only admission
+    /// checks so status surfaces observe the same concurrency source as CAS.
+    fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError>;
     /// Renew a claim's lease (tick liveness). No-op if the claim is gone.
     fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError>;
     /// Release a claim (finish/cancel), freeing the slot for admission.
@@ -334,6 +337,12 @@ impl SopRunStore for InMemoryRunStore {
         };
         g.claims.insert(run_id.to_string(), token.clone());
         Ok(Some(token))
+    }
+
+    fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
+        let g = self.lock()?;
+        let per_sop = g.claims.values().filter(|c| c.sop_name == sop_name).count();
+        Ok((per_sop, g.claims.len()))
     }
 
     fn heartbeat_claim(&self, _token: &ClaimToken) -> Result<(), StoreError> {
