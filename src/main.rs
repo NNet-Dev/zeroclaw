@@ -7175,9 +7175,10 @@ fn gate_security_posture(
 /// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
 /// prunes terminal runs past the retention policy, and dispatches cached cron
 /// SOP triggers. Returns `None` (no task) when the tick is disabled
-/// (`interval_secs == 0`) or no SOP engine is configured. The tick itself
-/// self-approves nothing - timeout handling follows `approval_timeout_action`
-/// (default `escalate`, fail-closed).
+/// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
+/// returned handle and aborts it when the foreground daemon/channel run exits.
+/// The tick itself self-approves nothing - timeout handling follows
+/// `approval_timeout_action` (default `escalate`, fail-closed).
 #[cfg(feature = "agent-runtime")]
 fn spawn_sop_maintenance(
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
