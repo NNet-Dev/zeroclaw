@@ -25,29 +25,17 @@ With the GitHub provider, ZeroClaw authenticates as a **GitHub App** and replies
 
 ## Configure
 
-```toml
-[channels.git.default]
-enabled = true
-provider = "github"              # the only wired provider today (default)
-app_id = 12345                   # GitHub provider
-private_key_path = "~/.zeroclaw/github-app.pem"  # GitHub provider
-repos = ["your-org/your-repo"]   # empty = every repo the installation can see
-poll_interval_secs = 30          # minimum 15
-mention_only = true              # respond only to comments that @mention the app
-# installation_id = 987654       # only needed when the app has several installations
-# listen_to_bots = false         # process comments from other bot accounts
-```
-
-Or via the CLI:
-
 ```bash
 zeroclaw config set channels.git.default.provider github
 zeroclaw config set channels.git.default.app-id 12345
 zeroclaw config set channels.git.default.private-key-path ~/.zeroclaw/github-app.pem
+zeroclaw config set channels.git.default.repos '["your-org/your-repo"]'
+zeroclaw config set channels.git.default.poll-interval-secs 30
+zeroclaw config set channels.git.default.mention-only true
 zeroclaw config set channels.git.default.enabled true
 ```
 
-An unknown `provider` value is a clear startup error rather than a silent fallback.
+The `default` alias is the common first instance. Leave `repos` empty to poll every repository visible to the GitHub App installation, or set it to an explicit repository list for lower rate usage. Set `installation-id` only when the app has several installations, and `listen-to-bots` only if comments from other bot accounts should be processed. An unknown `provider` value is a clear startup error rather than a silent fallback.
 
 {{#peer-group git}}
 
@@ -55,28 +43,19 @@ An unknown `provider` value is a clear startup error rather than a silent fallba
 
 Beyond conversation, the channel normalizes repository activity into typed events and routes each event type per config:
 
-```toml
-[channels.git.default.events]
-"pull_request.opened"   = { sop = "pr-triage" }
-"issues.opened"         = { sop = "issue-triage", then_message = true }
-"issue_comment.created" = { message = true }          # the conversational default
-"workflow_run.failed"   = { sop = "ci-failure" }
-"release.published"     = { message = true }
-```
+| Event type | Example route | Result |
+| --- | --- | --- |
+| `pull_request.opened` | `sop` = `pr-triage` | Dispatches the PR payload to the `pr-triage` SOP. |
+| `issues.opened` | `sop` = `issue-triage`, `then_message` = `true` | Dispatches to SOP ingress; message fan-out after SOP completion is reserved for a future release. |
+| `issue_comment.created` | `message` = `true` | Delivers the comment to the normal conversational agent loop. |
+| `workflow_run.failed` | `sop` = `ci-failure` | Dispatches the CI failure payload to SOP ingress. |
+| `release.published` | `message` = `true` | Delivers the release event to the normal agent loop. |
 
 Known event types: `issue_comment.created`, `issues.opened`, `pull_request.opened`, `pull_request.closed`, `pull_request.merged`, `pull_request_review_comment.created`, `workflow_run.completed`, `workflow_run.failed`, `release.published`.
 
 - **Defaults.** With no `events` table, the channel behaves conversationally: `issue_comment.created`, `issues.opened`, and `pull_request.opened` are delivered as messages (mention-gated as described above); everything else is ignored. Event types absent from a non-empty table get the same per-type defaults: listing `workflow_run.failed` doesn't turn conversation off. An entry with neither `message = true` nor a `sop` explicitly disables that event type.
 - **Routing an event type is subscribing to it.** The channel derives which API endpoints to poll from the table: review comments, releases, and Actions runs are only fetched when their event types are routed, so an unconfigured channel costs exactly what it did before.
-- **`sop` routing.** A `sop` route emits a channel-sourced SOP event with topic `git.<alias>:<event_type>` and a structured JSON payload. `then_message` is reserved for future SOP-completion fan-out; today the routed event is consumed by SOP ingress rather than delivered as chat. Match it from `SOP.toml` like this:
-
-```toml
-[[triggers]]
-type = "channel"
-topic = "git.main:pull_request.opened"
-condition = "$.repo == \"octo/repo\""
-```
-
+- **`sop` routing.** A `sop` route emits a channel-sourced SOP event with topic `git.<alias>:<event_type>` and a structured JSON payload. `then_message` is reserved for future SOP-completion fan-out; today the routed event is consumed by SOP ingress rather than delivered as chat. Match it from `SOP.toml` with a `channel` trigger whose topic is the Git event topic, for example `git.main:pull_request.opened`; use an optional condition such as `$.repo == "octo/repo"` to narrow the SOP to one repository.
 - **Mention gating per route.** The `mention_only` gate applies to conversational events on the message path. `sop`-routed events skip it: a PR routed to `pr-triage` is captured whether or not the author mentioned the app. Lifecycle/CI/release events have no mention surface and are never gated. The app's own activity is always dropped; other bots' activity follows `listen_to_bots`; every delivery passes the peer-group allowlist on the author's login.
 - **Reply surfaces.** Comment, issue, and PR events reply onto their issue/PR thread. Workflow-run events reply onto the run's associated PR when the forge reports one; otherwise, and for releases, the target is the bare repository and the agent cannot reply on-platform (route those to a SOP or act through other tools).
 - **Events API backbone (optional, GitHub).** `events_backbone = true` additionally polls `/repos/{owner}/{repo}/events` with ETag-conditional requests (one request per repo per tick; an idle repo answers 304 and costs almost nothing). Caveats: the feed lags by up to ~5 minutes, payloads are trimmed, and **Actions events never appear in it**: workflow runs always use their dedicated endpoint. Anything surfaced by both the feed and a targeted endpoint is de-duplicated, so it's safe to combine.
