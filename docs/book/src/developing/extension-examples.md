@@ -95,7 +95,7 @@ authorization belong to the canonical config/IAM path; do not store long-lived
 allowlist snapshots such as `allowed_users: Vec<String>` inside the channel
 handle.
 
-For a current in-tree example of a full directory-module channel behind a provider seam, including polling transports, a typed event enum with per-event routing config, a `GitProvider` trait with the GitHub forge as the first implementation, token-cache auth, and draft streaming, see `crates/zeroclaw-channels/src/git/` ([Git channel](../channels/git.md)). The generic core (`git/{channel,events,poll,router,types,traits}.rs`) is forge-agnostic; each forge lives under `git/providers/<forge>/` and a new forge is purely additive.
+For a current in-tree example of a full directory-module channel behind a provider seam, including polling transports, a typed event enum with per-event routing config, a `GitProvider` trait with GitHub and Gitea-compatible providers, token-cache or token auth, and draft streaming, see `crates/zeroclaw-channels/src/git/` ([Git channel](../channels/git.md)). The generic core (`git/{channel,events,poll,router,types,traits}.rs`) is forge-agnostic; each forge lives under `git/providers/<forge>/` and a new forge is purely additive.
 
 ```rust
 // In your crate: use zeroclaw::channels::traits::{Channel, ChannelMessage, SendMessage};

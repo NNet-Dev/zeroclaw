@@ -55,7 +55,25 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
                 );
             }
         }
-        other => anyhow::bail!("unknown git channel provider `{other}` (supported: github)"),
+        "gitea" | "forgejo" => {
+            #[cfg(feature = "provider-gitea")]
+            {
+                Ok(Box::new(super::providers::gitea::GiteaProvider::new(
+                    cfg.api_base_url.clone(),
+                    cfg.access_token.clone(),
+                    cfg.proxy_url.clone(),
+                )))
+            }
+            #[cfg(not(feature = "provider-gitea"))]
+            {
+                anyhow::bail!(
+                    "git channel provider `gitea`/`forgejo` requires the `provider-gitea` feature"
+                );
+            }
+        }
+        other => anyhow::bail!(
+            "unknown git channel provider `{other}` (supported: github, gitea, forgejo)"
+        ),
     }
 }
 
@@ -604,7 +622,7 @@ mod tests {
     #[test]
     fn unknown_provider_is_a_clear_error() {
         let cfg = GitConfig {
-            provider: "gitlab".to_string(),
+            provider: "bitbucket".to_string(),
             ..GitConfig::default()
         };
         let result = GitChannel::new(cfg, "main", Arc::new(Vec::new));
@@ -614,7 +632,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("unknown git channel provider `gitlab`")
+                .contains("unknown git channel provider `bitbucket`")
         );
     }
 

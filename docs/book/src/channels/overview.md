@@ -54,7 +54,7 @@ See [Social channels](./social.md).
 
 | Channel | Feature flag | Protocol / service |
 |---|---|---|
-| Git | `channel-git` | Git forge behind a provider seam (GitHub first); REST polling of issues, PRs, CI runs & releases with per-event routing |
+| Git | `channel-git` | Git forge behind a provider seam (GitHub, Gitea, Forgejo); REST polling of issues, PRs, CI runs & releases with per-event routing |
 
 See [Git](./git.md).
 

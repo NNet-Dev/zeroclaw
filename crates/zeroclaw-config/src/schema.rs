@@ -15566,12 +15566,12 @@ impl ChannelConfig for BlueskyConfig {
 
 /// Git-forge channel configuration (polling-based; no webhook required).
 ///
-/// A `provider` selects the forge; GitHub is the first and current
-/// implementation. The GitHub provider authenticates as a GitHub App: a
-/// short-lived RS256 JWT signed with the app's private key is exchanged
-/// for per-installation access tokens. Inbound issue/PR comments are
-/// polled from the forge REST API, so the daemon needs no inbound network
-/// exposure.
+/// A `provider` selects the forge. GitHub authenticates as a GitHub App:
+/// a short-lived RS256 JWT signed with the app's private key is exchanged
+/// for per-installation access tokens. Gitea and Forgejo use a personal
+/// access token against the instance's `/api/v1` endpoint. Inbound issue/PR
+/// comments are polled from the forge REST API, so the daemon needs no
+/// inbound network exposure.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.git"]
@@ -15583,8 +15583,9 @@ pub struct GitConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Git forge provider. Only `"github"` is wired today; an unknown
-    /// value is a clear startup error. Default: `"github"`.
+    /// Git forge provider. Supported: `"github"`, `"gitea"`, and
+    /// `"forgejo"` (Forgejo uses the Gitea-compatible REST provider).
+    /// Default: `"github"`.
     #[tab(Connection)]
     #[serde(default = "default_git_provider")]
     pub provider: String,
@@ -15605,6 +15606,18 @@ pub struct GitConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_id: Option<u64>,
+    /// Gitea/Forgejo API base URL, including `/api/v1`, for example
+    /// `https://git.example.org/api/v1`. Defaults to the public Gitea
+    /// service when omitted. Gitea/Forgejo provider only.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    /// Personal access token for Gitea/Forgejo API requests. The token needs
+    /// repository read access plus issue/PR comment write access for replies
+    /// and reactions. Gitea/Forgejo provider only.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub access_token: String,
     /// Repositories to poll, as `owner/repo`. Empty = every repository
     /// visible to the installation.
     #[tab(Advanced)]
@@ -15675,6 +15688,8 @@ impl Default for GitConfig {
             app_id: 0,
             private_key_path: String::new(),
             installation_id: None,
+            api_base_url: None,
+            access_token: String::new(),
             repos: Vec::new(),
             poll_interval_secs: default_github_poll_interval_secs(),
             mention_only: true,
@@ -15692,7 +15707,7 @@ impl ChannelConfig for GitConfig {
         "Git"
     }
     fn desc() -> &'static str {
-        "Git forge (GitHub): issues, PRs & events"
+        "Git forge (GitHub, Gitea, Forgejo): issues, PRs & events"
     }
 }
 
@@ -20785,6 +20800,27 @@ mod tests {
         let bare: GitConfig = ::toml::from_str("enabled = true").unwrap();
         assert!(bare.events.is_empty());
         assert!(!bare.events_backbone);
+    }
+
+    #[test]
+    async fn git_gitea_provider_fields_parse() {
+        let cfg: GitConfig = ::toml::from_str(
+            r#"
+            enabled = true
+            provider = "forgejo"
+            api_base_url = "https://git.example.org/api/v1"
+            access_token = "token-value"
+            repos = ["team/project"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.provider, "forgejo");
+        assert_eq!(
+            cfg.api_base_url.as_deref(),
+            Some("https://git.example.org/api/v1")
+        );
+        assert_eq!(cfg.access_token, "token-value");
+        assert_eq!(cfg.repos, vec!["team/project"]);
     }
 
     #[test]
