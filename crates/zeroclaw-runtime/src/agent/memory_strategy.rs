@@ -2,7 +2,11 @@ use std::sync::Arc;
 use zeroclaw_api::memory_traits::{Memory, MemoryStrategy};
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_api::observability_traits::Observer;
-use zeroclaw_memory::{RerankConfig, RerankStrategy, RetrievalConfig, RetrievalPipeline};
+use zeroclaw_config::schema::KnowledgeConfig;
+use zeroclaw_memory::{
+    RerankConfig, RerankStrategy, RetrievalConfig, RetrievalPipeline,
+    knowledge_graph::KnowledgeGraph,
+};
 
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 
@@ -18,6 +22,8 @@ pub struct DefaultMemoryStrategy {
     min_relevance_score: f64,
     memory_config: zeroclaw_config::schema::MemoryConfig,
     workspace_dir: std::path::PathBuf,
+    knowledge_graph: Option<Arc<KnowledgeGraph>>,
+    sweep_counter: parking_lot::Mutex<zeroclaw_memory::sweep::SweepCounter>,
 }
 
 impl DefaultMemoryStrategy {
@@ -39,7 +45,25 @@ impl DefaultMemoryStrategy {
             min_relevance_score: memory_config.min_relevance_score,
             memory_config,
             workspace_dir: workspace_dir.into(),
+            knowledge_graph: None,
+            sweep_counter: parking_lot::Mutex::new(zeroclaw_memory::sweep::SweepCounter::default()),
         }
+    }
+
+    /// Build a strategy with knowledge-graph recall fusion available. The KG is
+    /// only constructed when both `memory.types.fuse_kg_into_recall` and
+    /// `knowledge.enabled` are set (both default off), so this is behaviour-neutral
+    /// by default.
+    pub fn with_config_and_knowledge(
+        memory: Arc<dyn Memory>,
+        memory_config: zeroclaw_config::schema::MemoryConfig,
+        knowledge_config: KnowledgeConfig,
+        workspace_dir: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        let knowledge_graph = build_knowledge_graph(&memory_config, &knowledge_config);
+        let mut strategy = Self::new(memory, memory_config, workspace_dir);
+        strategy.knowledge_graph = knowledge_graph;
+        strategy
     }
 
     /// Convenience constructor that takes the live `MemoryConfig` so
@@ -81,6 +105,12 @@ impl MemoryStrategy for DefaultMemoryStrategy {
             self.memory_config.candidate_multiplier,
             self.memory_config.rerank_enabled,
             build_rerank_config(&self.memory_config, self.limit, self.min_relevance_score),
+        )
+        .with_kg_recall(
+            self.knowledge_graph.clone(),
+            self.memory_config.types.fuse_kg_into_recall,
+            self.memory_config.vector_weight as f32,
+            self.memory_config.keyword_weight as f32,
         );
         loader
             .load_context(self.pipeline.as_ref(), observer, query, session_id)
@@ -104,7 +134,41 @@ impl MemoryStrategy for DefaultMemoryStrategy {
             user_message,
             assistant_response,
         )
-        .await
+        .await?;
+
+        // Periodic cross-turn consolidation sweep (gated; default off).
+        if self.memory_config.consolidation_sweep_enabled {
+            let should_sweep = {
+                let mut counter = self.sweep_counter.lock();
+                counter.tick(self.memory_config.consolidation_sweep_interval)
+            };
+            if should_sweep {
+                let cfg =
+                    zeroclaw_memory::sweep::SweepConfig::from_memory_config(&self.memory_config);
+                let session_id = "default";
+                if let Err(e) = zeroclaw_memory::sweep::consolidate_sweep(
+                    self.pipeline.as_ref(),
+                    self.knowledge_graph.as_deref(),
+                    provider,
+                    model,
+                    temperature,
+                    session_id,
+                    &cfg,
+                )
+                .await
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "memory consolidation sweep skipped"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn run_governance(&self) -> anyhow::Result<()> {
@@ -172,6 +236,43 @@ fn build_rerank_config(
         min_relevance_score,
         final_limit: final_limit.max(1),
     }
+}
+
+/// Build the recall-fusion knowledge graph. Returns `None` (fusion off) unless
+/// BOTH `memory.types.fuse_kg_into_recall` and `knowledge.enabled` are set, or
+/// if the graph fails to open. Read-only: the memory subsystem never writes it.
+fn build_knowledge_graph(
+    memory_config: &zeroclaw_config::schema::MemoryConfig,
+    knowledge_config: &KnowledgeConfig,
+) -> Option<Arc<KnowledgeGraph>> {
+    if !memory_config.types.fuse_kg_into_recall || !knowledge_config.enabled {
+        return None;
+    }
+
+    let db_path = expand_home(&knowledge_config.db_path);
+    match KnowledgeGraph::new(&db_path, knowledge_config.max_nodes) {
+        Ok(graph) => Some(Arc::new(graph)),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "knowledge graph recall fusion disabled due to init error"
+            );
+            None
+        }
+    }
+}
+
+fn expand_home(path: &str) -> std::path::PathBuf {
+    let expanded = path.replace(
+        '~',
+        &directories::UserDirs::new()
+            .map(|u| u.home_dir().to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string()),
+    );
+    std::path::PathBuf::from(expanded)
 }
 
 #[cfg(test)]

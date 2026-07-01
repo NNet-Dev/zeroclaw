@@ -10071,6 +10071,21 @@ pub struct MemoryConfig {
     /// Run the periodic hygiene pass that archives stale daily/session files and enforces retention windows. Leave on unless you want to manage cleanup yourself.
     #[serde(default = "default_hygiene_enabled")]
     pub hygiene_enabled: bool,
+    /// Extract and store multiple typed facts from each turn. Default: false until the safety gate lands.
+    #[serde(default)]
+    pub consolidation_extract_facts: bool,
+    /// Run the periodic cross-turn consolidation sweep. Default: false until the safety gate lands.
+    #[serde(default)]
+    pub consolidation_sweep_enabled: bool,
+    /// Turns between consolidation sweeps when enabled.
+    #[serde(default = "default_consolidation_sweep_interval")]
+    pub consolidation_sweep_interval: u32,
+    /// Recent entries considered by each consolidation sweep.
+    #[serde(default = "default_consolidation_sweep_window")]
+    pub consolidation_sweep_window: usize,
+    /// Maximum merges a consolidation sweep may write.
+    #[serde(default = "default_consolidation_sweep_max_merges")]
+    pub consolidation_sweep_max_merges: usize,
     /// Move daily/session files to the archive directory after this many days. Keeps the hot working set small without deleting history.
     #[serde(default = "default_archive_after_days")]
     pub archive_after_days: u32,
@@ -10231,10 +10246,33 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub policy: MemoryPolicyConfig,
+    // ── Memory Types ────────────────────────────────────────────
+    /// Typed memory configuration.
+    #[serde(default)]
+    #[nested]
+    pub types: MemoryTypesConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
     // config via `Config::resolve_active_storage`.
+}
+
+/// Typed memory configuration (`[memory.types]` section).
+///
+/// Behaviour-neutral by default: `enabled` gates kind assignment on new
+/// consolidation writes, and `fuse_kg_into_recall` (double-gated with
+/// `knowledge.enabled`) gates read-only KG recall fusion. Both default off; the
+/// flips are sequenced in a later phase.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.types"]
+pub struct MemoryTypesConfig {
+    /// Assign a first-class MemoryKind to new consolidation writes.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fuse knowledge-graph nodes into recall (requires `knowledge.enabled`).
+    #[serde(default)]
+    pub fuse_kg_into_recall: bool,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -10344,6 +10382,15 @@ fn default_hygiene_enabled() -> bool {
 fn default_archive_after_days() -> u32 {
     7
 }
+fn default_consolidation_sweep_interval() -> u32 {
+    10
+}
+fn default_consolidation_sweep_window() -> usize {
+    50
+}
+fn default_consolidation_sweep_max_merges() -> usize {
+    5
+}
 fn default_purge_after_days() -> u32 {
     30
 }
@@ -10391,6 +10438,11 @@ impl Default for MemoryConfig {
             backend: "sqlite".into(),
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
+            consolidation_extract_facts: false,
+            consolidation_sweep_enabled: false,
+            consolidation_sweep_interval: default_consolidation_sweep_interval(),
+            consolidation_sweep_window: default_consolidation_sweep_window(),
+            consolidation_sweep_max_merges: default_consolidation_sweep_max_merges(),
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
@@ -10437,6 +10489,7 @@ impl Default for MemoryConfig {
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
+            types: MemoryTypesConfig::default(),
         }
     }
 }

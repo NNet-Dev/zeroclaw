@@ -28,6 +28,7 @@ pub mod audit;
 pub mod backend;
 pub mod budget;
 pub mod chunker;
+pub mod classify;
 pub mod conflict;
 pub mod consolidation;
 pub mod decay;
@@ -37,6 +38,8 @@ pub mod embed_local;
 pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
+pub mod kg_recall;
+pub mod kind_bridge;
 pub mod knowledge_graph;
 #[cfg(feature = "memory-postgres")]
 pub mod knowledge_graph_pg;
@@ -55,6 +58,7 @@ pub mod response_cache;
 pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
+pub mod sweep;
 pub mod traits;
 pub mod vector;
 

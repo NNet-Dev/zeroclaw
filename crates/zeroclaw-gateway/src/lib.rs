@@ -922,11 +922,13 @@ pub async fn run_gateway(
             Arc::new(platform::NativeRuntime::new())
         }
     };
-    let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(DefaultMemoryStrategy::with_config(
-        mem.clone(),
-        config.memory.clone(),
-        config.data_dir.clone(),
-    ));
+    let memory_strategy: Arc<dyn MemoryStrategy> =
+        Arc::new(DefaultMemoryStrategy::with_config_and_knowledge(
+            mem.clone(),
+            config.memory.clone(),
+            config.knowledge.clone(),
+            config.data_dir.clone(),
+        ));
     // Gateway is infrastructure — it doesn't run as an agent. Endpoints
     // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
     // ACP `session/new`, agent-scoped tools/memory) take it from the

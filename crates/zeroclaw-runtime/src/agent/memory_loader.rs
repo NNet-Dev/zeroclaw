@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use std::fmt::Write;
+use std::sync::Arc;
 use std::time::Instant;
 use zeroclaw_memory::{
-    self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, RerankConfig, decay, rerank,
+    self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, RerankConfig, decay,
+    knowledge_graph::KnowledgeGraph, rerank,
 };
 
 use crate::observability::{Observer, ObserverEvent};
@@ -33,6 +35,10 @@ pub struct DefaultMemoryLoader {
     candidate_multiplier: usize,
     rerank_enabled: bool,
     rerank_config: RerankConfig,
+    kg_graph: Option<Arc<KnowledgeGraph>>,
+    fuse_kg_into_recall: bool,
+    vector_weight: f32,
+    keyword_weight: f32,
 }
 
 impl Default for DefaultMemoryLoader {
@@ -45,6 +51,10 @@ impl Default for DefaultMemoryLoader {
             candidate_multiplier: 1,
             rerank_enabled: false,
             rerank_config: RerankConfig::disabled(limit, min_relevance_score),
+            kg_graph: None,
+            fuse_kg_into_recall: false,
+            vector_weight: 0.7,
+            keyword_weight: 0.3,
         }
     }
 }
@@ -58,6 +68,10 @@ impl DefaultMemoryLoader {
             candidate_multiplier: 1,
             rerank_enabled: false,
             rerank_config: RerankConfig::disabled(limit, min_relevance_score),
+            kg_graph: None,
+            fuse_kg_into_recall: false,
+            vector_weight: 0.7,
+            keyword_weight: 0.3,
         }
     }
 
@@ -81,7 +95,28 @@ impl DefaultMemoryLoader {
             candidate_multiplier: candidate_multiplier.max(1),
             rerank_enabled,
             rerank_config,
+            kg_graph: None,
+            fuse_kg_into_recall: false,
+            vector_weight: 0.7,
+            keyword_weight: 0.3,
         }
+    }
+
+    /// Attach optional read-only knowledge-graph recall fusion. When
+    /// `fuse_kg_into_recall` is false (default) or no graph is present, recall is
+    /// unaffected; fusing an empty graph is an identity operation.
+    pub fn with_kg_recall(
+        mut self,
+        kg_graph: Option<Arc<KnowledgeGraph>>,
+        fuse_kg_into_recall: bool,
+        vector_weight: f32,
+        keyword_weight: f32,
+    ) -> Self {
+        self.kg_graph = kg_graph;
+        self.fuse_kg_into_recall = fuse_kg_into_recall;
+        self.vector_weight = vector_weight;
+        self.keyword_weight = keyword_weight;
+        self
     }
 }
 
@@ -134,6 +169,22 @@ impl MemoryLoader for DefaultMemoryLoader {
                 return Err(e);
             }
         };
+
+        // Read-only knowledge-graph recall fusion (default off; fusing an empty
+        // graph is an identity operation). Runs before the rerank/decay stage.
+        if self.fuse_kg_into_recall
+            && let Some(kg) = self.kg_graph.as_deref()
+        {
+            let kg_candidates = zeroclaw_memory::kg_recall::query(kg, user_message, pool_limit);
+            entries = zeroclaw_memory::kg_recall::fuse_with_memory(
+                entries,
+                kg_candidates,
+                self.vector_weight,
+                self.keyword_weight,
+                pool_limit,
+            );
+        }
+
         if entries.is_empty() {
             return Ok(String::new());
         }
@@ -591,5 +642,45 @@ mod tests {
         assert!(context.contains("fact_c"));
         // Duplicate content collapsed by the rerank stage.
         assert!(!context.contains("fact_b"));
+    }
+
+    /// Read-only KG recall fusion is safe by construction: fusing an EMPTY
+    /// knowledge graph yields no candidates, so recall is returned unchanged.
+    /// This is the end-to-end identity proof behind the (default-off) KG flag.
+    #[tokio::test]
+    async fn kg_fusion_with_empty_graph_is_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kg = Arc::new(
+            zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(&tmp.path().join("kg.db"), 1000)
+                .unwrap(),
+        );
+        let memory = MockMemoryWithEntries {
+            entries: Arc::new(vec![
+                scored_entry("fact_a", "the office is in Denver", 0.9),
+                scored_entry("fact_c", "cats are mammals", 0.8),
+            ]),
+        };
+        let with_kg = DefaultMemoryLoader::new(5, 0.0).with_kg_recall(Some(kg), true, 0.7, 0.3);
+        let without_kg = DefaultMemoryLoader::new(5, 0.0);
+        let fused = with_kg
+            .load_context(&memory, &NoopObserver, "office", None)
+            .await
+            .unwrap();
+        let plain = without_kg
+            .load_context(&memory, &NoopObserver, "office", None)
+            .await
+            .unwrap();
+        assert_eq!(fused, plain);
+    }
+
+    /// PR-C ships fully neutral: kind assignment, KG fusion, typed-fact
+    /// extraction, and the consolidation sweep are all off by default.
+    #[test]
+    fn memory_types_and_consolidation_flags_default_off() {
+        let cfg = zeroclaw_config::schema::MemoryConfig::default();
+        assert!(!cfg.types.enabled);
+        assert!(!cfg.types.fuse_kg_into_recall);
+        assert!(!cfg.consolidation_extract_facts);
+        assert!(!cfg.consolidation_sweep_enabled);
     }
 }

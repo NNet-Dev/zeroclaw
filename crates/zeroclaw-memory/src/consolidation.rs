@@ -8,13 +8,14 @@
 //! This two-phase approach replaces the naive raw-message auto-save with
 //! semantic extraction, similar to Nanobot's `save_memory` tool call pattern.
 
+use crate::classify;
 use crate::conflict;
 use crate::dedup::{self, DedupAction};
 use crate::importance;
 use crate::merge;
 use crate::policy::PolicyEnforcer;
 use crate::policy_gate;
-use crate::traits::{Memory, MemoryCategory, StoreOptions};
+use crate::traits::{Memory, MemoryCategory, MemoryKind, SemanticSubtype, StoreOptions};
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
@@ -32,6 +33,10 @@ pub struct ConsolidationResult {
     /// Observed trend or pattern (when consolidation_extract_facts is enabled).
     #[serde(default)]
     pub trend: Option<String>,
+    /// Semantic subtype hint for the primary Core memory update (used only when
+    /// `memory.types.enabled`; parsed via `classify::kind_of_core`).
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
@@ -40,6 +45,22 @@ const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engi
 
 Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or null}
 Do not include any text outside the JSON object."#;
+
+/// Extended prompt used only when `consolidation_extract_facts` is enabled: also
+/// asks for a semantic `kind`, atomic `facts`, and a cross-turn `trend`.
+const CONSOLIDATION_TYPED_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
+1. "history_entry": A brief summary of what happened in this turn (1-2 sentences). Include the key topic or action.
+2. "memory_update": Any NEW facts, preferences, decisions, or commitments worth remembering long-term. Return null if nothing new was learned.
+3. "kind": The memory_update subtype: "preference", "fact", "decision", or "entity". Use "fact" if unsure. Return null when memory_update is null.
+4. "facts": Atomic durable facts from this turn. Return an empty array when there are none. Do not include procedures or how-to workflows.
+5. "trend": A stable cross-turn trend or pattern, or null when none is visible.
+
+Reusable procedures, how-to workflows, and repeated operating steps belong in skills, not persistent memory records. Do not store them as memory_update or facts unless they are also stable semantic facts.
+
+Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or null, "kind": "preference" | "fact" | "decision" | "entity" | null, "facts": ["..."], "trend": "..." or null}
+Do not include any text outside the JSON object."#;
+
+const MAX_TYPED_FACTS_PER_TURN: usize = 5;
 
 /// Run two-phase LLM-driven consolidation on a conversation turn.
 ///
@@ -88,13 +109,16 @@ pub async fn consolidate_turn(
         turn_text.clone()
     };
 
+    // The typed prompt (which also requests kind/facts/trend) is used only when
+    // the extract-facts flag is on; otherwise the default prompt is unchanged.
+    let system_prompt = if memory_config.consolidation_extract_facts {
+        CONSOLIDATION_TYPED_SYSTEM_PROMPT
+    } else {
+        CONSOLIDATION_SYSTEM_PROMPT
+    };
+
     let raw = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(
-            Some(CONSOLIDATION_SYSTEM_PROMPT),
-            &truncated,
-            model,
-            temperature,
-        )
+        .chat_with_system(Some(system_prompt), &truncated, model, temperature)
         .await?;
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
@@ -102,12 +126,17 @@ pub async fn consolidate_turn(
     // Phase 1: Write history entry to Daily category.
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let history_key = format!("daily_{date}_{}", uuid::Uuid::new_v4());
+    let history_options = StoreOptions {
+        kind: memory_config.types.enabled.then_some(MemoryKind::Episodic),
+        ..StoreOptions::default()
+    };
     memory
-        .store(
+        .store_with_options(
             &history_key,
             &result.history_entry,
             MemoryCategory::Daily,
             None,
+            history_options,
         )
         .await?;
 
@@ -155,6 +184,10 @@ pub async fn consolidate_turn(
                     let options = StoreOptions {
                         namespace: Some(survivor.namespace.clone()),
                         importance: merged.importance,
+                        kind: memory_config
+                            .types
+                            .enabled
+                            .then(|| classify::kind_of_core(&result)),
                         ..StoreOptions::default()
                     };
                     memory
@@ -193,9 +226,13 @@ pub async fn consolidate_turn(
             }
         };
 
-        // Store with importance metadata.
+        // Store with importance metadata (+ kind when types are enabled).
         let options = StoreOptions {
             importance: Some(imp),
+            kind: memory_config
+                .types
+                .enabled
+                .then(|| classify::kind_of_core(&result)),
             ..StoreOptions::default()
         };
         memory
@@ -213,6 +250,98 @@ pub async fn consolidate_turn(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "memory supersede skipped"
             );
+        }
+    }
+
+    // Phase 3: extract atomic typed facts (gated; default off).
+    if memory_config.consolidation_extract_facts {
+        store_typed_facts(memory, memory_config, &result).await?;
+    }
+
+    Ok(())
+}
+
+/// Store atomic typed facts extracted from a turn as Core `Semantic(Fact)`
+/// memories, reusing the same policy/dedup/merge/supersede path as the core
+/// update. Only called when `consolidation_extract_facts` is enabled.
+async fn store_typed_facts(
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    result: &ConsolidationResult,
+) -> anyhow::Result<()> {
+    for fact in result
+        .facts
+        .iter()
+        .filter_map(|fact| {
+            let trimmed = fact.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .take(MAX_TYPED_FACTS_PER_TURN)
+    {
+        let mem_key = format!("core_fact_{}", uuid::Uuid::new_v4());
+        let imp = importance::compute_importance(fact, &MemoryCategory::Core);
+
+        let candidates = memory.recall(fact, 10, None, None, None).await?;
+        let candidates = dedup::core_candidates(candidates);
+        match dedup::dedup_gate(&candidates, fact, memory_config) {
+            DedupAction::Insert => {}
+            DedupAction::Reject { dup_of } => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
+                    "memory typed fact skipped as duplicate"
+                );
+                continue;
+            }
+            DedupAction::Merge { into } => {
+                if let Some(survivor) = candidates.iter().find(|entry| entry.id == into) {
+                    let merged = merge::merge_into_survivor(survivor, fact);
+                    memory
+                        .store_with_options(
+                            &survivor.key,
+                            &merged.content,
+                            MemoryCategory::Core,
+                            survivor.session_id.as_deref(),
+                            StoreOptions {
+                                namespace: Some(survivor.namespace.clone()),
+                                importance: merged.importance,
+                                kind: Some(MemoryKind::Semantic(SemanticSubtype::Fact)),
+                                ..StoreOptions::default()
+                            },
+                        )
+                        .await?;
+                    continue;
+                }
+            }
+        }
+
+        let superseded_ids = conflict::check_and_resolve_conflicts(
+            memory,
+            &mem_key,
+            fact,
+            &MemoryCategory::Core,
+            memory_config.conflict_threshold,
+        )
+        .await
+        .unwrap_or_default();
+
+        memory
+            .store_with_options(
+                &mem_key,
+                fact,
+                MemoryCategory::Core,
+                None,
+                StoreOptions {
+                    importance: Some(imp),
+                    kind: Some(MemoryKind::Semantic(SemanticSubtype::Fact)),
+                    ..StoreOptions::default()
+                },
+            )
+            .await?;
+
+        if memory_config.conflict_supersede_enabled {
+            memory.supersede(&superseded_ids, &mem_key).await?;
         }
     }
 
@@ -248,6 +377,7 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
             memory_update: None,
             facts: Vec::new(),
             trend: None,
+            kind: None,
         }
     })
 }
