@@ -360,11 +360,7 @@ pub fn record_tool_loop_cost_usage(
     // post-fallback rate check supersedes HEAD's `pricing.is_none()` clause,
     // which would have warned even for live-filled models whose config pricing
     // map was absent.
-    if ctx.tracker.is_some()
-        && !priced_from_catalog
-        && input_rate == 0.0
-        && output_rate == 0.0
-    {
+    if ctx.tracker.is_some() && !priced_from_catalog && input_rate == 0.0 && output_rate == 0.0 {
         warn_once_missing_pricing(model_provider_name, model);
     }
 

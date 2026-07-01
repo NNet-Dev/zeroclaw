@@ -112,11 +112,12 @@ pub(crate) fn normalize_pricing(pricing: &ModelPricing) -> ModelRates {
     }
 }
 
-/// Snapshot layout: provider family `"<type>"` (the bare name the cost path
-/// resolves to, matching `provider_pricing`) → gateway-reported model id →
-/// USD-per-1M-token rates. A family's opted-in aliases collapse into one map
-/// keyed by model id. Nested `&str`-probeable maps so the per-call cost path
-/// looks up without allocating.
+/// Snapshot layout: outer key is either a composite alias `"<type>.<alias>"`
+/// (for opted-in aliases, so per-alias rates are preserved) or a bare provider
+/// family `"<type>"` (added only when ALL aliases for that family opted in,
+/// preserving backward compat with the bare-family cost path). Inner key:
+/// gateway-reported model id. Nested `&str`-probeable maps so the per-call
+/// cost path looks up without allocating.
 pub type PriceSnapshot = HashMap<String, HashMap<String, ModelRates>>;
 
 /// How often the background task re-fetches prices.
@@ -156,10 +157,10 @@ pub fn model_id_candidates(model_id: &str) -> impl Iterator<Item = &str> {
 }
 
 /// Pure lookup of one `(provider_ref, model_id)` against a snapshot. The
-/// snapshot is keyed by provider family (`"<type>"`); `provider_ref` is
-/// resolved the same way the config-rate path resolves it (`provider_pricing`):
-/// tried verbatim first, then by the bare family when it arrives as
-/// `"<type>.<alias>"`. The model id is probed through [`model_id_candidates`].
+/// snapshot may be keyed by composite alias `"<type>.<alias>"` or bare family
+/// `"<type>"`; `provider_ref` is tried verbatim first, then the bare family is
+/// tried when `provider_ref` arrives as `"<type>.<alias>"` (parity with
+/// `provider_pricing`). The model id is probed through [`model_id_candidates`].
 #[must_use]
 pub fn lookup<'a>(
     snapshot: &'a PriceSnapshot,
@@ -237,7 +238,7 @@ pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
                 .clone()
                 .expect("config handle is bound before the refresher is spawned");
             let cfg = handle.read().clone();
-            let groups = enabled_pricing_groups(&cfg);
+            let (groups, total_aliases_per_family) = enabled_pricing_groups(&cfg);
             if groups.is_empty() {
                 // Every provider opted back out (e.g. via reload): clear the
                 // snapshot once, on the transition to empty, so stale prices
@@ -251,23 +252,23 @@ pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
                     store_snapshot(PriceSnapshot::new());
                 }
             } else {
-                refresh_once(&groups).await;
+                refresh_once(&groups, &total_aliases_per_family).await;
             }
             tokio::time::sleep(REFRESH_INTERVAL).await;
         }
     });
 }
 
-/// One model whose price we want filled: the provider family (`<type>`) the
-/// cost path looks up by, the gateway's model id to match, the `<type>.<alias>`
-/// ref used only to build the provider handle, and the models.dev provider key
-/// to fall back to when the gateway carries no price for it.
+/// One model whose price we want filled: the composite alias (`<type>.<alias>`)
+/// the snapshot is keyed by, the gateway's model id to match, and the
+/// models.dev provider key to fall back to when the gateway carries no price.
 struct WantedModel {
-    /// Provider family (`<type>`, e.g. `kilo`). The snapshot is keyed by this,
-    /// matching the bare family name `provider_pricing` resolves to; the model
-    /// id disambiguates the family's opted-in aliases.
+    /// Composite alias (`<type>.<alias>`, e.g. `kilo.primary`). The snapshot
+    /// is keyed by this, preserving the alias boundary so a non-opted-in alias
+    /// cannot inherit prices from an opted-in same-family alias via the
+    /// bare-family fallback.
     provider_key: String,
-    /// `<type>.<alias>` ref, used only to build the provider handle/options.
+    /// Same as `provider_key`; kept for clarity at use sites that build handles.
     composite: String,
     model_id: String,
     models_dev_key: Option<String>,
@@ -287,7 +288,20 @@ struct GatewayGroup {
 /// the same family default when no `uri` is set) are deduped to a single
 /// `/models` call. Reuses the existing factory + each provider's own configured
 /// credentials/endpoint, so no endpoint URL or key is duplicated.
-fn enabled_pricing_groups(config: &zeroclaw_config::schema::Config) -> Vec<GatewayGroup> {
+///
+/// Also returns the total alias count per provider family (across all aliases,
+/// not just opted-in ones) so `assemble_snapshot` can decide whether to add a
+/// bare-family fallback entry.
+fn enabled_pricing_groups(
+    config: &zeroclaw_config::schema::Config,
+) -> (Vec<GatewayGroup>, HashMap<String, usize>) {
+    // Count TOTAL aliases per family (opted-in and not), used later to decide
+    // whether a bare-family snapshot entry is safe to add.
+    let mut total_aliases_per_family: HashMap<String, usize> = HashMap::new();
+    for (ty, _alias, _base) in config.providers.models.iter_entries() {
+        *total_aliases_per_family.entry(ty.to_string()).or_default() += 1;
+    }
+
     // gateway key -> (representative built handle, wanted models)
     let mut groups: HashMap<String, GatewayGroup> = HashMap::new();
     for (ty, alias, base) in config.providers.models.iter_entries() {
@@ -321,7 +335,10 @@ fn enabled_pricing_groups(config: &zeroclaw_config::schema::Config) -> Vec<Gatew
             .map_or_else(|| format!("type:{ty}"), str::to_string);
 
         let wanted = WantedModel {
-            provider_key: ty.to_string(),
+            // Keyed by composite alias to preserve the alias boundary; the
+            // snapshot uses this directly so a non-opted-in alias can never
+            // inherit rates from an opted-in same-family alias.
+            provider_key: composite.clone(),
             composite,
             model_id: model_id.to_string(),
             // models.dev provider key for this family, for the fallback path.
@@ -370,7 +387,7 @@ fn enabled_pricing_groups(config: &zeroclaw_config::schema::Config) -> Vec<Gatew
             }
         }
     }
-    groups.into_values().collect()
+    (groups.into_values().collect(), total_aliases_per_family)
 }
 
 /// Match a flagged model id against a `model_id -> rates` catalog through
@@ -409,13 +426,31 @@ fn rates_catalog(models: Vec<ModelInfo>) -> HashMap<String, ModelRates> {
 /// but not `cache_read` still gets `cache_read` from models.dev. A model
 /// neither source prices is simply absent (cost recording leaves it at $0, as
 /// before).
+///
+/// Each opted-in alias is keyed by its composite `"<type>.<alias>"` so per-alias
+/// rates are preserved and a non-opted-in alias cannot inherit prices via the
+/// bare-family fallback in `lookup`. Additionally, when ALL aliases for a family
+/// opted in (opted-in count == `total_aliases_per_family[family]`), a bare
+/// `"<type>"` entry is added so the existing bare-family cost path (which
+/// currently records the provider family, not the alias) still finds prices.
 fn assemble_snapshot(
     gateway_results: &[(&[WantedModel], HashMap<String, ModelRates>)],
     models_dev: &HashMap<String, HashMap<String, ModelRates>>,
+    total_aliases_per_family: &HashMap<String, usize>,
 ) -> PriceSnapshot {
     let mut out = PriceSnapshot::new();
+    // Count opted-in aliases per family (each WantedModel is one <type>.<alias>).
+    let mut opted_in_per_family: HashMap<String, usize> = HashMap::new();
+
     for (wanted, catalog) in gateway_results {
         for want in *wanted {
+            let family = want
+                .provider_key
+                .split_once('.')
+                .map(|(f, _)| f)
+                .unwrap_or(&want.provider_key);
+            *opted_in_per_family.entry(family.to_string()).or_default() += 1;
+
             let gw = match_pricing(catalog, &want.model_id).copied();
             let md = want
                 .models_dev_key
@@ -433,19 +468,59 @@ fn assemble_snapshot(
                 (None, None) => None,
             };
             if let Some(rates) = rates {
+                // Key by COMPOSITE alias to preserve the alias boundary.
                 out.entry(want.provider_key.clone())
                     .or_default()
                     .insert(want.model_id.clone(), rates);
             }
         }
     }
+
+    // Add a bare-family entry (e.g. "kilo") only when ALL aliases of that
+    // family opted in. This entry is a per-dimension merge of all opted-in
+    // aliases' rates (first alias to provide a dimension wins). Without it,
+    // a bare-family cost-path query ("kilo") would find nothing when no alias
+    // keyed the snapshot by bare family; with it, single-alias or all-opted-in
+    // families still work correctly via the existing lookup fallback.
+    //
+    // When only SOME aliases opted in, no bare entry is added: a non-opted-in
+    // alias querying by bare family (or via the split_once fallback from its
+    // composite key) correctly finds nothing.
+    for (family, opted_in_count) in &opted_in_per_family {
+        let total = total_aliases_per_family.get(family).copied().unwrap_or(0);
+        if *opted_in_count < total {
+            continue;
+        }
+        // Merge all composite alias entries for this family into one map.
+        let prefix = format!("{family}.");
+        let mut family_map: HashMap<String, ModelRates> = HashMap::new();
+        for (composite_key, model_map) in &out {
+            if !composite_key.starts_with(&prefix) {
+                continue;
+            }
+            for (model_id, &rates) in model_map {
+                let slot = family_map.entry(model_id.clone()).or_default();
+                *slot = ModelRates {
+                    input_per_mtok: slot.input_per_mtok.or(rates.input_per_mtok),
+                    output_per_mtok: slot.output_per_mtok.or(rates.output_per_mtok),
+                    cached_input_per_mtok: slot
+                        .cached_input_per_mtok
+                        .or(rates.cached_input_per_mtok),
+                };
+            }
+        }
+        if !family_map.is_empty() {
+            out.insert(family.clone(), family_map);
+        }
+    }
+
     out
 }
 
 /// Poll each gateway once, fall back to models.dev for models a gateway didn't
 /// price, and publish the merged snapshot. Keeps the previous snapshot if no
 /// source succeeded (never regress good prices to empty on a transient outage).
-async fn refresh_once(groups: &[GatewayGroup]) {
+async fn refresh_once(groups: &[GatewayGroup], total_aliases_per_family: &HashMap<String, usize>) {
     // ── Gather all gateway catalogs concurrently (one `/models` call per
     // gateway; first-fill latency is bounded by the slowest gateway, not the
     // sum of all of them) ──
@@ -523,7 +598,11 @@ async fn refresh_once(groups: &[GatewayGroup]) {
     }
 
     if any_ok {
-        store_snapshot(assemble_snapshot(&gateway_results, &models_dev));
+        store_snapshot(assemble_snapshot(
+            &gateway_results,
+            &models_dev,
+            total_aliases_per_family,
+        ));
     }
 }
 
@@ -613,9 +692,9 @@ mod tests {
 
     fn want(composite: &str, model: &str, md_key: Option<&str>) -> WantedModel {
         WantedModel {
-            // Family is the part before the first `.`: the snapshot key, just
-            // as `enabled_pricing_groups` derives it from `<type>.<alias>`.
-            provider_key: composite.split('.').next().unwrap_or(composite).to_string(),
+            // provider_key is the composite alias, matching what
+            // enabled_pricing_groups now stores (not the bare family).
+            provider_key: composite.to_string(),
             composite: composite.to_string(),
             model_id: model.to_string(),
             models_dev_key: md_key.map(str::to_string),
@@ -667,15 +746,15 @@ mod tests {
         );
         let models_dev = HashMap::from([("kilo".to_string(), md)]);
 
-        let snap = assemble_snapshot(&gateway_results, &models_dev);
+        // All 5 kilo aliases and the 1 x alias are in the wanted list (all opted
+        // in), so bare-family entries are added for "kilo" (5==5) but not "x"
+        // (x.e priced nothing, so "x" never gets a non-empty family map).
+        let total = HashMap::from([("kilo".to_string(), 5usize), ("x".to_string(), 1usize)]);
+        let snap = assemble_snapshot(&gateway_results, &models_dev, &total);
 
-        // The family's opted-in aliases collapse under one `<type>` key, keyed
-        // by model id (kilo.a/b/c/f all live under "kilo").
-        // Gateway price wins over models.dev for the shared model.
+        // All aliases opted in → bare "kilo" entry exists (backward compat path).
         assert_eq!(snap["kilo"]["minimax/m2.7"].input_per_mtok, Some(0.3));
-        // models.dev fills a model the gateway didn't price.
         assert_eq!(snap["kilo"]["only-on-mdev"].input_per_mtok, Some(0.5));
-        // Suffix match against the gateway catalog.
         assert_eq!(snap["kilo"]["vendor/slug"].input_per_mtok, Some(0.7));
         // Per-dimension merge: gateway wins input+output, models.dev backfills
         // ONLY the cache_read dimension the gateway left unset.
@@ -683,9 +762,13 @@ mod tests {
         assert_eq!(partial.input_per_mtok, Some(2.0)); // gateway
         assert_eq!(partial.output_per_mtok, Some(4.0)); // gateway
         assert_eq!(partial.cached_input_per_mtok, Some(0.5)); // models.dev backfill
-        // Neither source: the model is absent from the family map (left at $0).
+        // Neither source: absent from the family map (left at $0).
         assert!(!snap["kilo"].contains_key("nowhere"));
-        // The no-key case priced nothing, so its family never appears.
+        // Composite alias keys are also present.
+        assert_eq!(snap["kilo.a"]["minimax/m2.7"].input_per_mtok, Some(0.3));
+        assert_eq!(snap["kilo.b"]["only-on-mdev"].input_per_mtok, Some(0.5));
+        // The no-key case priced nothing; its composite key and bare "x" are absent.
+        assert!(!snap.contains_key("x.e"));
         assert!(!snap.contains_key("x"));
     }
 
@@ -699,5 +782,97 @@ mod tests {
         assert!(sane_mtok(f64::NAN).is_none());
         // Above the ceiling ($1/token) -> rejected (parsing artifact / hostile gateway).
         assert!(sane_mtok(MAX_SANE_PER_MTOK * 2.0).is_none());
+    }
+
+    // Alias-boundary regression test 1: when one alias opts in and another does
+    // not, the non-opted-in alias must NOT receive live prices -- neither by
+    // composite lookup nor by the bare-family split_once fallback.
+    #[test]
+    fn alias_boundary_non_opted_in_alias_gets_no_live_pricing() {
+        // kilo.primary opted in; kilo.secondary did NOT.
+        // Total kilo aliases: 2. Only 1 opted in -> no bare "kilo" entry.
+        let wanted = vec![want("kilo.primary", "minimax-m2.7", Some("kilo"))];
+        let mut gateway = HashMap::new();
+        gateway.insert("minimax-m2.7".to_string(), rate(0.3));
+        let gateway_results = vec![(wanted.as_slice(), gateway)];
+        let models_dev = HashMap::new();
+        let total = HashMap::from([("kilo".to_string(), 2usize)]);
+
+        let snap = assemble_snapshot(&gateway_results, &models_dev, &total);
+
+        // kilo.primary (opted in) has composite rates.
+        assert_eq!(
+            snap["kilo.primary"]["minimax-m2.7"].input_per_mtok,
+            Some(0.3)
+        );
+        // No bare "kilo" entry: mixed opt-in state means the bare-family lookup
+        // must not surface kilo.primary's rates to kilo.secondary.
+        assert!(
+            !snap.contains_key("kilo"),
+            "bare-family key must not exist when not all aliases opted in"
+        );
+        // A kilo.secondary composite lookup finds nothing (it never opted in).
+        assert!(
+            lookup(&snap, "kilo.secondary", "minimax-m2.7").is_none(),
+            "non-opted-in alias must not inherit prices via composite lookup"
+        );
+        // A bare-family lookup for "kilo" also finds nothing.
+        assert!(
+            lookup(&snap, "kilo", "minimax-m2.7").is_none(),
+            "bare-family lookup must not return prices when only some aliases opted in"
+        );
+    }
+
+    // Alias-boundary regression test 2: when two aliases of the same family opt
+    // in through different gateways with different rates for the same model, each
+    // alias retains its own source rates in the snapshot (no cross-alias collapse).
+    #[test]
+    fn alias_boundary_two_opted_in_aliases_have_own_source_rates() {
+        let wanted = vec![
+            want("kilo.primary", "minimax-m2.7", Some("kilo")),
+            want("kilo.secondary", "minimax-m2.7", Some("kilo")),
+        ];
+        // Two gateway groups: primary sees $0.30/MTok, secondary sees $0.90/MTok.
+        let mut gateway_a = HashMap::new();
+        gateway_a.insert("minimax-m2.7".to_string(), rate(0.3));
+        let mut gateway_b = HashMap::new();
+        gateway_b.insert("minimax-m2.7".to_string(), rate(0.9));
+        // Each alias is its own gateway group (different URIs / gateways).
+        let primary_slice = std::slice::from_ref(&wanted[0]);
+        let secondary_slice = std::slice::from_ref(&wanted[1]);
+        let gateway_results = vec![(primary_slice, gateway_a), (secondary_slice, gateway_b)];
+        let models_dev = HashMap::new();
+        // Both aliases opted in (2 == 2 total) -> bare "kilo" entry is added too.
+        let total = HashMap::from([("kilo".to_string(), 2usize)]);
+
+        let snap = assemble_snapshot(&gateway_results, &models_dev, &total);
+
+        // Each alias retains its own gateway's rates in the composite slot.
+        assert_eq!(
+            snap["kilo.primary"]["minimax-m2.7"].input_per_mtok,
+            Some(0.3),
+            "kilo.primary must use its own gateway rate"
+        );
+        assert_eq!(
+            snap["kilo.secondary"]["minimax-m2.7"].input_per_mtok,
+            Some(0.9),
+            "kilo.secondary must use its own gateway rate"
+        );
+        // Composite lookup preserves per-alias isolation.
+        assert_eq!(
+            lookup(&snap, "kilo.primary", "minimax-m2.7").and_then(|r| r.input_per_mtok),
+            Some(0.3)
+        );
+        assert_eq!(
+            lookup(&snap, "kilo.secondary", "minimax-m2.7").and_then(|r| r.input_per_mtok),
+            Some(0.9)
+        );
+        // The bare "kilo" entry exists (all aliases opted in) and carries merged
+        // rates (first-wins per dimension); bare-family cost-path queries resolve.
+        assert!(
+            snap.contains_key("kilo"),
+            "bare-family entry must exist when all aliases opted in"
+        );
+        assert!(lookup(&snap, "kilo", "minimax-m2.7").is_some());
     }
 }
