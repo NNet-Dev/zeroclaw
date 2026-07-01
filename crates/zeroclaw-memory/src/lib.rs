@@ -32,6 +32,8 @@ pub mod conflict;
 pub mod consolidation;
 pub mod decay;
 pub mod dedup;
+#[cfg(feature = "local-embeddings")]
+pub mod embed_local;
 pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
@@ -42,11 +44,13 @@ pub mod lucid;
 pub mod markdown;
 pub mod merge;
 pub mod none;
+pub mod normalize;
 pub mod policy;
 pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
+pub mod rerank;
 pub mod response_cache;
 pub mod retrieval;
 pub mod snapshot;
@@ -72,6 +76,8 @@ pub use policy::PolicyEnforcer;
 #[allow(unused_imports)]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
+#[allow(unused_imports)]
+pub use rerank::{RerankConfig, RerankStrategy};
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};

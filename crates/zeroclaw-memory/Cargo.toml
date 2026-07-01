@@ -27,6 +27,9 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 
 [features]
+# Optional dependency-light local embedding provider (lexical feature-hash).
+# OFF by default; the configured embeddings provider is the primary path.
+local-embeddings = []
 memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres"]
 
 [dev-dependencies]

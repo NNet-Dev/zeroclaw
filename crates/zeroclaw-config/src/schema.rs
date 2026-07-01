@@ -10151,12 +10151,27 @@ pub struct MemoryConfig {
     /// Retrieval stages to execute in order. Valid: "cache", "fts", "vector".
     #[serde(default = "default_retrieval_stages")]
     pub retrieval_stages: Vec<String>,
+    /// Candidate pool multiplier over the final recall limit before blend/rerank trimming.
+    #[serde(default = "default_candidate_multiplier")]
+    pub candidate_multiplier: usize,
     /// Enable LLM reranking when candidate count exceeds threshold.
     #[serde(default)]
     pub rerank_enabled: bool,
     /// Minimum candidate count to trigger reranking.
     #[serde(default = "default_rerank_threshold")]
     pub rerank_threshold: usize,
+    /// Advanced rerank strategy. Valid: "none", "mmr".
+    #[serde(default = "default_rerank_strategy")]
+    pub rerank_strategy: String,
+    /// MMR relevance-vs-diversity weight, where 1.0 means relevance-only.
+    #[serde(default = "default_mmr_lambda")]
+    pub mmr_lambda: f64,
+    /// Importance weight used by the recall blend.
+    #[serde(default = "default_importance_weight")]
+    pub importance_weight: f64,
+    /// Recency weight used by the recall blend.
+    #[serde(default = "default_recency_weight")]
+    pub recency_weight: f64,
     /// FTS score above which to early-return without vector search (0.0–1.0).
     #[serde(default = "default_fts_early_return_score")]
     pub fts_early_return_score: f64,
@@ -10246,6 +10261,21 @@ fn default_retrieval_stages() -> Vec<String> {
 }
 fn default_rerank_threshold() -> usize {
     5
+}
+fn default_candidate_multiplier() -> usize {
+    4
+}
+fn default_rerank_strategy() -> String {
+    "none".into()
+}
+fn default_mmr_lambda() -> f64 {
+    0.7
+}
+fn default_importance_weight() -> f64 {
+    0.2
+}
+fn default_recency_weight() -> f64 {
+    0.1
 }
 fn default_fts_early_return_score() -> f64 {
     0.85
@@ -10384,8 +10414,13 @@ impl Default for MemoryConfig {
             snapshot_on_hygiene: false,
             auto_hydrate: true,
             retrieval_stages: default_retrieval_stages(),
+            candidate_multiplier: default_candidate_multiplier(),
             rerank_enabled: false,
             rerank_threshold: default_rerank_threshold(),
+            rerank_strategy: default_rerank_strategy(),
+            mmr_lambda: default_mmr_lambda(),
+            importance_weight: default_importance_weight(),
+            recency_weight: default_recency_weight(),
             fts_early_return_score: default_fts_early_return_score(),
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),

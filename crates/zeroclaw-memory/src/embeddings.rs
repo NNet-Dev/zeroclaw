@@ -182,6 +182,7 @@ pub fn create_embedding_provider(
     dims: usize,
 ) -> Box<dyn EmbeddingProvider> {
     match model_provider {
+        "local" => create_local_embedding_provider(model, dims),
         "openai" => {
             let key = api_key.unwrap_or("");
             Box::new(OpenAiEmbedding::new(
@@ -207,6 +208,43 @@ pub fn create_embedding_provider(
         }
         _ => Box::new(NoopEmbedding),
     }
+}
+
+#[cfg(feature = "local-embeddings")]
+fn create_local_embedding_provider(_model: &str, dims: usize) -> Box<dyn EmbeddingProvider> {
+    match crate::embed_local::LocalEmbedding::load(dims) {
+        Ok(provider) => Box::new(provider),
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "memory.local_embedding_load_failed",
+                        "provider": "local",
+                        "error": error.to_string(),
+                    })),
+                "local embedding provider failed to load; degrading to keyword-only recall"
+            );
+            Box::new(NoopEmbedding)
+        }
+    }
+}
+
+#[cfg(not(feature = "local-embeddings"))]
+fn create_local_embedding_provider(_model: &str, _dims: usize) -> Box<dyn EmbeddingProvider> {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error_key": "memory.local_embeddings_feature_disabled",
+                "provider": "local",
+            })),
+        "local embedding provider requested but this build was compiled without \
+         `local-embeddings`; degrading to keyword-only recall"
+    );
+    Box::new(NoopEmbedding)
 }
 
 #[cfg(test)]
@@ -257,6 +295,21 @@ mod tests {
         let p = create_embedding_provider("custom:http://localhost:1234", None, "model", 768);
         assert_eq!(p.name(), "openai"); // uses OpenAiEmbedding internally
         assert_eq!(p.dimensions(), 768);
+    }
+
+    #[test]
+    fn factory_local_degrades_without_feature_or_invalid_dimensions() {
+        let p = create_embedding_provider("local", None, "local-hash", 0);
+        assert_eq!(p.name(), "none");
+        assert_eq!(p.dimensions(), 0);
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn factory_local_uses_local_provider_when_feature_enabled() {
+        let p = create_embedding_provider("local", None, "local-hash", 64);
+        assert_eq!(p.name(), "local");
+        assert_eq!(p.dimensions(), 64);
     }
 
     // ── Edge cases ───────────────────────────────────────────────

@@ -1,5 +1,7 @@
 // Vector operations — cosine similarity, normalization, hybrid merge.
 
+use crate::normalize;
+
 /// Cosine similarity between two vectors. Returns 0.0–1.0.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
@@ -76,60 +78,13 @@ pub fn hybrid_merge(
     keyword_weight: f32,
     limit: usize,
 ) -> Vec<ScoredResult> {
-    use std::collections::HashMap;
-
-    let mut map: HashMap<String, ScoredResult> = HashMap::new();
-
-    // Normalize vector scores (already 0–1 from cosine similarity)
-    for (id, score) in vector_results {
-        map.entry(id.clone())
-            .and_modify(|r| r.vector_score = Some(*score))
-            .or_insert_with(|| ScoredResult {
-                id: id.clone(),
-                vector_score: Some(*score),
-                keyword_score: None,
-                final_score: 0.0,
-            });
-    }
-
-    // Normalize keyword scores (BM25 can be any positive number)
-    let max_kw = keyword_results
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(0.0_f32, f32::max);
-    let max_kw = if max_kw < f32::EPSILON { 1.0 } else { max_kw };
-
-    for (id, score) in keyword_results {
-        let normalized = score / max_kw;
-        map.entry(id.clone())
-            .and_modify(|r| r.keyword_score = Some(normalized))
-            .or_insert_with(|| ScoredResult {
-                id: id.clone(),
-                vector_score: None,
-                keyword_score: Some(normalized),
-                final_score: 0.0,
-            });
-    }
-
-    // Compute final scores
-    let mut results: Vec<ScoredResult> = map
-        .into_values()
-        .map(|mut r| {
-            let vs = r.vector_score.unwrap_or(0.0);
-            let ks = r.keyword_score.unwrap_or(0.0);
-            r.final_score = vector_weight * vs + keyword_weight * ks;
-            r
-        })
-        .collect();
-
-    results.sort_by(|a, b| {
-        b.final_score
-            .partial_cmp(&a.final_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    results.truncate(limit);
-    results
+    normalize::normalize_and_fuse(
+        vector_results,
+        keyword_results,
+        vector_weight,
+        keyword_weight,
+        limit,
+    )
 }
 
 #[cfg(test)]
