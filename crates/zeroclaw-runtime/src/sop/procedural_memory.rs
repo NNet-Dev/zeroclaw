@@ -140,7 +140,19 @@ pub fn apply_proposal(
     }
 
     let sops_root = super::resolve_sops_dir(workspace_dir, engine.config().sops_dir.as_deref());
-    let target_dir = contained_sop_dir(&sops_root, &proposal.sop_name)?;
+    // An Update must land on the currently-loaded SOP's actual directory, which
+    // the loader sets from on-disk layout and need not match a slug of the name.
+    // Create has no loaded SOP, so derive the new directory from the name.
+    let target_dir = match proposal.kind {
+        ProposalKind::Update => match engine
+            .get_sop(&proposal.sop_name)
+            .and_then(|sop| sop.location.clone())
+        {
+            Some(location) => contained_existing_dir(&sops_root, &location)?,
+            None => contained_sop_dir(&sops_root, &proposal.sop_name)?,
+        },
+        ProposalKind::Create => contained_sop_dir(&sops_root, &proposal.sop_name)?,
+    };
     let current_target_hash = if target_dir.exists() {
         Some(hash_sop_dir(&target_dir)?)
     } else {
@@ -370,7 +382,67 @@ fn contained_sop_dir(sops_root: &Path, sop_name: &str) -> Result<PathBuf> {
         bail!("SOP name does not contain a safe path component");
     }
     ensure_relative_component(&slug)?;
-    Ok(sops_root.join(slug))
+    let target = sops_root.join(slug);
+    ensure_within_root(sops_root, &target)?;
+    Ok(target)
+}
+
+/// Validate that an already-existing SOP directory (taken from the loaded
+/// `Sop.location`) stays within `sops_root`, rejecting `..` and symlink escapes.
+fn contained_existing_dir(sops_root: &Path, location: &Path) -> Result<PathBuf> {
+    let target = location.to_path_buf();
+    ensure_within_root(sops_root, &target)?;
+    Ok(target)
+}
+
+/// Assert that `target` resolves to a path inside `sops_root`. Both paths may
+/// not yet exist on disk (a fresh Create has neither the root nor the leaf), so
+/// each is resolved by canonicalizing its nearest existing ancestor (which
+/// follows symlinks where they actually live - the real escape vector) and
+/// re-appending the remaining lexical components.
+fn ensure_within_root(sops_root: &Path, target: &Path) -> Result<()> {
+    let root = resolve_existing_ancestor(sops_root)?;
+    let resolved_target = resolve_existing_ancestor(target)?;
+    if !resolved_target.starts_with(&root) {
+        bail!(
+            "target SOP directory '{}' escapes SOPs root",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+/// Canonicalize the nearest existing ancestor of `path` and re-append the
+/// not-yet-created trailing components verbatim. A `..` or symlink that escapes
+/// is caught because the existing portion is canonicalized; a trailing
+/// component is rejected unless it is a plain name.
+fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut remainder: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut current = path;
+    loop {
+        if current.exists() {
+            let mut resolved = fs::canonicalize(current)
+                .with_context(|| format!("canonicalize '{}'", current.display()))?;
+            for name in remainder.iter().rev() {
+                resolved.push(name);
+            }
+            return Ok(resolved);
+        }
+        match (current.file_name(), current.parent()) {
+            (Some(name), Some(parent)) => {
+                let component = Path::new(name);
+                if component
+                    .components()
+                    .any(|c| !matches!(c, Component::Normal(_)))
+                {
+                    bail!("unsafe SOP path component '{}'", name.to_string_lossy());
+                }
+                remainder.push(name);
+                current = parent;
+            }
+            _ => bail!("cannot resolve SOP path '{}'", path.display()),
+        }
+    }
 }
 
 fn ensure_relative_component(component: &str) -> Result<()> {
@@ -532,6 +604,57 @@ mod tests {
         assert!(apply_proposal(&mut engine, tmp.path(), &proposal.id, None).is_err());
         let stored = engine.load_proposal(&proposal.id).unwrap().unwrap();
         assert_eq!(stored.status, ProposalStatus::Stale);
+    }
+
+    #[test]
+    fn apply_update_targets_loaded_location_not_name_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        // On-disk directory name ("foo") intentionally differs from the manifest
+        // SOP name ("daily-check"); the loader keys off the manifest name but
+        // records the actual directory as the location.
+        let sops = tmp.path().join("sops").join("foo");
+        fs::create_dir_all(&sops).unwrap();
+        fs::write(
+            sops.join("SOP.toml"),
+            "[sop]\nname = \"daily-check\"\ndescription = \"Daily check\"\n\n[[triggers]]\ntype = \"manual\"\n",
+        )
+        .unwrap();
+        fs::write(sops.join("SOP.md"), "## Steps\n\n1. **Old** - Do it.\n").unwrap();
+
+        let mut engine = engine_with_workspace(tmp.path());
+        engine.reload(tmp.path());
+        assert_eq!(
+            engine
+                .get_sop("daily-check")
+                .and_then(|sop| sop.location.clone()),
+            Some(sops.clone())
+        );
+
+        let proposal = create_proposal(
+            &engine,
+            ProposalDraft {
+                sop_name: "daily-check".into(),
+                description: "Daily check".into(),
+                manifest_toml: None,
+                procedure_markdown: "## Steps\n\n1. **New** - Do it.\n".into(),
+                source_run_id: None,
+                requested_by: None,
+            },
+        )
+        .unwrap();
+
+        let outcome = apply_proposal(&mut engine, tmp.path(), &proposal.id, None).unwrap();
+
+        assert_eq!(outcome.proposal.status, ProposalStatus::Applied);
+        assert_eq!(outcome.target_dir, sops);
+        // The original directory was updated in place with the new content
+        // (create_proposal trims trailing whitespace from the markdown).
+        assert_eq!(
+            fs::read_to_string(sops.join("SOP.md")).unwrap(),
+            "## Steps\n\n1. **New** - Do it."
+        );
+        // No new slug-named directory was created next to the real one.
+        assert!(!tmp.path().join("sops").join("daily-check").exists());
     }
 
     #[test]
