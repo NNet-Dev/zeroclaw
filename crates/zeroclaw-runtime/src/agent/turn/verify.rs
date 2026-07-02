@@ -8,8 +8,10 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use zeroclaw_api::diagnostics::{Diagnostic, DiagnosticKey};
 use zeroclaw_config::coding::{CodingConfig, VerifyConfig};
 use zeroclaw_tool_call_parser::ParsedToolCall;
+use zeroclaw_tools::diagnostics::{parse_diagnostics, render_diagnostics_block};
 
 pub(crate) enum VerifyDecision {
     Pass,
@@ -19,7 +21,7 @@ pub(crate) enum VerifyDecision {
 
 #[derive(Default)]
 pub(crate) struct BaselineStore {
-    diagnostics: HashMap<TargetKey, HashSet<String>>,
+    diagnostics: HashMap<TargetKey, HashSet<VerifyDiagnosticKey>>,
 }
 
 pub(crate) async fn capture_verify_baselines(
@@ -44,7 +46,7 @@ pub(crate) async fn capture_verify_baselines(
         let output = run_verify_command(command, &target.package_root, cfg.timeout_secs).await;
         baselines
             .diagnostics
-            .insert(key, diagnostic_set(&output.text));
+            .insert(key, diagnostic_set(command, &output.text));
     }
 }
 
@@ -66,6 +68,9 @@ pub(crate) async fn run_verify_stage(
     }
 
     let mut failures = Vec::new();
+    if let Some(text) = semantic_diagnostics_text(calls, ordered_results, cfg) {
+        failures.push(render_semantic_failure(&text));
+    }
     for target in targets {
         let Some(command) = command_for_target(cfg, &target) else {
             continue;
@@ -77,14 +82,12 @@ pub(crate) async fn run_verify_stage(
         }
 
         let text = if cfg.baseline_delta {
-            let post = diagnostic_set(&output.text);
+            let post = parse_verify_diagnostics(command, &output.text);
             let baseline = baselines.diagnostics.entry(target.key()).or_default();
-            let mut delta = delta_diagnostics(baseline, &post);
-            if delta.is_empty() {
+            let Some(delta) = delta_diagnostics(baseline, post) else {
                 continue;
-            }
-            delta.sort();
-            delta.join("\n")
+            };
+            delta
         } else {
             output.text
         };
@@ -127,6 +130,17 @@ impl EditedTarget {
 struct RawVerifyOutput {
     success: bool,
     text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum VerifyDiagnosticKey {
+    Structured(DiagnosticKey),
+    Raw(String),
+}
+
+enum VerifyDiagnostics {
+    Structured(Vec<Diagnostic>),
+    Raw(Vec<String>),
 }
 
 fn edited_targets_from_results(
@@ -177,9 +191,6 @@ fn target_from_call(call: &ParsedToolCall, cfg: &VerifyConfig) -> Option<EditedT
 
     let path = path_arg(&call.arguments).map(PathBuf::from)?;
     let language = language_for_path(&path)?;
-    if !cfg.commands.contains_key(language) {
-        return None;
-    }
 
     Some(EditedTarget {
         language: language.to_string(),
@@ -211,7 +222,16 @@ fn language_for_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn diagnostic_set(text: &str) -> HashSet<String> {
+fn parse_verify_diagnostics(command: &str, text: &str) -> VerifyDiagnostics {
+    let diagnostics = parse_diagnostics("shell", &serde_json::json!({ "command": command }), text);
+    if diagnostics.is_empty() {
+        VerifyDiagnostics::Raw(raw_diagnostic_lines(text))
+    } else {
+        VerifyDiagnostics::Structured(diagnostics)
+    }
+}
+
+fn raw_diagnostic_lines(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -219,8 +239,88 @@ fn diagnostic_set(text: &str) -> HashSet<String> {
         .collect()
 }
 
-fn delta_diagnostics(baseline: &HashSet<String>, post: &HashSet<String>) -> Vec<String> {
-    post.difference(baseline).cloned().collect()
+fn diagnostic_set(command: &str, text: &str) -> HashSet<VerifyDiagnosticKey> {
+    keys_for(parse_verify_diagnostics(command, text)).collect()
+}
+
+fn keys_for(
+    diagnostics: VerifyDiagnostics,
+) -> Box<dyn Iterator<Item = VerifyDiagnosticKey> + Send + 'static> {
+    match diagnostics {
+        VerifyDiagnostics::Structured(diagnostics) => Box::new(
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| VerifyDiagnosticKey::Structured(diagnostic.key())),
+        ),
+        VerifyDiagnostics::Raw(lines) => Box::new(lines.into_iter().map(VerifyDiagnosticKey::Raw)),
+    }
+}
+
+fn delta_diagnostics(
+    baseline: &HashSet<VerifyDiagnosticKey>,
+    post: VerifyDiagnostics,
+) -> Option<String> {
+    match post {
+        VerifyDiagnostics::Structured(diagnostics) => {
+            let delta = diagnostics
+                .into_iter()
+                .filter(|diagnostic| {
+                    !baseline.contains(&VerifyDiagnosticKey::Structured(diagnostic.key()))
+                })
+                .collect::<Vec<_>>();
+            if delta.is_empty() {
+                None
+            } else {
+                let rendered = render_diagnostics_block(&delta, 8_000);
+                if rendered.is_empty() {
+                    None
+                } else {
+                    Some(rendered)
+                }
+            }
+        }
+        VerifyDiagnostics::Raw(lines) => {
+            let mut delta = lines
+                .into_iter()
+                .filter(|line| !baseline.contains(&VerifyDiagnosticKey::Raw(line.clone())))
+                .collect::<Vec<_>>();
+            if delta.is_empty() {
+                None
+            } else {
+                delta.sort();
+                Some(delta.join("\n"))
+            }
+        }
+    }
+}
+
+fn semantic_diagnostics_text(
+    calls: &[ParsedToolCall],
+    ordered_results: &[Option<(String, Option<String>, ToolExecutionOutcome)>],
+    cfg: &VerifyConfig,
+) -> Option<String> {
+    let diagnostics = ordered_results
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, slot)| {
+            let (tool_name, _, outcome) = slot.as_ref()?;
+            if !outcome.success || !cfg.on.iter().any(|name| name == tool_name) {
+                return None;
+            }
+            calls
+                .get(idx)
+                .and_then(|call| target_from_call(call, cfg))?;
+            outcome.diagnostics.as_deref()
+        })
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    if diagnostics.is_empty() {
+        None
+    } else {
+        let rendered = render_diagnostics_block(&diagnostics, 8_000);
+        (!rendered.is_empty()).then_some(rendered)
+    }
 }
 
 fn package_root_for(path: &Path) -> PathBuf {
@@ -309,11 +409,16 @@ fn render_verify_failure(command: &str, cwd: &Path, text: &str) -> String {
     )
 }
 
+fn render_semantic_failure(text: &str) -> String {
+    format!("[Verification failed]\nsemantic code-intel diagnostics\n\n{text}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
+    use zeroclaw_api::diagnostics::DiagnosticSeverity;
 
     fn outcome(success: bool) -> ToolExecutionOutcome {
         ToolExecutionOutcome {
@@ -324,6 +429,13 @@ mod tests {
             diagnostics: None,
             duration: Duration::ZERO,
             receipt: None,
+        }
+    }
+
+    fn outcome_with_diagnostics(diagnostics: Vec<Diagnostic>) -> ToolExecutionOutcome {
+        ToolExecutionOutcome {
+            diagnostics: Some(diagnostics),
+            ..outcome(true)
         }
     }
 
@@ -388,15 +500,36 @@ mod tests {
     }
 
     #[test]
-    fn delta_filters_pre_existing_diagnostics() {
-        let baseline = diagnostic_set("error[E0425]: cannot find value `old`\nwarning: old");
-        let post = diagnostic_set(
-            "error[E0425]: cannot find value `old`\nwarning: old\nerror[E0308]: new mismatch",
+    fn structured_delta_filters_line_shifted_pre_existing_diagnostics() {
+        let baseline = diagnostic_set(
+            "cargo check --message-format=json",
+            r#"{"reason":"compiler-message","message":{"message":"cannot find value `old` in this scope","code":{"code":"E0425"},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":10,"column_start":5,"is_primary":true}]}}"#,
+        );
+        let post = parse_verify_diagnostics(
+            "cargo check --message-format=json",
+            concat!(
+                r#"{"reason":"compiler-message","message":{"message":"cannot find value `old` in this scope","code":{"code":"E0425"},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":40,"column_start":5,"is_primary":true}]}}"#,
+                "\n",
+                r#"{"reason":"compiler-message","message":{"message":"new mismatch","code":{"code":"E0308"},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":50,"column_start":2,"is_primary":true}]}}"#
+            ),
         );
 
-        let delta = delta_diagnostics(&baseline, &post);
+        let delta = delta_diagnostics(&baseline, post).expect("new diagnostic should remain");
 
-        assert_eq!(delta, vec!["error[E0308]: new mismatch"]);
+        assert!(delta.contains("new mismatch"));
+        assert!(delta.contains("[E0308]"));
+        assert!(!delta.contains("cannot find value `old`"));
+    }
+
+    #[test]
+    fn raw_delta_filters_pre_existing_lines() {
+        let baseline = diagnostic_set("custom-check", "old failure\nwarning: old");
+        let post =
+            parse_verify_diagnostics("custom-check", "old failure\nwarning: old\nnew failure");
+
+        let delta = delta_diagnostics(&baseline, post).expect("new line should remain");
+
+        assert_eq!(delta, "new failure");
     }
 
     #[test]
@@ -454,6 +587,60 @@ mod tests {
             }
             VerifyDecision::Pass | VerifyDecision::Surface { .. } => {
                 panic!("expected repair decision with new diagnostic")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_verify_stage_repairs_on_semantic_tool_diagnostics_without_shell_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.0.0'\n",
+        )
+        .expect("write Cargo.toml");
+        fs::create_dir(temp.path().join("src")).expect("create src");
+        let edited_path = temp.path().join("src/lib.rs");
+        fs::write(&edited_path, "").expect("write edited file");
+
+        let coding = CodingConfig {
+            verify: VerifyConfig {
+                enabled: true,
+                ..VerifyConfig::default()
+            },
+            ..CodingConfig::default()
+        };
+        let calls = vec![ParsedToolCall {
+            name: "file_edit".into(),
+            arguments: serde_json::json!({"path": edited_path}),
+            tool_call_id: None,
+        }];
+        let results = vec![Some((
+            "file_edit".into(),
+            None,
+            outcome_with_diagnostics(vec![Diagnostic {
+                file: "src/lib.rs".to_string(),
+                line: Some(4),
+                col: Some(8),
+                severity: DiagnosticSeverity::Error,
+                code: Some("semantic.unresolved_symbol".to_string()),
+                message:
+                    "`helper` has remaining references and no indexed definition after this edit"
+                        .to_string(),
+            }]),
+        ))];
+        let mut baselines = BaselineStore::default();
+
+        let decision = run_verify_stage(&coding, &calls, &results, &mut baselines, 1).await;
+
+        match decision {
+            VerifyDecision::Repair { payload } => {
+                assert!(payload.contains("semantic code-intel diagnostics"));
+                assert!(payload.contains("semantic.unresolved_symbol"));
+                assert!(payload.contains("`helper`"));
+            }
+            VerifyDecision::Pass | VerifyDecision::Surface { .. } => {
+                panic!("expected repair decision from semantic diagnostics")
             }
         }
     }

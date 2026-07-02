@@ -3,6 +3,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use zeroclaw_api::diagnostics::{Diagnostic, DiagnosticSeverity};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -297,7 +298,8 @@ impl FileEditTool {
                     "Edited {path}: replaced 1 occurrence ({} bytes)",
                     new_content.len()
                 );
-                if let Some(note) = self.post_edit_symbol_note(&pre_edit_defs) {
+                let diagnostics = self.post_edit_symbol_diagnostics(&pre_edit_defs);
+                if let Some(note) = post_edit_symbol_note(&diagnostics) {
                     output.push_str("\n\n");
                     output.push_str(&note);
                 }
@@ -305,7 +307,7 @@ impl FileEditTool {
                     success: true,
                     output: output.into(),
                     error: None,
-                    diagnostics: None,
+                    diagnostics: (!diagnostics.is_empty()).then_some(diagnostics),
                 })
             }
             Err(e) => Ok(ToolResult {
@@ -331,13 +333,16 @@ impl FileEditTool {
         code_intel.symbols_in_span(path, &span).unwrap_or_default()
     }
 
-    fn post_edit_symbol_note(&self, pre_edit_defs: &[SymbolDef]) -> Option<String> {
+    fn post_edit_symbol_diagnostics(&self, pre_edit_defs: &[SymbolDef]) -> Vec<Diagnostic> {
         let code_intel = self
             .code_intel
             .as_ref()
-            .filter(|code_intel| code_intel.post_edit_check_enabled())?;
+            .filter(|code_intel| code_intel.post_edit_check_enabled());
+        let Some(code_intel) = code_intel else {
+            return Vec::new();
+        };
         let mut seen = HashSet::new();
-        let mut lines = Vec::new();
+        let mut diagnostics = Vec::new();
         for def in pre_edit_defs {
             if !seen.insert(def.name.clone()) {
                 continue;
@@ -353,15 +358,9 @@ impl FileEditTool {
             if references.is_empty() {
                 continue;
             }
-            lines.push(format_unresolved_symbol(&def.name, &references));
+            diagnostics.push(unresolved_symbol_diagnostic(&def.name, &references));
         }
-        if lines.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "## Post-edit symbol check\nPotential unresolved references after this edit:\n{}",
-            lines.join("\n")
-        ))
+        diagnostics
     }
 }
 
@@ -401,14 +400,41 @@ fn line_col_for_byte(content: &str, offset: usize) -> (u32, u32) {
     (line, col)
 }
 
-fn format_unresolved_symbol(name: &str, references: &[SymbolRef]) -> String {
+fn unresolved_symbol_diagnostic(name: &str, references: &[SymbolRef]) -> Diagnostic {
     let first = &references[0].span;
+    Diagnostic {
+        file: first.path.display().to_string(),
+        line: Some(first.start_line),
+        col: Some(first.start_col),
+        severity: DiagnosticSeverity::Error,
+        code: Some("semantic.unresolved_symbol".to_string()),
+        message: format!(
+            "`{name}` has {} remaining reference(s) and no indexed definition after this edit",
+            references.len()
+        ),
+    }
+}
+
+fn post_edit_symbol_note(diagnostics: &[Diagnostic]) -> Option<String> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "## Post-edit symbol check\nPotential unresolved references after this edit:\n{}",
+        diagnostics
+            .iter()
+            .map(format_unresolved_symbol)
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
+}
+
+fn format_unresolved_symbol(diagnostic: &Diagnostic) -> String {
+    let line = diagnostic.line.unwrap_or(0);
+    let col = diagnostic.col.unwrap_or(0);
     format!(
-        "- `{name}` has {} remaining reference(s) and no indexed definition (first: {}:{}:{})",
-        references.len(),
-        first.path.display(),
-        first.start_line,
-        first.start_col
+        "- {} (first: {}:{line}:{col})",
+        diagnostic.message, diagnostic.file
     )
 }
 
@@ -722,6 +748,14 @@ mod tests {
             "got: {}",
             result.output
         );
+        let diagnostics = result.diagnostics.expect("semantic diagnostics");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(
+            diagnostics[0].code.as_deref(),
+            Some("semantic.unresolved_symbol")
+        );
+        assert!(diagnostics[0].message.contains("`helper`"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
