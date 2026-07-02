@@ -228,11 +228,12 @@ channel-email = [
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
 channel-lark = ["dep:prost"]
-channel-git = ["provider-github"]
-# Forge providers for the git channel. `provider-github` (GitHub Apps) is the
-# first provider; future forges (e.g. `provider-gitea`, `provider-gitlab`) add
-# their own sub-feature and deps here in follow-up PRs.
+channel-git = ["provider-github", "provider-gitea"]
+# Forge providers for the git channel. `provider-github` (GitHub Apps) and
+# `provider-gitea` (Gitea/Forgejo PAT) are default-on under `channel-git`;
+# future forges (e.g. `provider-gitlab`) add their own sub-feature and deps here.
 provider-github = ["dep:jsonwebtoken", "dep:thiserror"]
+provider-gitea = []
 channel-line = []
 channel-nostr = ["dep:nostr-sdk"]
 whatsapp-web = [

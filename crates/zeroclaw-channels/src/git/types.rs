@@ -122,6 +122,8 @@ pub enum GitChannelError {
     NoInstallation,
     #[error("git provider has {0} installations; set `installation_id` to choose one")]
     MultipleInstallations(usize),
+    #[error("git provider configuration error: {0}")]
+    Config(String),
     #[error("invalid git recipient `{0}` (expected `owner/repo#number`)")]
     BadRecipient(String),
     #[error(transparent)]

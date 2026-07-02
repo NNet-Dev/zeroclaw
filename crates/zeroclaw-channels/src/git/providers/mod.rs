@@ -6,5 +6,7 @@
 //! needs. A new forge (e.g. GitLab) drops in here as `pub mod gitlab;`
 //! with zero edits to the generic `git` core.
 
+#[cfg(feature = "provider-gitea")]
+pub mod gitea;
 #[cfg(feature = "provider-github")]
 pub mod github;

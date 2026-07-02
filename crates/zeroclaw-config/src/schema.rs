@@ -15698,6 +15698,21 @@ pub struct GitConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_id: Option<u64>,
+    /// Gitea/Forgejo API base URL, including `/api/v1`, for example
+    /// `https://git.example.org/api/v1`. Defaults to the public Gitea
+    /// service when omitted. Gitea/Forgejo provider only.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    /// Personal access token for Gitea/Forgejo API requests. The token needs
+    /// repository read access plus issue/PR comment write access for replies
+    /// and reactions. Gitea/Forgejo provider only.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub access_token: String,
     /// Repositories to poll, as `owner/repo`. Empty = every repository
     /// visible to the installation.
     #[tab(Advanced)]
@@ -15768,6 +15783,8 @@ impl Default for GitConfig {
             app_id: 0,
             private_key_path: String::new(),
             installation_id: None,
+            api_base_url: None,
+            access_token: String::new(),
             repos: Vec::new(),
             poll_interval_secs: default_github_poll_interval_secs(),
             mention_only: true,
@@ -20995,6 +21012,44 @@ mod tests {
         let bare: GitConfig = ::toml::from_str("enabled = true").unwrap();
         assert!(bare.events.is_empty());
         assert!(!bare.events_backbone);
+    }
+
+    #[test]
+    async fn git_gitea_provider_fields_parse() {
+        let cfg: GitConfig = ::toml::from_str(
+            r#"
+            enabled = true
+            provider = "forgejo"
+            api_base_url = "https://git.example.org/api/v1"
+            access_token = "token-value"
+            repos = ["team/project"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.provider, "forgejo");
+        assert_eq!(
+            cfg.api_base_url.as_deref(),
+            Some("https://git.example.org/api/v1")
+        );
+        assert_eq!(cfg.access_token, "token-value");
+        assert_eq!(cfg.repos, vec!["team/project"]);
+    }
+
+    #[test]
+    async fn git_gitea_access_token_is_secret() {
+        assert!(GitConfig::prop_is_secret("channels.git.access_token"));
+
+        let cfg = GitConfig {
+            access_token: "token-value".to_string(),
+            ..Default::default()
+        };
+        let fields = cfg.secret_fields();
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "channels.git.access_token" && field.is_set),
+            "Gitea/Forgejo access_token must be secret-classified and set"
+        );
     }
 
     #[test]

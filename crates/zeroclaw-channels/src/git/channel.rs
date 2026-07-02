@@ -56,7 +56,20 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
             }
         }
         "gitea" | "forgejo" => {
-            anyhow::bail!("git channel provider `gitea`/`forgejo` is not available in this build")
+            #[cfg(feature = "provider-gitea")]
+            {
+                Ok(Box::new(super::providers::gitea::GiteaProvider::new(
+                    cfg.api_base_url.clone(),
+                    cfg.access_token.clone(),
+                    cfg.proxy_url.clone(),
+                )))
+            }
+            #[cfg(not(feature = "provider-gitea"))]
+            {
+                anyhow::bail!(
+                    "git channel provider `gitea`/`forgejo` requires the `provider-gitea` feature"
+                );
+            }
         }
         other => anyhow::bail!(
             "unknown git channel provider `{other}` (supported: github, gitea, forgejo)"
