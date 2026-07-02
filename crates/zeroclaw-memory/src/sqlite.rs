@@ -757,7 +757,7 @@ impl SqliteMemory {
             let until_ref = until_owned.as_deref();
 
             let mut sql =
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.superseded_by IS NULL AND 1=1"
                     .to_string();
@@ -800,7 +800,7 @@ impl SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: None,
+                    tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -932,7 +932,7 @@ impl Memory for SqliteMemory {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id \
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                      WHERE m.superseded_by IS NULL AND m.id IN ({placeholders})"
                 );
@@ -958,23 +958,54 @@ impl Memory for SqliteMemory {
                         row.get::<_, i64>(10)? != 0,
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
                     ))
                 })?;
 
                 let mut entry_map = std::collections::HashMap::new();
                 for row in rows {
-                    let (id, key, content, cat, ts, sid, ns, imp, sup, kind, pinned, alias, aid) =
-                        row?;
+                    let (
+                        id,
+                        key,
+                        content,
+                        cat,
+                        ts,
+                        sid,
+                        ns,
+                        imp,
+                        sup,
+                        kind,
+                        pinned,
+                        alias,
+                        aid,
+                        tenant,
+                    ) = row?;
                     entry_map.insert(
                         id,
                         (
                             key, content, cat, ts, sid, ns, imp, sup, kind, pinned, alias, aid,
+                            tenant,
                         ),
                     );
                 }
 
                 for scored in &merged {
-                    if let Some((key, content, cat, ts, sid, ns, imp, sup, kind, pinned, alias, aid)) = entry_map.remove(&scored.id) {
+                    if let Some((
+                        key,
+                        content,
+                        cat,
+                        ts,
+                        sid,
+                        ns,
+                        imp,
+                        sup,
+                        kind,
+                        pinned,
+                        alias,
+                        aid,
+                        tenant,
+                    )) = entry_map.remove(&scored.id)
+                    {
                         if let Some(s) = since_ref
                             && ts.as_str() < s {
                                 continue;
@@ -996,7 +1027,7 @@ impl Memory for SqliteMemory {
                             superseded_by: sup,
                             kind: Self::decode_kind(kind),
                             pinned,
-                            tenant_id: None,
+                            tenant_id: tenant,
                             agent_alias: alias,
                             agent_id: aid,
                         };
@@ -1053,7 +1084,7 @@ impl Memory for SqliteMemory {
                         param_idx += 1;
                     }
                     let sql = format!(
-                        "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id
+                        "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                          FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
                          WHERE m.superseded_by IS NULL AND ({where_clause}){time_conditions}
                          ORDER BY m.updated_at DESC
@@ -1089,7 +1120,7 @@ impl Memory for SqliteMemory {
                             superseded_by: row.get(8)?,
                             kind: Self::decode_kind(row.get(9)?),
                             pinned: row.get::<_, i64>(10)? != 0,
-                            tenant_id: None,
+                            tenant_id: row.get(13)?,
                             agent_alias: row.get(11)?,
                             agent_id: row.get(12)?,
                         })
@@ -1129,7 +1160,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.key = ?1",
             )?;
@@ -1148,7 +1179,7 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: None,
+                    tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -1174,7 +1205,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.key = ?1 AND m.agent_id = ?2",
             )?;
@@ -1193,7 +1224,7 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: None,
+                    tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -1237,7 +1268,7 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: None,
+                    tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -1246,7 +1277,7 @@ impl Memory for SqliteMemory {
             if let Some(ref cat) = category {
                 let cat_str = Self::category_to_str(cat);
                 let mut stmt = conn.prepare(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
                      WHERE m.superseded_by IS NULL AND m.category = ?1 ORDER BY m.updated_at DESC LIMIT ?2",
                 )?;
@@ -1261,7 +1292,7 @@ impl Memory for SqliteMemory {
                 }
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
                      WHERE m.superseded_by IS NULL ORDER BY m.updated_at DESC LIMIT ?1",
                 )?;
@@ -1536,7 +1567,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let mut sql =
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE 1=1"
                     .to_string();
@@ -1587,7 +1618,7 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: None,
+                    tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -1609,7 +1640,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1) \
                  ORDER BY m.created_at ASC",
@@ -1628,7 +1659,7 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: None,
+                    tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -3623,6 +3654,49 @@ mod tests {
                 .iter()
                 .any(|entry| entry.key == "pinned_readback" && entry.pinned)
         );
+    }
+
+    #[tokio::test]
+    async fn tenant_id_round_trips_through_get_list_recall_and_export() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "tenant_scoped",
+            "tenant scoped marker",
+            MemoryCategory::Core,
+            Some("session-tenant"),
+            StoreOptions::default().with_tenant_id("acme"),
+        )
+        .await
+        .unwrap();
+
+        let entry = mem
+            .get("tenant_scoped")
+            .await
+            .unwrap()
+            .expect("tenant-scoped row should be readable");
+        assert_eq!(entry.tenant_id.as_deref(), Some("acme"));
+
+        let listed = mem
+            .list(Some(&MemoryCategory::Core), Some("session-tenant"))
+            .await
+            .unwrap();
+        assert!(listed.iter().any(
+            |entry| entry.key == "tenant_scoped" && entry.tenant_id.as_deref() == Some("acme")
+        ));
+
+        let recalled = mem
+            .recall("marker", 10, Some("session-tenant"), None, None)
+            .await
+            .unwrap();
+        assert!(recalled.iter().any(
+            |entry| entry.key == "tenant_scoped" && entry.tenant_id.as_deref() == Some("acme")
+        ));
+
+        let exported = mem.export(&ExportFilter::default()).await.unwrap();
+        assert!(exported.iter().any(
+            |entry| entry.key == "tenant_scoped" && entry.tenant_id.as_deref() == Some("acme")
+        ));
     }
 
     #[tokio::test]
