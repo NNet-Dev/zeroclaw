@@ -6,6 +6,16 @@ use crate::channel::ChannelMessage;
 use crate::model_provider::{ChatMessage, ChatResponse};
 use crate::tool::ToolResult;
 
+/// Decision returned by a post-tool hook.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum AfterToolCallDecision {
+    /// Preserve the historical fire-and-forget behavior.
+    Continue,
+    /// Replace the tool result before it is recorded for the model.
+    RewriteResult(ToolResult),
+}
+
 /// Result of a modifying hook — continue with (possibly modified) data, or cancel.
 #[derive(Debug, Clone)]
 pub enum HookResult<T> {
@@ -35,7 +45,14 @@ pub trait HookHandler: Send + Sync {
     async fn on_session_end(&self, _session_id: &str, _channel: &str) {}
     async fn on_llm_input(&self, _messages: &[ChatMessage], _model: &str) {}
     async fn on_llm_output(&self, _response: &ChatResponse) {}
-    async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {}
+    async fn on_after_tool_call(
+        &self,
+        _tool: &str,
+        _result: &ToolResult,
+        _duration: Duration,
+    ) -> AfterToolCallDecision {
+        AfterToolCallDecision::Continue
+    }
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
 

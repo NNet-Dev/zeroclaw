@@ -1,6 +1,7 @@
 //! Post-execution recording: result log line, the `after_tool_call` hook, the
 //! completion Status, and filling the executed calls' `ordered_results` slots.
 
+use super::after_tool_decision::apply_after_tool_decisions;
 use super::context::TurnCtx;
 use super::events::StreamDelta;
 use super::redact::scrub_credentials;
@@ -20,7 +21,7 @@ pub(crate) async fn record_executed_outcomes(
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
 ) {
-    for ((idx, call), outcome) in executable_indices
+    for ((idx, call), mut outcome) in executable_indices
         .iter()
         .zip(executable_calls.iter())
         .zip(executed_outcomes)
@@ -51,16 +52,17 @@ pub(crate) async fn record_executed_outcomes(
             "tool_call_result"
         );
 
-        // ── Hook: after_tool_call (void) ─────────────────
+        // ── Hook: after_tool_call ─────────────────────────
         if let Some(hooks) = ctx.hooks {
             let tool_result_obj = crate::tools::ToolResult {
                 success: outcome.success,
                 output: outcome.output.clone().into(),
-                error: None,
+                error: outcome.error_reason.clone(),
             };
-            hooks
+            let decisions = hooks
                 .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
                 .await;
+            apply_after_tool_decisions(&mut outcome, decisions);
         }
 
         // ── Progress: tool completion ───────────────────────

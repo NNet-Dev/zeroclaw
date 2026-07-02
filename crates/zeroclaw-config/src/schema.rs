@@ -235,6 +235,12 @@ pub struct Config {
     #[group = "Agent"]
     pub pacing: PacingConfig,
 
+    /// Coding-agent reliability settings (`[coding]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub coding: crate::coding::CodingConfig,
+
     /// Skills loading and community repository behavior (`[skills]`).
     #[serde(default)]
     #[nested]
@@ -17076,6 +17082,7 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             pacing: PacingConfig::default(),
+            coding: crate::coding::CodingConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
@@ -23976,6 +23983,7 @@ auto_save = true
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
+            coding: crate::coding::CodingConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
@@ -24807,6 +24815,7 @@ default_temperature = 0.7
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
+            coding: crate::coding::CodingConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),

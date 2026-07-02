@@ -2208,6 +2208,7 @@ impl Agent {
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
+            coding: zeroclaw_config::coding::CodingConfig::default(),
             detect_protocol_without_tools: false,
         };
         // E3 never had pattern-based loop detection; default pacing turns it
@@ -2513,6 +2514,7 @@ impl Agent {
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
+            coding: zeroclaw_config::coding::CodingConfig::default(),
             detect_protocol_without_tools: false,
         };
         // The streaming engine never had pattern-based loop detection; default

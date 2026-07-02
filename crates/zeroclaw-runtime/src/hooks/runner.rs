@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::panic::AssertUnwindSafe;
 
 use zeroclaw_api::channel::ChannelMessage;
+use zeroclaw_api::hook::AfterToolCallDecision;
 use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
 
@@ -102,13 +103,18 @@ impl HookRunner {
         join_all(futs).await;
     }
 
-    pub async fn fire_after_tool_call(&self, tool: &str, result: &ToolResult, duration: Duration) {
+    pub async fn fire_after_tool_call(
+        &self,
+        tool: &str,
+        result: &ToolResult,
+        duration: Duration,
+    ) -> Vec<AfterToolCallDecision> {
         let futs: Vec<_> = self
             .handlers
             .iter()
             .map(|h| h.on_after_tool_call(tool, result, duration))
             .collect();
-        join_all(futs).await;
+        join_all(futs).await
     }
 
     pub async fn fire_message_sent(&self, channel: &str, recipient: &str, content: &str) {

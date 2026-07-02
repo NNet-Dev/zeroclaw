@@ -1,5 +1,6 @@
 //! The agent turn engine, decomposed into single-purpose step modules.
 
+pub(crate) mod after_tool_decision;
 pub(crate) mod approval_gate;
 pub(crate) mod call_prep;
 pub(crate) mod context;
@@ -22,6 +23,7 @@ pub(crate) mod steering;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
 pub(crate) mod tool_specs;
+pub(crate) mod verify;
 pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
@@ -59,6 +61,7 @@ pub use steering::drain_steering_messages;
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
+use verify::{BaselineStore, VerifyDecision, capture_verify_baselines, run_verify_stage};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
@@ -82,6 +85,7 @@ use zeroclaw_providers::{ChatMessage, ModelProvider};
 
 /// Maximum malformed internal tool-protocol retries before returning a safe fallback.
 pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
+pub(crate) const MAX_VERIFY_REPAIR_TURNS: usize = 2;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
@@ -274,6 +278,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     } else {
         max_tool_iterations
     };
+    let coding = &knobs.coding;
 
     let loop_started_at = Instant::now();
     let loop_ignore_tools: HashSet<&str> = pacing
@@ -303,6 +308,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    let mut verify_repair_turns: usize = 0;
+    let mut verify_baselines = BaselineStore::default();
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
@@ -865,6 +872,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         .await?;
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
+        capture_verify_baselines(coding, &executable_calls, &mut verify_baselines).await;
         let execution_result =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
@@ -985,6 +993,16 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
+        let max_verify_repair_turns = coding.verify.max_repair_turns.min(MAX_VERIFY_REPAIR_TURNS);
+        let verify_decision = run_verify_stage(
+            coding,
+            &tool_calls,
+            &ordered_results,
+            &mut verify_baselines,
+            max_verify_repair_turns.saturating_sub(verify_repair_turns),
+        )
+        .await;
+
         let CollectedResults {
             individual_results,
             tool_results,
@@ -1027,6 +1045,22 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         );
         if let Some(out) = new_messages_out.as_deref_mut() {
             out.extend_from_slice(&history[appended_from..]);
+        }
+
+        match verify_decision {
+            VerifyDecision::Pass => {}
+            VerifyDecision::Repair { payload } => {
+                verify_repair_turns += 1;
+                let repair_message = ChatMessage::user(&payload);
+                history.push(repair_message.clone());
+                if let Some(out) = new_messages_out.as_deref_mut() {
+                    out.push(repair_message);
+                }
+                continue;
+            }
+            VerifyDecision::Surface { payload } => {
+                return Ok(payload);
+            }
         }
 
         if cancelled_mid_batch {

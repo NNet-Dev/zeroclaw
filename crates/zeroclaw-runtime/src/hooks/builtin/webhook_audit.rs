@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::hooks::traits::{HookHandler, HookResult};
+use crate::hooks::traits::{AfterToolCallDecision, HookHandler, HookResult};
 use zeroclaw_api::tool::ToolResult;
 use zeroclaw_config::schema::WebhookAuditConfig;
 
@@ -267,15 +267,20 @@ impl HookHandler for WebhookAuditHook {
         HookResult::Continue((name, args))
     }
 
-    async fn on_after_tool_call(&self, tool: &str, result: &ToolResult, duration: Duration) {
+    async fn on_after_tool_call(
+        &self,
+        tool: &str,
+        result: &ToolResult,
+        duration: Duration,
+    ) -> AfterToolCallDecision {
         // Skip if no URL configured.
         if self.config.url.is_empty() {
-            return;
+            return AfterToolCallDecision::Continue;
         }
 
         // Skip tools that don't match the configured patterns.
         if !matches_any_pattern(&self.config.tool_patterns, tool) {
-            return;
+            return AfterToolCallDecision::Continue;
         }
 
         // Pop the first captured args entry for this tool (FIFO) and optionally truncate.
@@ -332,6 +337,8 @@ impl HookHandler for WebhookAuditHook {
                 }
             }
         });
+
+        AfterToolCallDecision::Continue
     }
 }
 

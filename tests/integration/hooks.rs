@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use zeroclaw::hooks::{HookHandler, HookResult, HookRunner};
+use zeroclaw::hooks::{AfterToolCallDecision, HookHandler, HookResult, HookRunner};
 use zeroclaw::tools::ToolResult;
 
 struct CounterHook {
@@ -21,8 +21,14 @@ impl HookHandler for CounterHook {
         self.gateway_starts.fetch_add(1, Ordering::SeqCst);
     }
 
-    async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {
+    async fn on_after_tool_call(
+        &self,
+        _tool: &str,
+        _result: &ToolResult,
+        _duration: Duration,
+    ) -> AfterToolCallDecision {
         self.tool_calls.fetch_add(1, Ordering::SeqCst);
+        AfterToolCallDecision::Continue
     }
 }
 

@@ -1768,6 +1768,10 @@ pub async fn run(
                         thinking_params.system_prompt_prefix.as_deref(),
                     )?;
                 }
+                let loop_knobs = LoopKnobs {
+                    coding: config.coding.clone(),
+                    ..LoopKnobs::default()
+                };
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .scope(
                         thinking_params.native_thinking,
@@ -1803,7 +1807,7 @@ pub async fn run(
                                         context_token_budget: agent
                                             .resolved
                                             .effective_context_budget(),
-                                        knobs: &LoopKnobs::default(),
+                                        knobs: &loop_knobs,
                                     },
                                 ),
                                 history: &mut history,
@@ -2305,6 +2309,10 @@ pub async fn run(
                             thinking_params.system_prompt_prefix.as_deref(),
                         )?;
                     }
+                    let loop_knobs = LoopKnobs {
+                        coding: config.coding.clone(),
+                        ..LoopKnobs::default()
+                    };
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .scope(
                             thinking_params.native_thinking,
@@ -2346,7 +2354,7 @@ pub async fn run(
                                             context_token_budget: agent
                                                 .resolved
                                                 .effective_context_budget(),
-                                            knobs: &LoopKnobs::default(),
+                                            knobs: &loop_knobs,
                                         },
                                     ),
                                     history: &mut history,

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::hooks::traits::HookHandler;
+use zeroclaw_api::hook::AfterToolCallDecision;
 use zeroclaw_api::tool::ToolResult;
 
 /// Logs tool calls for auditing.
@@ -39,7 +40,12 @@ impl HookHandler for CommandLoggerHook {
         -50
     }
 
-    async fn on_after_tool_call(&self, tool: &str, result: &ToolResult, duration: Duration) {
+    async fn on_after_tool_call(
+        &self,
+        tool: &str,
+        result: &ToolResult,
+        duration: Duration,
+    ) -> AfterToolCallDecision {
         let entry = format!(
             "[{}] {} ({}ms) success={}",
             chrono::Utc::now().format("%H:%M:%S"),
@@ -54,6 +60,7 @@ impl HookHandler for CommandLoggerHook {
             &format!("{}", entry)
         );
         self.log.lock().unwrap().push(entry);
+        AfterToolCallDecision::Continue
     }
 }
 
