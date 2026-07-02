@@ -160,9 +160,16 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+use zeroclaw_config::schema::{AliasedAgentConfig, Config, SandboxBackend, SandboxConfig};
 use zeroclaw_memory::Memory;
 
+const DEFAULT_TOOLS_RUNTIME_KIND: &str = "native";
+
+/// Per-tool channel-map handle — `Arc<RwLock<HashMap<channel_name, channel>>>`.
+///
+/// Each channel-driven tool owns its own handle so callers can populate it
+/// independently (late-bound registration). Shared alias of the same
+/// underlying type formerly known as `ChannelMapHandle`.
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
 
@@ -271,10 +278,16 @@ pub fn default_tools_with_runtime(
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
     let persistent_writes = runtime.has_filesystem_access();
+    let sandbox = create_sandbox(
+        &sandbox_config_from_security_policy(&security),
+        DEFAULT_TOOLS_RUNTIME_KIND,
+        Some(&security.workspace_dir),
+    );
     vec![
         Box::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                ShellTool::new(security.clone(), runtime).with_persistent_writes(persistent_writes),
+                ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+                    .with_persistent_writes(persistent_writes),
                 security.clone(),
             ),
             security.clone(),
@@ -311,6 +324,32 @@ pub fn default_tools_with_runtime(
     ]
 }
 
+fn sandbox_config_from_security_policy(security: &SecurityPolicy) -> SandboxConfig {
+    SandboxConfig {
+        enabled: security.sandbox_enabled,
+        backend: sandbox_backend_from_policy(security.sandbox_backend.as_deref()),
+        firejail_args: security.firejail_args.clone(),
+    }
+}
+
+fn sandbox_backend_from_policy(backend: Option<&str>) -> SandboxBackend {
+    let Some(backend) = backend.map(str::trim).filter(|backend| !backend.is_empty()) else {
+        return SandboxBackend::default();
+    };
+    let normalized = match backend.to_ascii_lowercase().as_str() {
+        "sandboxexec" | "seatbelt" => "sandbox-exec".to_string(),
+        backend => backend.to_string(),
+    };
+
+    serde_json::from_value::<SandboxBackend>(serde_json::Value::String(normalized))
+        .unwrap_or_default()
+}
+
+/// Register skill-defined tools into an existing tool registry.
+///
+/// Converts each skill's `[[tools]]` entries into callable `Tool` implementations
+/// and appends them to the registry. Skill tools that would shadow a built-in tool
+/// name are skipped with a warning.
 pub fn register_skill_tools(
     tools_registry: &mut Vec<Box<dyn Tool>>,
     skills: &[crate::skills::Skill],
@@ -1681,6 +1720,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_tools_sandbox_config_uses_security_policy() {
+        let security = SecurityPolicy {
+            sandbox_enabled: Some(false),
+            sandbox_backend: Some("seatbelt".into()),
+            firejail_args: vec!["--private".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let sandbox_config = sandbox_config_from_security_policy(&security);
+
+        assert_eq!(sandbox_config.enabled, Some(false));
+        assert!(matches!(
+            sandbox_config.backend,
+            zeroclaw_config::schema::SandboxBackend::SandboxExec
+        ));
+        assert_eq!(sandbox_config.firejail_args, vec!["--private"]);
+    }
+
+    #[test]
+    fn sandbox_backend_from_policy_defaults_unknown_or_empty_to_auto() {
+        assert!(matches!(
+            sandbox_backend_from_policy(Some("unknown-backend")),
+            zeroclaw_config::schema::SandboxBackend::Auto
+        ));
+        assert!(matches!(
+            sandbox_backend_from_policy(Some("   ")),
+            zeroclaw_config::schema::SandboxBackend::Auto
+        ));
+        assert!(matches!(
+            sandbox_backend_from_policy(None),
+            zeroclaw_config::schema::SandboxBackend::Auto
+        ));
+    }
+
+    /// Regression: SOP tools must NOT appear in the tool registry when the
+    /// engine handle is not provided (i.e. no `sops_dir` configured).
+    /// Proves the production gating path at `all_tools_with_runtime`.
     #[test]
     fn sop_tools_absent_when_engine_not_provided() {
         let tmp = TempDir::new().unwrap();

