@@ -828,7 +828,7 @@ mod tests {
     // alias retains its own source rates in the snapshot (no cross-alias collapse).
     #[test]
     fn alias_boundary_two_opted_in_aliases_have_own_source_rates() {
-        let wanted = vec![
+        let wanted = [
             want("kilo.primary", "minimax-m2.7", Some("kilo")),
             want("kilo.secondary", "minimax-m2.7", Some("kilo")),
         ];
