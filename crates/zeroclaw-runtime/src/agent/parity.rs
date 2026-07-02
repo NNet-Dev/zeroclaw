@@ -141,6 +141,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 activated_tools: None,
                 model_switch_callback: None,
                 receipt_generator: None,
+                symbol_context_provider: None,
             },
             ResolvedRuntimeKnobs {
                 max_tool_iterations: 5,
@@ -219,6 +220,7 @@ fn a4_policy() -> Arc<SecurityPolicy> {
 fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
     AllToolsResult {
         tools,
+        code_intel: None,
         delegate_handle: None,
         ask_user_handle: None,
         reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),

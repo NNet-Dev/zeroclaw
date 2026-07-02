@@ -47,6 +47,7 @@ pub use zeroclaw_tools::claude_code_runner::ClaudeCodeRunnerTool;
 pub use zeroclaw_tools::cli_discovery::{DiscoveredCli, discover_cli_tools};
 pub use zeroclaw_tools::cloud_ops::CloudOpsTool;
 pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
+pub use zeroclaw_tools::code_intel::CodeIntel;
 pub use zeroclaw_tools::codex_cli::CodexCliTool;
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
@@ -108,6 +109,7 @@ pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+pub use zeroclaw_tools::symbol_search::SymbolSearchTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
 pub use zeroclaw_tools::weather_tool::WeatherTool;
@@ -496,6 +498,8 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// Shared code-intelligence facade constructed with the tool registry.
+    pub code_intel: Option<Arc<CodeIntel>>,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
@@ -602,6 +606,18 @@ pub fn all_tools_with_runtime(
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    let mut code_intel = None;
+    if config.coding.code_intel.enabled
+        && (config.coding.code_intel.symbol_search_tool
+            || config.coding.code_intel.pre_edit_injection
+            || config.coding.code_intel.post_edit_check)
+    {
+        let code_intel_config = config.clone();
+        code_intel = Some(Arc::new(CodeIntel::new(
+            security.workspace_dir.clone(),
+            Arc::new(move || code_intel_config.coding.code_intel.clone()),
+        )));
+    }
     // Keep a shared runtime adapter available after constructing ShellTool.
     // Independent agentic delegates use it later to build the target-owned tool
     // registry; bounded delegates continue to use the parent `tool_arcs`
@@ -630,14 +646,16 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
+                FileWriteTool::new_with_persistence(security.clone(), persistent_writes)
+                    .with_code_intel(code_intel.clone()),
                 security.clone(),
             ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                FileEditTool::new_with_persistence(security.clone(), persistent_writes),
+                FileEditTool::new_with_persistence(security.clone(), persistent_writes)
+                    .with_code_intel(code_intel.clone()),
                 security.clone(),
             ),
             security.clone(),
@@ -705,6 +723,15 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(TodoWriteTool::new()),
     ];
+
+    if config.coding.code_intel.symbol_search_tool
+        && let Some(facade) = &code_intel
+    {
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(SymbolSearchTool::new(facade.clone()), security.clone()),
+            security.clone(),
+        )));
+    }
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
@@ -1358,6 +1385,7 @@ pub fn all_tools_with_runtime(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
+                    code_intel,
                 };
             }
 
@@ -1616,6 +1644,7 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
+        code_intel,
     }
 }
 

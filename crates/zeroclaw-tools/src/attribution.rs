@@ -67,6 +67,8 @@ use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+#[cfg(feature = "code-intel")]
+use crate::symbol_search::SymbolSearchTool;
 use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
 use crate::weather_tool::WeatherTool;
@@ -88,6 +90,8 @@ tool_attribution!(CloudPatternsTool, ToolKind::Plugin);
 tool_attribution!(CodexCliTool, ToolKind::Plugin);
 tool_attribution!(ComposioTool, ToolKind::Plugin);
 tool_attribution!(ContentSearchTool, ToolKind::Search);
+#[cfg(feature = "code-intel")]
+tool_attribution!(SymbolSearchTool, ToolKind::Search);
 tool_attribution!(DataManagementTool, ToolKind::Plugin);
 tool_attribution!(DiscordSearchTool, ToolKind::Search);
 tool_attribution!(EscalateToHumanTool, ToolKind::Wait);

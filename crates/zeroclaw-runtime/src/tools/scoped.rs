@@ -181,6 +181,9 @@ impl ScopedToolRegistry {
         let AllToolsResult {
             tools: mut tools_registry,
             delegate_handle,
+            // CodeIntel is consumed at the loop level (pre-edit symbol context),
+            // extracted by callers before assembly; the registry has no use for it.
+            code_intel: _,
             ask_user_handle,
             reaction_handle,
             poll_handle,
@@ -578,6 +581,7 @@ mod tests {
         AllToolsResult {
             tools,
             delegate_handle: None,
+            code_intel: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             poll_handle: None,

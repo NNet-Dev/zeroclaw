@@ -25,6 +25,7 @@ glob = "0.3"
 hex = "0.4"
 infer = { version = "0.19", default-features = false }
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
+inkjet = { version = "0.11.1", optional = true, default-features = false, features = ["language-rust", "language-python", "language-typescript"] }
 nanohtml2text = "0.2"
 parking_lot = "0.12"
 probe-rs = { version = "0.31", optional = true }
@@ -53,8 +54,9 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 webpki-roots = "1.0.6"
 
 [features]
-default = []
+default = ["code-intel"]
 browser-native = ["dep:fantoccini"]
+code-intel = ["dep:inkjet"]
 probe = ["dep:probe-rs"]
 # Exposes cross-crate test-only constructors (e.g.
 # `McpRegistry::for_test_with_server_count`) so downstream test

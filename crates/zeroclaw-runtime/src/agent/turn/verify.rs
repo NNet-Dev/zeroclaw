@@ -422,7 +422,10 @@ mod tests {
         fs::write(&edited_path, "").expect("write edited file");
         fs::write(temp.path().join("diagnostics.txt"), "old failure\n").expect("write baseline");
 
-        let mut coding = CodingConfig { verify: cfg() };
+        let mut coding = CodingConfig {
+            verify: cfg(),
+            ..CodingConfig::default()
+        };
         coding
             .verify
             .commands
@@ -467,7 +470,10 @@ mod tests {
         let edited_path = temp.path().join("src/lib.rs");
         fs::write(&edited_path, "").expect("write edited file");
 
-        let mut coding = CodingConfig { verify: cfg() };
+        let mut coding = CodingConfig {
+            verify: cfg(),
+            ..CodingConfig::default()
+        };
         coding.verify.baseline_delta = false;
         coding
             .verify

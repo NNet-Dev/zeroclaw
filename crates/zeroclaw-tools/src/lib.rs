@@ -19,6 +19,8 @@ pub mod claude_code_runner;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
+#[cfg(feature = "code-intel")]
+pub mod code_intel;
 pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
@@ -80,6 +82,8 @@ pub mod report_templates;
 pub mod screenshot;
 pub mod send_via;
 pub mod sessions;
+#[cfg(feature = "code-intel")]
+pub mod symbol_search;
 pub mod text_browser;
 pub mod tool_search;
 pub mod weather_tool;

@@ -94,6 +94,7 @@ pub async fn maybe_run_skill_review(
                         activated_tools: None,
                         model_switch_callback: None,
                         receipt_generator: None,
+                        symbol_context_provider: None,
                     },
                     crate::agent::loop_::ResolvedRuntimeKnobs {
                         max_tool_iterations: config.max_review_iterations as usize,

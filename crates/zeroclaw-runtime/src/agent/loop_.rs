@@ -610,6 +610,7 @@ fn build_system_prompt_for_turn(
     max_system_prompt_chars: usize,
     inject_memory: bool,
     show_tool_calls: bool,
+    verified_symbol_context: Option<&str>,
     thinking_prefix: Option<&str>,
 ) -> Result<String> {
     let native_tools = model_provider.supports_native_tools();
@@ -648,6 +649,7 @@ fn build_system_prompt_for_turn(
         max_system_prompt_chars,
         inject_memory,
         show_tool_calls,
+        verified_symbol_context,
     );
 
     if expose_text_tool_protocol {
@@ -667,6 +669,53 @@ fn build_system_prompt_for_turn(
     Ok(system_prompt)
 }
 
+fn symbol_context_refresh_for_tool_calls<F>(
+    code_intel: Option<&tools::CodeIntel>,
+    config: &Config,
+    tool_calls: &[ParsedToolCall],
+    compact_context: bool,
+    build_prompt: F,
+) -> Option<SymbolContextRefresh>
+where
+    F: FnOnce(&str) -> Result<String>,
+{
+    if !config.coding.code_intel.enabled || !config.coding.code_intel.pre_edit_injection {
+        return None;
+    }
+    let max_chars = config.coding.code_intel.max_injection_chars;
+    if max_chars == 0 {
+        return None;
+    }
+    let targets = crate::agent::symbol_context::edit_targets_from_tool_calls(tool_calls);
+    if targets.is_empty() {
+        return None;
+    }
+    let section = crate::agent::symbol_context::build_symbol_context_section(
+        code_intel?,
+        &targets,
+        compact_context,
+        max_chars,
+    )?;
+    let system_prompt = build_prompt(&section).ok()?;
+    Some(SymbolContextRefresh {
+        key: crate::agent::symbol_context::edit_targets_key(&targets),
+        system_prompt,
+    })
+}
+
+/// Build a `query_summary` field for memory observability events from a raw
+/// user query.
+///
+/// Applies [`scrub_credentials`] first, then truncates to ≤200 content
+/// chars via [`truncate_with_ellipsis`] (which appends a 3-char `...`
+/// ellipsis when truncation occurred, so summaries are ≤203 chars total).
+/// The order matters: `scrub_credentials` may insert placeholder
+/// substrings, so truncating first risks chopping a half-token.
+///
+/// Returns `None` for empty input so observers can distinguish "no query
+/// recorded" from "empty query string". Always call this helper at memory
+/// emit sites — never inline the scrub-then-truncate pattern, since that
+/// invites drift where one site accidentally skips the scrubber.
 pub fn make_query_summary(raw: &str) -> Option<String> {
     if raw.is_empty() {
         return None;
@@ -822,6 +871,7 @@ pub async fn agent_turn(
                 activated_tools,
                 model_switch_callback,
                 receipt_generator: None,
+                symbol_context_provider: None,
             },
             ResolvedRuntimeKnobs {
                 max_tool_iterations,
@@ -896,8 +946,9 @@ pub(crate) use super::turn::{
 pub use super::turn::{
     DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
     PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
-    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+    ResolvedRuntimeKnobs, StreamDelta, SymbolContextRefresh, ToolLoop, ToolLoopCancelled,
+    drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop,
+    scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1229,6 +1280,7 @@ pub async fn run(
             sop_audit,
             None,
         );
+        let code_intel = all_tools_result.code_intel.clone();
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
@@ -1564,6 +1616,7 @@ pub async fn run(
             true,
             config.channels.show_tool_calls,
             None,
+            None,
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
@@ -1659,6 +1712,7 @@ pub async fn run(
                 eff_max_system_prompt_chars,
                 true,
                 config.channels.show_tool_calls,
+                None,
                 thinking_params.system_prompt_prefix.as_deref(),
             )?;
 
@@ -1765,12 +1819,45 @@ pub async fn run(
                         eff_max_system_prompt_chars,
                         true,
                         config.channels.show_tool_calls,
+                        None,
                         thinking_params.system_prompt_prefix.as_deref(),
                     )?;
                 }
                 let loop_knobs = LoopKnobs {
                     coding: config.coding.clone(),
                     ..LoopKnobs::default()
+                };
+                let symbol_context_provider = |tool_calls: &[ParsedToolCall]| {
+                    symbol_context_refresh_for_tool_calls(
+                        code_intel.as_deref(),
+                        &config,
+                        tool_calls,
+                        eff_compact_context,
+                        |section| {
+                            build_system_prompt_for_turn(
+                                &agent_workspace,
+                                &model_name,
+                                &tool_descs,
+                                &deferred_section,
+                                &skills,
+                                Some(&agent.identity),
+                                bootstrap_max_chars,
+                                &risk_profile,
+                                model_provider.as_ref(),
+                                &tools_registry,
+                                &excluded_tools,
+                                activated_handle.as_ref(),
+                                agent.resolved.strict_tool_parsing,
+                                config.skills.prompt_injection_mode,
+                                eff_compact_context,
+                                eff_max_system_prompt_chars,
+                                true,
+                                config.channels.show_tool_calls,
+                                Some(section),
+                                thinking_params.system_prompt_prefix.as_deref(),
+                            )
+                        },
+                    )
                 };
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .scope(
@@ -1795,6 +1882,7 @@ pub async fn run(
                                         activated_tools: activated_handle.as_ref(),
                                         model_switch_callback: Some(model_switch_callback.clone()),
                                         receipt_generator: None,
+                                        symbol_context_provider: Some(&symbol_context_provider),
                                     },
                                     ResolvedRuntimeKnobs {
                                         max_tool_iterations: agent.resolved.max_tool_iterations,
@@ -2306,12 +2394,45 @@ pub async fn run(
                             eff_max_system_prompt_chars,
                             true,
                             config.channels.show_tool_calls,
+                            None,
                             thinking_params.system_prompt_prefix.as_deref(),
                         )?;
                     }
                     let loop_knobs = LoopKnobs {
                         coding: config.coding.clone(),
                         ..LoopKnobs::default()
+                    };
+                    let symbol_context_provider = |tool_calls: &[ParsedToolCall]| {
+                        symbol_context_refresh_for_tool_calls(
+                            code_intel.as_deref(),
+                            &config,
+                            tool_calls,
+                            eff_compact_context,
+                            |section| {
+                                build_system_prompt_for_turn(
+                                    &agent_workspace,
+                                    &model_name,
+                                    &tool_descs,
+                                    &deferred_section,
+                                    &skills,
+                                    Some(&agent.identity),
+                                    bootstrap_max_chars,
+                                    &risk_profile,
+                                    model_provider.as_ref(),
+                                    &tools_registry,
+                                    &excluded_tools,
+                                    activated_handle.as_ref(),
+                                    agent.resolved.strict_tool_parsing,
+                                    config.skills.prompt_injection_mode,
+                                    eff_compact_context,
+                                    eff_max_system_prompt_chars,
+                                    true,
+                                    config.channels.show_tool_calls,
+                                    Some(section),
+                                    thinking_params.system_prompt_prefix.as_deref(),
+                                )
+                            },
+                        )
                     };
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .scope(
@@ -2338,6 +2459,7 @@ pub async fn run(
                                                 model_switch_callback.clone(),
                                             ),
                                             receipt_generator: None,
+                                            symbol_context_provider: Some(&symbol_context_provider),
                                         },
                                         ResolvedRuntimeKnobs {
                                             max_tool_iterations: agent.resolved.max_tool_iterations,
@@ -3048,6 +3170,7 @@ pub async fn process_message(
                 eff_max_system_prompt_chars,
                 false,
                 config.channels.show_tool_calls,
+                None,
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -4937,6 +5060,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -5011,6 +5135,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -5092,6 +5217,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -5178,6 +5304,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -5249,6 +5376,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -5323,6 +5451,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -5398,6 +5527,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -5460,6 +5590,7 @@ mod tests {
                     max_tool_result_chars: 0,
                     context_token_budget: 0,
                     receipt_generator: None,
+                    symbol_context_provider: None,
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
@@ -5643,6 +5774,7 @@ mod tests {
                     max_tool_result_chars: 0,
                     context_token_budget: 0,
                     receipt_generator: None,
+                    symbol_context_provider: None,
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
@@ -5765,6 +5897,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -5839,6 +5972,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -5912,6 +6046,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -6071,6 +6206,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -6209,6 +6345,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -6367,6 +6504,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -6482,6 +6620,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -6653,6 +6792,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -6759,6 +6899,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -6849,6 +6990,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -6931,6 +7073,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7021,6 +7164,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7114,6 +7258,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7212,6 +7357,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7307,6 +7453,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &knobs,
             },
             history: &mut history,
@@ -7402,6 +7549,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7502,6 +7650,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7592,6 +7741,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7686,6 +7836,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7782,6 +7933,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7864,6 +8016,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -7950,6 +8103,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8031,6 +8185,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8110,6 +8265,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8192,6 +8348,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8271,6 +8428,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8349,6 +8507,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8419,6 +8578,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8490,6 +8650,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8561,6 +8722,7 @@ mod tests {
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8634,6 +8796,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8712,6 +8875,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8802,6 +8966,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8875,6 +9040,7 @@ Done."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8951,6 +9117,7 @@ Done."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -9025,6 +9192,7 @@ Done."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -9100,6 +9268,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -9232,6 +9401,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -9315,6 +9485,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -9402,6 +9573,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -9512,6 +9684,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -9627,6 +9800,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -9716,6 +9890,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -9816,6 +9991,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -10696,6 +10872,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -10798,6 +10975,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -10899,6 +11077,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -11000,6 +11179,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -11156,6 +11336,7 @@ This is an example, not an invocation."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -12492,6 +12673,7 @@ Let me check the result."#;
             true,
             false,
             None,
+            None,
         )
         .expect("startup prompt should build");
         assert!(startup_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
@@ -12523,6 +12705,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("no-tools turn prompt should build");
@@ -12558,6 +12741,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("tools turn prompt should build");
@@ -13473,6 +13657,7 @@ Let me check the result."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -13648,6 +13833,7 @@ Let me check the result."#;
                         max_tool_result_chars: 0,
                         context_token_budget: 0,
                         receipt_generator: None,
+                        symbol_context_provider: None,
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
@@ -13722,6 +13908,7 @@ Let me check the result."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -13835,6 +14022,7 @@ Let me check the result."#;
                         max_tool_result_chars: 0,
                         context_token_budget: 0,
                         receipt_generator: None,
+                        symbol_context_provider: None,
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
@@ -13914,6 +14102,7 @@ Let me check the result."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -14000,6 +14189,7 @@ Let me check the result."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 50,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -15143,6 +15333,7 @@ Let me check the result."#;
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
+                symbol_context_provider: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,

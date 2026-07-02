@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::{ModelProvider, ProviderDispatch};
+use zeroclaw_tool_call_parser::ParsedToolCall;
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -12,6 +13,14 @@ use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
 use crate::tools::{ActivatedToolSet, Tool};
+
+pub struct SymbolContextRefresh {
+    pub key: String,
+    pub system_prompt: String,
+}
+
+pub type SymbolContextProvider<'a> =
+    &'a (dyn Fn(&[ParsedToolCall]) -> Option<SymbolContextRefresh> + Send + Sync);
 
 /// The resolved model binding: which provider, model, and temperature a turn
 /// uses. The base layer any LLM call needs; [`ResolvedAgentExecution`] composes
@@ -79,6 +88,8 @@ pub struct ResolvedAgentExecution<'a> {
     pub context_token_budget: usize,
     /// Tool-receipt tracer; `None` when receipts are off.
     pub receipt_generator: Option<&'a ReceiptGenerator>,
+    /// Optional prompt refresh producer for explicit pending edit/write calls.
+    pub symbol_context_provider: Option<SymbolContextProvider<'a>>,
     /// Fine-grained loop behavior flags.
     pub knobs: &'a LoopKnobs,
 }
@@ -96,6 +107,7 @@ pub struct ResolvedIo<'a> {
     pub activated_tools: Option<&'a Arc<Mutex<ActivatedToolSet>>>,
     pub model_switch_callback: Option<ModelSwitchCallback>,
     pub receipt_generator: Option<&'a ReceiptGenerator>,
+    pub symbol_context_provider: Option<SymbolContextProvider<'a>>,
 }
 
 /// The resolved per-agent runtime knobs half of [`ResolvedAgentExecution::resolve`]'s
@@ -138,6 +150,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             max_tool_result_chars: runtime.max_tool_result_chars,
             context_token_budget: runtime.context_token_budget,
             receipt_generator: io.receipt_generator,
+            symbol_context_provider: io.symbol_context_provider,
             knobs: runtime.knobs,
         }
     }

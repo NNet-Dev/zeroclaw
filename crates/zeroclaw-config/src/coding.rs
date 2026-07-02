@@ -13,6 +13,52 @@ pub struct CodingConfig {
     #[serde(default)]
     #[nested]
     pub verify: VerifyConfig,
+    /// Code-intelligence backend settings (`[coding.code_intel]`).
+    #[serde(default)]
+    #[nested]
+    pub code_intel: CodeIntelConfig,
+}
+
+/// Tree-sitter-backed code-intelligence settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "coding.code_intel"]
+pub struct CodeIntelConfig {
+    /// Enable the code-intelligence backend and symbol pull-tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Register the symbol_search pull-tool when code intelligence is enabled.
+    #[serde(default = "default_symbol_search_tool")]
+    pub symbol_search_tool: bool,
+    /// Enable proactive pre-edit symbol context injection.
+    #[serde(default = "default_pre_edit_injection")]
+    pub pre_edit_injection: bool,
+    /// Enable post-edit symbol checks.
+    #[serde(default = "default_post_edit_check")]
+    pub post_edit_check: bool,
+    /// Maximum characters available to future injected symbol context.
+    #[serde(default = "default_max_injection_chars")]
+    pub max_injection_chars: usize,
+    /// Maximum files held in the symbol index.
+    #[serde(default = "default_max_indexed_files")]
+    pub max_indexed_files: usize,
+    /// Maximum source bytes held in the symbol index.
+    #[serde(default = "default_max_indexed_bytes")]
+    pub max_indexed_bytes: usize,
+}
+
+impl Default for CodeIntelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            symbol_search_tool: default_symbol_search_tool(),
+            pre_edit_injection: default_pre_edit_injection(),
+            post_edit_check: default_post_edit_check(),
+            max_injection_chars: default_max_injection_chars(),
+            max_indexed_files: default_max_indexed_files(),
+            max_indexed_bytes: default_max_indexed_bytes(),
+        }
+    }
 }
 
 /// Engine-driven post-edit verification settings.
@@ -69,6 +115,30 @@ fn default_timeout_secs() -> u64 {
     60
 }
 
+fn default_symbol_search_tool() -> bool {
+    true
+}
+
+fn default_pre_edit_injection() -> bool {
+    true
+}
+
+fn default_post_edit_check() -> bool {
+    true
+}
+
+fn default_max_injection_chars() -> usize {
+    4_000
+}
+
+fn default_max_indexed_files() -> usize {
+    2_000
+}
+
+fn default_max_indexed_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +148,13 @@ mod tests {
         let cfg: CodingConfig = toml::from_str("").expect("empty coding config should parse");
 
         assert!(!cfg.verify.enabled);
+        assert!(!cfg.code_intel.enabled);
+        assert!(cfg.code_intel.symbol_search_tool);
+        assert!(cfg.code_intel.pre_edit_injection);
+        assert!(cfg.code_intel.post_edit_check);
+        assert_eq!(cfg.code_intel.max_injection_chars, 4_000);
+        assert_eq!(cfg.code_intel.max_indexed_files, 2_000);
+        assert_eq!(cfg.code_intel.max_indexed_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.verify.on, vec!["file_write", "file_edit"]);
         assert!(cfg.verify.commands.is_empty());
         assert!(cfg.verify.baseline_delta);
@@ -101,5 +178,25 @@ mod tests {
         assert!(cfg.verify.baseline_delta);
         assert_eq!(cfg.verify.max_repair_turns, 2);
         assert_eq!(cfg.verify.timeout_secs, 60);
+    }
+
+    #[test]
+    fn coding_code_intel_partial_config_keeps_safe_defaults() {
+        let cfg: CodingConfig = toml::from_str(
+            r#"
+            [code_intel]
+            enabled = true
+            max_indexed_files = 12
+            "#,
+        )
+        .expect("partial code-intel config should parse");
+
+        assert!(cfg.code_intel.enabled);
+        assert!(cfg.code_intel.symbol_search_tool);
+        assert!(cfg.code_intel.pre_edit_injection);
+        assert!(cfg.code_intel.post_edit_check);
+        assert_eq!(cfg.code_intel.max_injection_chars, 4_000);
+        assert_eq!(cfg.code_intel.max_indexed_files, 12);
+        assert_eq!(cfg.code_intel.max_indexed_bytes, 64 * 1024 * 1024);
     }
 }

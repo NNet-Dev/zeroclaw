@@ -1,11 +1,28 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 
+use crate::code_intel::{CodeIntel, Span, SymbolDef, SymbolRef};
+
+/// Edit a file by replacing an exact string match with new content.
+///
+/// Uses `old_string` → `new_string` precise replacement within the workspace.
+/// The `old_string` must appear exactly once in the file (zero matches = not
+/// found, multiple matches = ambiguous). `new_string` may be empty to delete
+/// the matched text. Security checks mirror [`super::file_write::FileWriteTool`].
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
+    code_intel: Option<Arc<CodeIntel>>,
+    /// Whether edits to the workspace persist on the host filesystem. `false`
+    /// on an ephemeral runtime (Docker tmpfs / no volume mount), where the
+    /// rewritten file succeeds inside the container but is invisible on the
+    /// host and discarded at session end. When `false`, successful edits carry
+    /// a loud ephemeral-workspace warning. Mirrors
+    /// [`super::file_write::FileWriteTool`]. See issue #4627.
     persistent_writes: bool,
 }
 
@@ -13,6 +30,7 @@ impl FileEditTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self {
             security,
+            code_intel: None,
             persistent_writes: true,
         }
     }
@@ -23,8 +41,14 @@ impl FileEditTool {
     pub fn new_with_persistence(security: Arc<SecurityPolicy>, persistent_writes: bool) -> Self {
         Self {
             security,
+            code_intel: None,
             persistent_writes,
         }
+    }
+
+    pub fn with_code_intel(mut self, code_intel: Option<Arc<CodeIntel>>) -> Self {
+        self.code_intel = code_intel;
+        self
     }
 }
 
@@ -247,19 +271,29 @@ impl FileEditTool {
             });
         }
 
+        let pre_edit_defs = self.pre_edit_defs(&resolved_target, &content, old_string);
         let new_content = content.replacen(old_string, new_string, 1);
 
         match tokio::fs::write(&resolved_target, &new_content).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!(
+            Ok(()) => {
+                if let Some(code_intel) = &self.code_intel {
+                    code_intel.invalidate(&resolved_target);
+                }
+                let mut output = format!(
                     "Edited {path}: replaced 1 occurrence ({} bytes)",
                     new_content.len()
-                )
-                .into(),
-                error: None,
-                diagnostics: None,
-            }),
+                );
+                if let Some(note) = self.post_edit_symbol_note(&pre_edit_defs) {
+                    output.push_str("\n\n");
+                    output.push_str(&note);
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: output.into(),
+                    error: None,
+                    diagnostics: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -268,6 +302,100 @@ impl FileEditTool {
             }),
         }
     }
+
+    fn pre_edit_defs(&self, path: &Path, content: &str, old_string: &str) -> Vec<SymbolDef> {
+        let Some(code_intel) = self
+            .code_intel
+            .as_ref()
+            .filter(|code_intel| code_intel.post_edit_check_enabled())
+        else {
+            return Vec::new();
+        };
+        let Some(span) = span_for_match(path, content, old_string) else {
+            return Vec::new();
+        };
+        code_intel.symbols_in_span(path, &span).unwrap_or_default()
+    }
+
+    fn post_edit_symbol_note(&self, pre_edit_defs: &[SymbolDef]) -> Option<String> {
+        let code_intel = self
+            .code_intel
+            .as_ref()
+            .filter(|code_intel| code_intel.post_edit_check_enabled())?;
+        let mut seen = HashSet::new();
+        let mut lines = Vec::new();
+        for def in pre_edit_defs {
+            if !seen.insert(def.name.clone()) {
+                continue;
+            }
+            if !code_intel
+                .find_definition(&def.name)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                continue;
+            }
+            let references = code_intel.find_references(&def.name).unwrap_or_default();
+            if references.is_empty() {
+                continue;
+            }
+            lines.push(format_unresolved_symbol(&def.name, &references));
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "## Post-edit symbol check\nPotential unresolved references after this edit:\n{}",
+            lines.join("\n")
+        ))
+    }
+}
+
+fn span_for_match(path: &Path, content: &str, needle: &str) -> Option<Span> {
+    let start = content.find(needle)?;
+    Some(span_for_byte_range(
+        path,
+        content,
+        start,
+        start + needle.len(),
+    ))
+}
+
+fn span_for_byte_range(path: &Path, content: &str, start: usize, end: usize) -> Span {
+    let (start_line, start_col) = line_col_for_byte(content, start);
+    let (end_line, end_col) = line_col_for_byte(content, end);
+    Span {
+        path: path.to_path_buf(),
+        start_line,
+        start_col,
+        end_line,
+        end_col,
+    }
+}
+
+fn line_col_for_byte(content: &str, offset: usize) -> (u32, u32) {
+    let prefix = &content[..offset];
+    let line = prefix
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count() as u32
+        + 1;
+    let col = prefix
+        .rsplit_once('\n')
+        .map_or(prefix.len(), |(_, tail)| tail.len()) as u32;
+    (line, col)
+}
+
+fn format_unresolved_symbol(name: &str, references: &[SymbolRef]) -> String {
+    let first = &references[0].span;
+    format!(
+        "- `{name}` has {} remaining reference(s) and no indexed definition (first: {}:{}:{})",
+        references.len(),
+        first.path.display(),
+        first.start_line,
+        first.start_col
+    )
 }
 
 fn no_match_diagnostic(content: &str, old_string: &str) -> String {
@@ -301,8 +429,10 @@ fn no_match_diagnostic(content: &str, old_string: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_intel::CodeIntel;
     use crate::wrappers::{PathGuardedTool, RateLimitedTool};
     use zeroclaw_config::autonomy::AutonomyLevel;
+    use zeroclaw_config::coding::CodeIntelConfig;
     use zeroclaw_config::policy::SecurityPolicy;
 
     fn test_tool(workspace: std::path::PathBuf) -> FileEditTool {
@@ -312,6 +442,27 @@ mod tests {
             ..SecurityPolicy::default()
         });
         FileEditTool::new(security)
+    }
+
+    fn test_code_intel(workspace: std::path::PathBuf, post_edit_check: bool) -> Arc<CodeIntel> {
+        let cfg = CodeIntelConfig {
+            enabled: true,
+            post_edit_check,
+            ..CodeIntelConfig::default()
+        };
+        Arc::new(CodeIntel::new(workspace, Arc::new(move || cfg.clone())))
+    }
+
+    fn test_tool_with_code_intel(
+        workspace: std::path::PathBuf,
+        code_intel: Arc<CodeIntel>,
+    ) -> FileEditTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        FileEditTool::new(security).with_code_intel(Some(code_intel))
     }
 
     #[cfg(target_os = "windows")]
@@ -516,6 +667,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "goodbye world");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_reports_removed_symbol_with_remaining_reference() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_symbol_check");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("lib.rs"),
+            "fn helper() {}\n\nfn main() {\n    helper();\n}\n",
+        )
+        .await
+        .unwrap();
+
+        let code_intel = test_code_intel(dir.clone(), true);
+        assert_eq!(code_intel.find_definition("helper").unwrap().len(), 1);
+
+        let tool = test_tool_with_code_intel(dir.clone(), code_intel);
+        let result = tool
+            .execute(json!({
+                "path": "lib.rs",
+                "old_string": "fn helper() {}\n\n",
+                "new_string": ""
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(
+            result.output.contains("## Post-edit symbol check"),
+            "symbol check note missing from output: {}",
+            result.output
+        );
+        assert!(result.output.contains("`helper`"), "got: {}", result.output);
+        assert!(
+            result.output.contains("remaining reference"),
+            "got: {}",
+            result.output
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

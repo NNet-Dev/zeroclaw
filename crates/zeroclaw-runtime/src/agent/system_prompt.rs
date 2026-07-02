@@ -87,6 +87,7 @@ pub fn build_system_prompt_with_tool_calls(
         0,
         true,
         show_tool_calls,
+        None,
     )
 }
 
@@ -119,6 +120,7 @@ pub fn build_system_prompt_with_mode(
         0,
         true,
         false,
+        None,
     )
 }
 
@@ -142,6 +144,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // response. When `false` (default), the system prompt instructs
     // the model to treat tool calls as invisible infrastructure.
     show_tool_calls: bool,
+    verified_symbol_context: Option<&str>,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -241,6 +244,11 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
              Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
         );
+    }
+
+    if let Some(section) = verified_symbol_context.filter(|section| !section.is_empty()) {
+        prompt.push_str(section);
+        prompt.push('\n');
     }
 
     // ── 2. Safety ───────────────────────────────────────────────

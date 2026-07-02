@@ -4,9 +4,12 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
+use crate::code_intel::CodeIntel;
+
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
+    code_intel: Option<Arc<CodeIntel>>,
     /// Whether writes to the workspace will persist on the host filesystem.
     /// `false` when the runtime uses an ephemeral sandbox (e.g. Docker without
     /// a workspace volume mount), in which case writes succeed inside the
@@ -18,6 +21,7 @@ impl FileWriteTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self {
             security,
+            code_intel: None,
             persistent_writes: true,
         }
     }
@@ -27,8 +31,14 @@ impl FileWriteTool {
     pub fn new_with_persistence(security: Arc<SecurityPolicy>, persistent_writes: bool) -> Self {
         Self {
             security,
+            code_intel: None,
             persistent_writes,
         }
+    }
+
+    pub fn with_code_intel(mut self, code_intel: Option<Arc<CodeIntel>>) -> Self {
+        self.code_intel = code_intel;
+        self
     }
 }
 
@@ -234,12 +244,17 @@ impl Tool for FileWriteTool {
         }
 
         match tokio::fs::write(&resolved_target, &bytes).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!("Written {} bytes to {path}", bytes.len()).into(),
-                error: None,
-                diagnostics: None,
-            }),
+            Ok(()) => {
+                if let Some(code_intel) = &self.code_intel {
+                    code_intel.invalidate(&resolved_target);
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Written {} bytes to {path}", bytes.len()).into(),
+                    error: None,
+                    diagnostics: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),

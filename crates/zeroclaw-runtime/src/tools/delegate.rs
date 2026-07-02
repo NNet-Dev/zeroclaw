@@ -2681,6 +2681,7 @@ impl DelegateTool {
                         model_switch_callback: None,
                         // delegate subagents don't support approval
                         receipt_generator,
+                        symbol_context_provider: None,
                     },
                     ResolvedRuntimeKnobs {
                         max_tool_iterations: loop_runtime.max_tool_iterations,

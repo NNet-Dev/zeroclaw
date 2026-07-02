@@ -34,6 +34,7 @@ pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
 pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    SymbolContextRefresh,
 };
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
@@ -91,6 +92,47 @@ pub(crate) const MAX_VERIFY_REPAIR_TURNS: usize = 2;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+fn replace_system_prompt(history: &mut [ChatMessage], system_prompt: String) -> bool {
+    let Some(system_message) = history.iter_mut().find(|message| message.role == "system") else {
+        return false;
+    };
+    system_message.content = system_prompt;
+    true
+}
+
+// ── Agent Tool-Call Loop ──────────────────────────────────────────────────
+// Core agentic iteration: send conversation to the LLM, parse any tool
+// calls from the response, execute them, append results to history, and
+// repeat until the LLM produces a final text-only answer.
+//
+// Loop invariant: at the start of each iteration, `history` contains the
+// full conversation so far (system prompt + user messages + prior tool
+// results). The loop exits when:
+//   • the LLM returns no tool calls (final answer), or
+//   • max_iterations is reached (runaway safety), or
+//   • the cancellation token fires (external abort).
+
+/// Execute a single turn of the agent loop: send messages, parse tool calls,
+/// execute tools, and loop until the LLM produces a final text response.
+///
+/// `new_messages_out` is an append-log: every message the loop adds to
+/// `history` is mirrored into it at push time (a clone taken before any
+/// later in-loop history maintenance), so it is populated on **every** exit
+/// — success, error, and cancellation — and never derived from history
+/// indices, which in-loop pruning can invalidate. Loop-detection system
+/// notes are the one exception (merged into the existing system message;
+/// only reachable when pattern loop detection is enabled, which no
+/// `new_messages_out` consumer turns on).
+/// All parameters of [`run_tool_call_loop`], bundled into one borrowed struct.
+///
+/// Field names and types mirror the loop's former positional arguments
+/// one-for-one (the loop borrows everything for the duration of the turn,
+/// including the `&mut` working sets `history`, `steering`, `new_messages_out`,
+/// and `image_cache`). [`LoopKnobs`] stays a nested sub-bundle in `knobs`.
+///
+/// Callers build this struct literal and pass it by value; the loop
+/// destructures it once at entry, so the body reads exactly as it did when
+/// these were positional parameters.
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
     /// registry, approval, observability, and resolved runtime knobs. Stable
@@ -210,6 +252,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         max_tool_result_chars,
         context_token_budget,
         receipt_generator,
+        symbol_context_provider,
         knobs,
     } = exec;
 
@@ -311,6 +354,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     let mut verify_repair_turns: usize = 0;
     let mut verify_baselines = BaselineStore::default();
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let mut symbol_context_refreshes: HashSet<String> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
@@ -871,6 +915,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
+        if let Some(refresh) =
+            symbol_context_provider.and_then(|provider| provider(&executable_calls))
+            && symbol_context_refreshes.insert(refresh.key)
+            && replace_system_prompt(history, refresh.system_prompt)
+        {
+            continue;
+        }
+
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         capture_verify_baselines(coding, &executable_calls, &mut verify_baselines).await;
         let execution_result =
@@ -1311,6 +1363,7 @@ async fn drive_live_sop_actions(
                                     activated_tools,
                                     model_switch_callback: model_switch_callback.clone(),
                                     receipt_generator,
+                                    symbol_context_provider: None,
                                 },
                                 ResolvedRuntimeKnobs {
                                     max_tool_iterations,
