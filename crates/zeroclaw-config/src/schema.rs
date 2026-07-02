@@ -5807,6 +5807,12 @@ pub struct PacingConfig {
     /// escalation (Warning). Defaults to 3.
     #[serde(default = "default_loop_detection_max_repeats")]
     pub loop_detection_max_repeats: usize,
+
+    /// Allow no-progress detections to hard-stop the turn. Defaults to `false`
+    /// so no-progress is warn/block-first unless an operator opts into aborts.
+    /// Exact-repeat, exact-failure, and ping-pong hard stops are unaffected.
+    #[serde(default)]
+    pub loop_no_progress_hard_stop: bool,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -5831,6 +5837,7 @@ impl Default for PacingConfig {
             loop_detection_enabled: default_loop_detection_enabled(),
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
+            loop_no_progress_hard_stop: false,
         }
     }
 }
@@ -24571,6 +24578,7 @@ runtime_profile = "long_turn"
         assert!(cfg.loop_detection_min_elapsed_secs.is_none());
         assert!(cfg.loop_ignore_tools.is_empty());
         assert!(cfg.message_timeout_scale_max.is_none());
+        assert!(!cfg.loop_no_progress_hard_stop);
     }
 
     #[test]
@@ -24582,6 +24590,7 @@ step_timeout_secs = 120
 loop_detection_min_elapsed_secs = 60
 loop_ignore_tools = ["browser_screenshot", "browser_navigate"]
 message_timeout_scale_max = 8
+loop_no_progress_hard_stop = true
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(parsed.pacing.step_timeout_secs, Some(120));
@@ -24591,6 +24600,7 @@ message_timeout_scale_max = 8
             vec!["browser_screenshot", "browser_navigate"]
         );
         assert_eq!(parsed.pacing.message_timeout_scale_max, Some(8));
+        assert!(parsed.pacing.loop_no_progress_hard_stop);
     }
 
     #[test]
@@ -24603,6 +24613,28 @@ default_temperature = 0.7
         assert!(parsed.pacing.loop_detection_min_elapsed_secs.is_none());
         assert!(parsed.pacing.loop_ignore_tools.is_empty());
         assert!(parsed.pacing.message_timeout_scale_max.is_none());
+        assert!(!parsed.pacing.loop_no_progress_hard_stop);
+    }
+
+    #[test]
+    async fn pacing_no_progress_hard_stop_is_operator_visible_bool() {
+        let mut config = Config::default();
+        config.init_defaults(None);
+
+        let fields = config.prop_fields();
+        let field = fields
+            .iter()
+            .find(|field| field.name == "pacing.loop_no_progress_hard_stop")
+            .expect("pacing loop_no_progress_hard_stop is exposed to config surfaces");
+
+        assert_eq!(field.kind, crate::config::PropKind::Bool);
+        assert!(!field.is_secret);
+        assert_eq!(field.display_value, "false");
+        assert_eq!(config.get_prop(&field.name).unwrap(), "false");
+
+        config.set_prop(&field.name, "true").unwrap();
+        assert!(config.pacing.loop_no_progress_hard_stop);
+        assert_eq!(config.get_prop(&field.name).unwrap(), "true");
     }
 
     #[tokio::test]
@@ -30352,11 +30384,19 @@ url = "http://localhost:8080/mcp"
             from_toml.loop_detection_max_repeats,
             manual.loop_detection_max_repeats
         );
+        assert_eq!(
+            from_toml.loop_no_progress_hard_stop,
+            manual.loop_no_progress_hard_stop
+        );
 
         // Verify concrete values so a silent change to the defaults is caught.
         assert!(from_toml.loop_detection_enabled, "default should be true");
         assert_eq!(from_toml.loop_detection_window_size, 20);
         assert_eq!(from_toml.loop_detection_max_repeats, 3);
+        assert!(
+            !from_toml.loop_no_progress_hard_stop,
+            "no-progress hard stops must be opt-in by default"
+        );
     }
 
     // ── Docker baked config template ────────────────────────────

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSideEffect};
 use zeroclaw_config::policy::SecurityPolicy;
 
 const MAX_RESULTS: usize = 1000;
@@ -40,6 +40,10 @@ impl Tool for GlobSearchTool {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn side_effect(&self) -> ToolSideEffect {
+        ToolSideEffect::ReadOnly
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

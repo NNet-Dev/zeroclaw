@@ -2,7 +2,9 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{
+    Tool, ToolOutput, ToolResult, ToolSideEffect, with_ephemeral_workspace_warning,
+};
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -79,6 +81,10 @@ impl Tool for FileReadTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn side_effect(&self) -> ToolSideEffect {
+        ToolSideEffect::ReadOnly
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

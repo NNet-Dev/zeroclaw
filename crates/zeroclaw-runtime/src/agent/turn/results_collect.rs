@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use zeroclaw_api::tool::ToolSideEffect;
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::ParsedToolCall;
@@ -38,6 +39,7 @@ pub(crate) fn collect_tool_results(
     tool_calls: &[ParsedToolCall],
     history: &mut Vec<ChatMessage>,
     loop_detector: &mut LoopDetector,
+    tool_side_effect: &dyn Fn(&str) -> ToolSideEffect,
     loop_ignore_tools: &HashSet<&str>,
     max_tool_result_chars: usize,
     collected_receipts: Option<&Mutex<Vec<String>>>,
@@ -56,19 +58,34 @@ pub(crate) fn collect_tool_results(
         .filter_map(|(i, opt)| opt.map(|v| (i, v)))
     {
         if !loop_ignore_tools.contains(tool_name.as_str()) {
+            // Keep failed outputs out of the hash-based identical-output abort
+            // (check_identical_output_abort) too, for the same reason the
+            // pattern detector below is gated: a burst of identical,
+            // argument-independent error strings (rate-limit / action-budget)
+            // would otherwise hash identically and hard-abort the turn — the
+            // exact misfire this PR removes. Successful output still feeds the
+            // hash so the #7143 productive-loop guard (identical *successful*
+            // output) still aborts. The pattern detector below still records
+            // failed calls, but carries the success bit so no-progress only
+            // counts successful results.
             if outcome.success {
                 detection_relevant_output.push_str(&outcome.output);
             }
 
+            // Feed the pattern-based loop detector with the real success bit
+            // so failed calls stay in the accounting window without being
+            // classified as successful no-progress loops.
             let args = tool_calls
                 .get(result_index)
                 .map(|c| &c.arguments)
                 .unwrap_or(&serde_json::Value::Null);
-            let det_result = if outcome.success {
-                loop_detector.record(&tool_name, args, &outcome.output)
-            } else {
-                crate::agent::loop_detector::LoopDetectionResult::Ok
-            };
+            let det_result = loop_detector.record(
+                &tool_name,
+                args,
+                outcome.success,
+                tool_side_effect(&tool_name),
+                &outcome.output,
+            );
             match det_result {
                 crate::agent::loop_detector::LoopDetectionResult::Ok => {}
                 crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
@@ -238,8 +255,13 @@ mod tests {
     /// Run one results-collection pass over `n` `file_read` calls that each use
     /// different args but return an identical `output` string, with the given
     /// `success` flag.
-    fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
-        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+    fn run_with_config(
+        n: usize,
+        output: &str,
+        success: bool,
+        config: LoopDetectorConfig,
+    ) -> Result<CollectedResults> {
+        let mut detector = LoopDetector::new(config);
         let ignore: HashSet<&str> = HashSet::new();
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
@@ -261,6 +283,33 @@ mod tests {
             &tool_calls,
             &mut history,
             &mut detector,
+            &|_| ToolSideEffect::ReadOnly,
+            &ignore,
+            10_000,
+            None,
+            "test-model",
+            0,
+            "turn-test",
+        )
+    }
+
+    fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
+        run_with_config(n, output, success, LoopDetectorConfig::default())
+    }
+
+    fn collect_with_detector(
+        ordered: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
+        tool_calls: &[ParsedToolCall],
+        history: &mut Vec<ChatMessage>,
+        detector: &mut LoopDetector,
+    ) -> Result<CollectedResults> {
+        let ignore: HashSet<&str> = HashSet::new();
+        collect_tool_results(
+            ordered,
+            tool_calls,
+            history,
+            detector,
+            &|_| ToolSideEffect::ReadOnly,
             &ignore,
             10_000,
             None,
@@ -280,16 +329,69 @@ mod tests {
     }
 
     #[test]
-    fn successful_identical_results_still_trip_no_progress_breaker() {
+    fn successful_identical_results_do_not_hard_stop_no_progress_by_default() {
         // Identical *successful* output across different args is the genuine
-        // stuck-loop signaland must still hard-abort the turn.
-        let err = match run(8, "byte-identical successful output", true) {
-            Ok(_) => panic!("expected the no-progress circuit breaker to abort the turn"),
+        // stuck-loop signal (#7143), but no-progress hard stops are opt-in.
+        assert!(run(8, "byte-identical successful output", true).is_ok());
+    }
+
+    #[test]
+    fn successful_identical_results_hard_stop_when_enabled() {
+        let err = match run_with_config(
+            8,
+            "byte-identical successful output",
+            true,
+            LoopDetectorConfig {
+                no_progress_hard_stop: true,
+                ..Default::default()
+            },
+        ) {
+            Ok(_) => panic!("expected the opt-in no-progress circuit breaker to abort the turn"),
             Err(e) => e.to_string(),
         };
         assert!(err.contains("loop detector"), "got: {err}");
     }
 
+    #[test]
+    fn exact_failure_guidance_is_appended_to_history() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig {
+            exact_failure_max: 3,
+            max_repeats: 20,
+            ..Default::default()
+        });
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let tool_calls: Vec<ParsedToolCall> = (0..3)
+            .map(|_| ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({ "cmd": "cargo test" }),
+                tool_call_id: None,
+            })
+            .collect();
+        let ordered: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> = (0..3)
+            .map(|_| Some(("shell".to_string(), None, outcome("compiler error", false))))
+            .collect();
+
+        collect_with_detector(ordered, &tool_calls, &mut history, &mut detector)
+            .expect("warning-level exact failure should not abort");
+
+        let appended = history
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(appended.contains("[Loop Detection]"), "got: {appended}");
+        assert!(appended.contains("failed 3 times"), "got: {appended}");
+        assert!(appended.contains("inspect the error"), "got: {appended}");
+        assert!(!appended.contains("no progress"), "got: {appended}");
+    }
+
+    /// Drive the *hash-based* identical-output abort
+    /// (`check_identical_output_abort`) directly, with loop detection ACTIVE
+    /// (pacing configured + elapsed), over `n` iterations whose `file_read`
+    /// calls each use different args but return an identical `output` with the
+    /// given `success` flag. Mirrors `run`, but exercises the *second*
+    /// loop-detection mechanism (the hash path) rather than the pattern
+    /// detector.
     fn run_hash_path(n: usize, output: &str, success: bool) -> Result<()> {
         // `Some(0)` => loop detection active immediately (`elapsed() >= 0s`).
         let pacing = PacingConfig {
@@ -318,6 +420,7 @@ mod tests {
                 &tool_calls,
                 &mut history,
                 &mut detector,
+                &|_| ToolSideEffect::ReadOnly,
                 &ignore,
                 10_000,
                 None,

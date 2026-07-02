@@ -77,6 +77,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
+use zeroclaw_api::tool::ToolSideEffect;
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
 /// Maximum malformed internal tool-protocol retries before returning a safe fallback.
@@ -288,8 +289,16 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             enabled: pacing.loop_detection_enabled,
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
+            no_progress_hard_stop: pacing.loop_no_progress_hard_stop,
+            ..Default::default()
         },
     );
+    let tool_side_effect = |tool_name: &str| {
+        tools_registry
+            .iter()
+            .find(|tool| tool.name() == tool_name)
+            .map_or(ToolSideEffect::Unknown, |tool| tool.side_effect())
+    };
 
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
@@ -985,6 +994,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             &tool_calls,
             history,
             &mut loop_detector,
+            &tool_side_effect,
             &loop_ignore_tools,
             max_tool_result_chars,
             collected_receipts,

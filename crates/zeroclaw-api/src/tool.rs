@@ -315,6 +315,17 @@ impl OptionEntry {
     }
 }
 
+/// Side-effect class for loop accounting, retry safety, and approval policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolSideEffect {
+    /// Side effects are not declared. Callers must take the conservative path.
+    Unknown,
+    /// Re-running the tool does not mutate external state.
+    ReadOnly,
+    /// The tool may mutate state, execute commands, or produce external effects.
+    Mutating,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Tool name (used in LLM function calling)
@@ -344,6 +355,11 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
 
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
+
+    /// Side-effect class used by shared loop-accounting and policy code.
+    fn side_effect(&self) -> ToolSideEffect {
+        ToolSideEffect::Unknown
+    }
 
     fn spec(&self) -> ToolSpec {
         ToolSpec {

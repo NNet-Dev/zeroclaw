@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role};
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSideEffect};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Type alias for a path-extraction closure used by [`PathGuardedTool`].
@@ -51,6 +51,10 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 
     fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn side_effect(&self) -> ToolSideEffect {
+        self.inner.side_effect()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -146,6 +150,10 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
 
     fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn side_effect(&self) -> ToolSideEffect {
+        self.inner.side_effect()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

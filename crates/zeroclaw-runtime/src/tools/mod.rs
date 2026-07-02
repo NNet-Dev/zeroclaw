@@ -196,6 +196,10 @@ impl Tool for ArcToolRef {
         self.0.param_domains()
     }
 
+    fn side_effect(&self) -> zeroclaw_api::tool::ToolSideEffect {
+        self.0.side_effect()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -241,6 +245,10 @@ impl Tool for ArcDelegatingTool {
 
     fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn side_effect(&self) -> zeroclaw_api::tool::ToolSideEffect {
+        self.inner.side_effect()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
