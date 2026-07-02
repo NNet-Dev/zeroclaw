@@ -5,6 +5,7 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 use crate::code_intel::CodeIntel;
+use crate::workspace_locks::WorkspaceFileLocks;
 
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
@@ -15,6 +16,7 @@ pub struct FileWriteTool {
     /// a workspace volume mount), in which case writes succeed inside the
     /// container but are invisible on the host.
     persistent_writes: bool,
+    workspace_locks: Option<WorkspaceFileLocks>,
 }
 
 impl FileWriteTool {
@@ -23,6 +25,7 @@ impl FileWriteTool {
             security,
             code_intel: None,
             persistent_writes: true,
+            workspace_locks: None,
         }
     }
 
@@ -33,11 +36,17 @@ impl FileWriteTool {
             security,
             code_intel: None,
             persistent_writes,
+            workspace_locks: None,
         }
     }
 
     pub fn with_code_intel(mut self, code_intel: Option<Arc<CodeIntel>>) -> Self {
         self.code_intel = code_intel;
+        self
+    }
+
+    pub fn with_workspace_locks(mut self, workspace_locks: Option<WorkspaceFileLocks>) -> Self {
+        self.workspace_locks = workspace_locks;
         self
     }
 }
@@ -215,6 +224,11 @@ impl Tool for FileWriteTool {
         };
 
         let resolved_target = resolved_parent.join(file_name);
+        let _write_guard = if let Some(locks) = &self.workspace_locks {
+            Some(locks.lock_path(&resolved_target).await)
+        } else {
+            None
+        };
 
         if self.security.is_runtime_config_path(&resolved_target) {
             return Ok(ToolResult {

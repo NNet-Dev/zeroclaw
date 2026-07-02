@@ -1,6 +1,7 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
+use crate::tools::shell_session::ShellSession;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -88,6 +89,7 @@ pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
+    session: ShellSession,
     timeout_secs: u64,
     /// Environment forwarded from the connected TUI client. When set, these
     /// vars are overlaid on top of the safe-env snapshot, letting the user's
@@ -101,6 +103,7 @@ impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
         let timeout_secs = security.shell_timeout_secs;
         Self {
+            session: ShellSession::new(security.clone()),
             security,
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
@@ -117,6 +120,7 @@ impl ShellTool {
     ) -> Self {
         let timeout_secs = security.shell_timeout_secs;
         Self {
+            session: ShellSession::new(security.clone()),
             security,
             runtime,
             sandbox,
@@ -299,10 +303,19 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
-        {
+        let cwd = match self.session.current_cwd() {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Failed to resolve shell cwd: {e}")),
+                    diagnostics: None,
+                });
+            }
+        };
+
+        let mut cmd = match self.runtime.build_shell_command(command, &cwd) {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -447,6 +460,11 @@ impl Tool for ShellTool {
                     }
                 }
             };
+
+        if let Err(e) = self.session.update_cwd_if_cd(command, result.success) {
+            result.success = false;
+            result.error = Some(format!("Failed to update shell cwd: {e}"));
+        }
 
         // The command ran inside an ephemeral workspace: any files it wrote are
         // invisible on the host and discarded at session end
@@ -743,6 +761,43 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn shell_persists_exact_cd_for_next_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let subdir = tmp.path().join("subcrate");
+        std::fs::create_dir(&subdir).expect("subdir");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+
+        let cd_result = tool
+            .execute(json!({"command": "cd subcrate"}))
+            .await
+            .expect("cd command should run");
+        assert!(
+            cd_result.success,
+            "cd should succeed: {:?}",
+            cd_result.error
+        );
+
+        let pwd_result = tool
+            .execute(json!({"command": "pwd"}))
+            .await
+            .expect("pwd command should run");
+        assert!(
+            pwd_result.success,
+            "pwd should succeed: {:?}",
+            pwd_result.error
+        );
+
+        let expected = subdir.canonicalize().expect("canonical subdir");
+        assert_eq!(pwd_result.output.trim(), expected.display().to_string());
     }
 
     #[tokio::test]

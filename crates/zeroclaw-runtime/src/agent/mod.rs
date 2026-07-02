@@ -19,6 +19,7 @@ pub mod pricing_catalog;
 pub mod prompt;
 pub(crate) mod symbol_context;
 pub mod system_prompt;
+pub(crate) mod task_workspace;
 pub mod thinking;
 pub(crate) mod tool_classification;
 pub mod tool_execution;

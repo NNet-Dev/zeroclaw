@@ -4,6 +4,7 @@
 //! dispatch is the other SubAgent spawn site; both funnel through
 
 use crate::agent::loop_::AgentRunOverrides;
+use crate::agent::task_workspace::TaskWorkspace;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use crate::subagent::{SubAgentOverrides, SubAgentSpawn};
@@ -153,15 +154,22 @@ impl Tool for SpawnSubagentTool {
             });
         }
 
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let task_workspace =
+            TaskWorkspace::new(Arc::clone(&self.security), &self.config.security.workspace);
+        let allocated_workspace = task_workspace.allocate(&run_id).await;
+        let spawn_policy = task_workspace.child_policy_for(&allocated_workspace);
+
         let subagent_ctx = match SubAgentSpawn::for_agent_with_policy(
             &self.config,
             &self.parent_alias,
-            Arc::clone(&self.security),
+            spawn_policy,
         )
         .and_then(|spawn| spawn.build(SubAgentOverrides::default()))
         {
             Ok(ctx) => ctx,
             Err(e) => {
+                task_workspace.release(&allocated_workspace).await;
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -170,8 +178,6 @@ impl Tool for SpawnSubagentTool {
                 });
             }
         };
-
-        let run_id = uuid::Uuid::new_v4().to_string();
 
         let temperature: Option<f64> = self
             .config
@@ -242,6 +248,8 @@ impl Tool for SpawnSubagentTool {
         ))
         .await;
 
+        task_workspace.release(&allocated_workspace).await;
+
         // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
         if let Some(cp) = crate::control_plane::control_plane() {
             let (status, output, error) = match &run_result {
@@ -265,7 +273,14 @@ impl Tool for SpawnSubagentTool {
         match run_result {
             Ok(response) => Ok(ToolResult {
                 success: true,
-                output: if response.trim().is_empty() {
+                output: if let Some(warning) = &allocated_workspace.warning {
+                    let body = if response.trim().is_empty() {
+                        "subagent completed without output".to_string()
+                    } else {
+                        response
+                    };
+                    format!("{warning}\n\n{body}").into()
+                } else if response.trim().is_empty() {
                     "subagent completed without output".to_string().into()
                 } else {
                     response.into()

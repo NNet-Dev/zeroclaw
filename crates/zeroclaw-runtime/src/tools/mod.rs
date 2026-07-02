@@ -18,6 +18,7 @@ pub mod scoped;
 pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
+mod shell_session;
 pub mod skill_http;
 pub mod skill_manage;
 pub mod skill_tool;
@@ -115,6 +116,7 @@ pub use zeroclaw_tools::tool_search::ToolSearchTool;
 pub use zeroclaw_tools::weather_tool::WeatherTool;
 pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
+pub use zeroclaw_tools::workspace_locks::WorkspaceFileLocks;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
 // Traits from zeroclaw-api
@@ -603,6 +605,9 @@ pub fn all_tools_with_runtime(
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
+    let workspace_locks = (root_config.security.workspace.file_lock
+        == zeroclaw_config::schema::WorkspaceFileLockMode::PerPath)
+        .then(WorkspaceFileLocks::new);
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
@@ -647,7 +652,8 @@ pub fn all_tools_with_runtime(
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileWriteTool::new_with_persistence(security.clone(), persistent_writes)
-                    .with_code_intel(code_intel.clone()),
+                    .with_code_intel(code_intel.clone())
+                    .with_workspace_locks(workspace_locks.clone()),
                 security.clone(),
             ),
             security.clone(),
@@ -655,7 +661,8 @@ pub fn all_tools_with_runtime(
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileEditTool::new_with_persistence(security.clone(), persistent_writes)
-                    .with_code_intel(code_intel.clone()),
+                    .with_code_intel(code_intel.clone())
+                    .with_workspace_locks(workspace_locks.clone()),
                 security.clone(),
             ),
             security.clone(),

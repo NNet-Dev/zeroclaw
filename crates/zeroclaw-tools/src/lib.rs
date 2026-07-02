@@ -90,6 +90,7 @@ pub mod weather_tool;
 pub mod web_fetch;
 pub mod web_search_provider_routing;
 pub mod web_search_tool;
+pub mod workspace_locks;
 pub mod wrappers;
 
 pub const MEMORY_TOOL_NAMES: &[&str] = &[

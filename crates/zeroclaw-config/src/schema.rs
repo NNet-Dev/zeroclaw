@@ -15377,6 +15377,11 @@ pub struct SecurityConfig {
     #[nested]
     pub leak_detection: LeakDetectionConfig,
 
+    /// Workspace isolation controls for concurrent agent work.
+    #[serde(default)]
+    #[nested]
+    pub workspace: WorkspaceIsolationConfig,
+
     /// OTP gating configuration for sensitive actions/domains.
     #[serde(default)]
     #[nested]
@@ -15441,6 +15446,76 @@ impl Default for LeakDetectionConfig {
             sensitivity: default_leak_detection_sensitivity(),
             high_entropy_tokens: default_leak_detection_high_entropy_tokens(),
         }
+    }
+}
+
+/// Workspace isolation configuration (`[security.workspace]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "security.workspace"]
+#[serde(default)]
+pub struct WorkspaceIsolationConfig {
+    /// Workspace allocation mode for spawned subagents.
+    pub isolation: WorkspaceIsolationMode,
+    /// Directory under the parent workspace where per-task worktrees are created.
+    pub worktree_root: String,
+    /// Write-locking mode for file mutation tools in shared workspaces.
+    pub file_lock: WorkspaceFileLockMode,
+    /// Maximum concurrently allocated task worktrees.
+    pub max_concurrent_worktrees: usize,
+}
+
+impl Default for WorkspaceIsolationConfig {
+    fn default() -> Self {
+        Self {
+            isolation: WorkspaceIsolationMode::Shared,
+            worktree_root: ".zc-tasks".to_string(),
+            file_lock: WorkspaceFileLockMode::Off,
+            max_concurrent_worktrees: 16,
+        }
+    }
+}
+
+/// Workspace allocation mode for spawned subagents.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceIsolationMode {
+    /// Inherit the parent workspace unchanged.
+    #[default]
+    Shared,
+    /// Allocate a git worktree per spawned task when possible.
+    WorktreePerTask,
+}
+
+/// File write-locking mode for workspace mutation tools.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceFileLockMode {
+    /// Do not serialize file writes beyond existing filesystem behavior.
+    #[default]
+    Off,
+    /// Serialize write/edit critical sections per resolved path.
+    PerPath,
+}
+
+#[cfg(test)]
+mod workspace_isolation_config_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_isolation_defaults_preserve_shared_workspace_behavior() {
+        let cfg = WorkspaceIsolationConfig::default();
+
+        assert_eq!(cfg.isolation, WorkspaceIsolationMode::Shared);
+        assert_eq!(cfg.worktree_root, ".zc-tasks");
+        assert_eq!(cfg.file_lock, WorkspaceFileLockMode::Off);
+        assert_eq!(cfg.max_concurrent_worktrees, 16);
     }
 }
 
