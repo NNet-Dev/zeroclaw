@@ -1806,6 +1806,7 @@ mod tests {
             None,
             Some(engine),
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
