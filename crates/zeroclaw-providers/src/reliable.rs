@@ -100,6 +100,10 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return false;
     }
 
+    if is_content_policy_refusal(err) {
+        return true;
+    }
+
     // 4xx errors are generally non-retryable (bad request, auth failure, etc.),
     // except 429 (rate-limit — transient) and 408 (timeout — worth retrying).
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
@@ -149,6 +153,27 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
             || msg_lower.contains("invalid"))
+}
+
+/// Check if an error reports a deterministic content-policy refusal.
+pub fn is_content_policy_refusal(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    let hints = [
+        "content policy",
+        "content_filter",
+        "content filter",
+        "safety policy",
+        "safety settings",
+        "blocked by safety",
+        "blocked due to safety",
+        "prompt was blocked",
+        "response was blocked",
+        "finish_reason\":\"content_filter",
+        "finish_reason: content_filter",
+        "stop_reason\":\"content_filter",
+    ];
+
+    hints.iter().any(|hint| lower.contains(hint))
 }
 
 /// Check if an error indicates an authentication/authorization failure.
@@ -2407,6 +2432,9 @@ mod tests {
         assert!(is_non_retryable(&anyhow::Error::msg(
             "unsupported model: glm-4.7"
         )));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            r#"provider returned finish_reason":"content_filter" for a 200 response"#
+        )));
         assert!(!is_non_retryable(&anyhow::Error::msg(
             "429 Too Many Requests"
         )));
@@ -2425,6 +2453,32 @@ mod tests {
         // Context window errors are now recoverable (not non-retryable)
         assert!(!is_non_retryable(&anyhow::Error::msg(
             "OpenAI Codex stream error: Your input exceeds the context window of this model."
+        )));
+    }
+
+    #[test]
+    fn content_policy_refusal_detects_common_provider_shapes() {
+        assert!(is_content_policy_refusal(&anyhow::Error::msg(
+            "content policy refusal"
+        )));
+        assert!(is_content_policy_refusal(&anyhow::Error::msg(
+            r#"{"finish_reason":"content_filter"}"#
+        )));
+        assert!(is_content_policy_refusal(&anyhow::Error::msg(
+            "prompt was blocked by safety settings"
+        )));
+    }
+
+    #[test]
+    fn content_policy_refusal_ignores_transient_errors() {
+        assert!(!is_content_policy_refusal(&anyhow::Error::msg(
+            "429 Too Many Requests"
+        )));
+        assert!(!is_content_policy_refusal(&anyhow::Error::msg(
+            "500 Internal Server Error"
+        )));
+        assert!(!is_content_policy_refusal(&anyhow::Error::msg(
+            "connection reset"
         )));
     }
 
