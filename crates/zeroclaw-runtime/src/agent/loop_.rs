@@ -10128,7 +10128,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+            memory: None,
+            ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
