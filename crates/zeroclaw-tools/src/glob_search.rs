@@ -73,6 +73,7 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Absolute paths are not allowed. Use a relative glob pattern.".into()),
+                diagnostics: None,
             });
         }
 
@@ -82,6 +83,7 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Path traversal ('..') is not allowed in glob patterns.".into()),
+                diagnostics: None,
             });
         }
 
@@ -100,6 +102,7 @@ impl Tool for GlobSearchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Invalid glob pattern: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -112,6 +115,7 @@ impl Tool for GlobSearchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Cannot resolve workspace directory: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -172,6 +176,7 @@ impl Tool for GlobSearchTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

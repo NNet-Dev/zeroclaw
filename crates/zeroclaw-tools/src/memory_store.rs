@@ -90,6 +90,7 @@ impl Tool for MemoryStoreTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -98,11 +99,13 @@ impl Tool for MemoryStoreTool {
                 success: true,
                 output: format!("Stored memory: {key}").into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to store memory: {e}")),
+                diagnostics: None,
             }),
         }
     }

@@ -510,6 +510,7 @@ impl Tool for HttpRequestTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some("'auth_secret' must be a string".into()),
+                        diagnostics: None,
                     });
                 }
             },
@@ -522,6 +523,7 @@ impl Tool for HttpRequestTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                diagnostics: None,
             });
         }
 
@@ -535,6 +537,7 @@ impl Tool for HttpRequestTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -546,6 +549,7 @@ impl Tool for HttpRequestTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -557,6 +561,7 @@ impl Tool for HttpRequestTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -565,6 +570,7 @@ impl Tool for HttpRequestTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             });
         }
 
@@ -623,12 +629,14 @@ impl Tool for HttpRequestTool {
                     } else {
                         None
                     },
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("HTTP request failed: {e}")),
+                diagnostics: None,
             }),
         }
     }

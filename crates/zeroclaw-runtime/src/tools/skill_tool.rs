@@ -200,6 +200,7 @@ impl Tool for SkillShellTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(reason),
+                    diagnostics: None,
                 });
             }
         }
@@ -209,6 +210,7 @@ impl Tool for SkillShellTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Path blocked by security policy: {path}")),
+                diagnostics: None,
             });
         }
 
@@ -222,6 +224,7 @@ impl Tool for SkillShellTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to build runtime command: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -272,12 +275,14 @@ impl Tool for SkillShellTool {
                     } else {
                         Some(stderr)
                     },
+                    diagnostics: None,
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to execute command: {e}")),
+                diagnostics: None,
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -286,6 +291,7 @@ impl Tool for SkillShellTool {
                     "Command timed out after {}s and was killed",
                     self.timeout_secs
                 )),
+                diagnostics: None,
             }),
         }
     }
@@ -719,6 +725,7 @@ mod tests {
                 success: true,
                 output: format!("mock_result:{input}").into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -934,6 +941,7 @@ mod tests {
                 success: true,
                 output: args.to_string().into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }

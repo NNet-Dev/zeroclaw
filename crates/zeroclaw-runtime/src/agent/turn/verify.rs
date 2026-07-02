@@ -321,6 +321,7 @@ mod tests {
             output_data: None,
             success,
             error_reason: None,
+            diagnostics: None,
             duration: Duration::ZERO,
             receipt: None,
         }

@@ -58,6 +58,7 @@ impl BackupTool {
             .to_string()
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -122,6 +123,7 @@ impl BackupTool {
             success: true,
             output: serde_json::to_string_pretty(&items)?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -132,6 +134,7 @@ impl BackupTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Backup not found: {backup_name}")),
+                diagnostics: None,
             });
         }
         let manifest_path = backup_dir.join("manifest.json");
@@ -170,6 +173,7 @@ impl BackupTool {
             } else {
                 Some("Integrity check failed".into())
             },
+            diagnostics: None,
         })
     }
 
@@ -180,6 +184,7 @@ impl BackupTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Backup not found: {backup_name}")),
+                diagnostics: None,
             });
         }
 
@@ -207,6 +212,7 @@ impl BackupTool {
                 .to_string()
                 .into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -224,6 +230,7 @@ impl BackupTool {
             .to_string()
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -268,6 +275,7 @@ impl Tool for BackupTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'command' parameter".into()),
+                    diagnostics: None,
                 });
             }
         };
@@ -327,6 +335,7 @@ impl Tool for BackupTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Unknown command: {other}")),
+                diagnostics: None,
             }),
         }
     }

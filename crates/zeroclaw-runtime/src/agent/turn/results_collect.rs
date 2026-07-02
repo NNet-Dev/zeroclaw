@@ -17,6 +17,7 @@ use zeroclaw_api::tool::ToolSideEffect;
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::ParsedToolCall;
+use zeroclaw_tools::diagnostics::render_diagnostics_block;
 
 /// One round's collected tool results.
 pub(crate) struct CollectedResults {
@@ -141,6 +142,12 @@ pub(crate) fn collect_tool_results(
         let canonical_output =
             canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
         let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
+        if let Some(diagnostics) = outcome.diagnostics.as_deref() {
+            let block = render_diagnostics_block(diagnostics, max_tool_result_chars / 2);
+            if !block.is_empty() {
+                result_output = format!("{block}\n{result_output}");
+            }
+        }
         // Append HMAC receipt to tool result when receipts are enabled
         if let Some(ref receipt) = outcome.receipt {
             ::zeroclaw_log::record!(
@@ -246,6 +253,7 @@ mod tests {
             } else {
                 Some(output.to_string())
             },
+            diagnostics: None,
             duration: Duration::from_millis(1),
             receipt: None,
             output_data: None,
@@ -317,6 +325,38 @@ mod tests {
             0,
             "turn-test",
         )
+    }
+
+    #[test]
+    fn diagnostic_output_is_rendered_before_raw_tool_output() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let tool_calls = vec![ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command":"cargo check --message-format=json"}),
+            tool_call_id: None,
+        }];
+        let raw = r#"{"reason":"compiler-message","message":{"message":"cannot find value `barr` in this scope","code":{"code":"E0425"},"level":"error","spans":[{"file_name":"src/main.rs","line_start":42,"column_start":17,"is_primary":true}]}}"#;
+        // Diagnostics are parsed once in `tool_execution.rs` and carried on the
+        // outcome; results_collect only renders what it's handed (see
+        // `s2-c-tool-result-diagnostics-migration`). Populate it the same way
+        // the real dispatch path would.
+        let diagnostics =
+            zeroclaw_tools::diagnostics::parse_diagnostics("shell", &tool_calls[0].arguments, raw);
+        let mut tool_outcome = outcome(raw, false);
+        tool_outcome.diagnostics = Some(diagnostics);
+        let ordered = vec![Some(("shell".to_string(), None, tool_outcome))];
+
+        let collected = collect_with_detector(ordered, &tool_calls, &mut history, &mut detector)
+            .expect("diagnostic render should not fail");
+
+        assert!(collected.tool_results.contains("<diagnostics>"));
+        assert!(collected.tool_results.contains("ERROR src/main.rs [42:16]"));
+        assert!(collected.tool_results.contains("[E0425]"));
+        assert!(
+            collected.tool_results.find("<diagnostics>").unwrap()
+                < collected.tool_results.find(raw).unwrap()
+        );
     }
 
     #[test]

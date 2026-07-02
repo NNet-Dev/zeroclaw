@@ -81,11 +81,13 @@ impl Tool for McpToolWrapper {
                 success: true,
                 output: output.into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             }),
         }
     }
@@ -217,6 +219,7 @@ mod tests {
             success: true,
             output: "hello".to_string().into(),
             error: None,
+            diagnostics: None,
         };
     }
 

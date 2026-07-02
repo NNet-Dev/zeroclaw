@@ -187,6 +187,7 @@ impl WebFetchTool {
                     status.as_u16(),
                     error_body
                 )),
+                diagnostics: None,
             });
         }
 
@@ -215,6 +216,7 @@ impl WebFetchTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Firecrawl returned empty markdown content".into()),
+                diagnostics: None,
             });
         }
 
@@ -224,6 +226,7 @@ impl WebFetchTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -236,6 +239,7 @@ impl WebFetchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("HTTP request failed: {e}")),
+                    diagnostics: None,
                 };
             }
         };
@@ -250,6 +254,7 @@ impl WebFetchTool {
                     status.as_u16(),
                     status.canonical_reason().unwrap_or("Unknown")
                 )),
+                diagnostics: None,
             };
         }
 
@@ -276,6 +281,7 @@ impl WebFetchTool {
                     "Unsupported content type: {content_type}. \
                      web_fetch supports text/html, text/plain, text/markdown, and application/json."
                 )),
+                diagnostics: None,
             };
         };
 
@@ -286,6 +292,7 @@ impl WebFetchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to read response body: {e}")),
+                    diagnostics: None,
                 };
             }
         };
@@ -302,6 +309,7 @@ impl WebFetchTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         }
     }
 }
@@ -351,6 +359,7 @@ impl Tool for WebFetchTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                diagnostics: None,
             });
         }
 
@@ -364,6 +373,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -419,6 +429,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to build HTTP client: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -1248,6 +1259,7 @@ mod tests {
             success: false,
             output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
+            diagnostics: None,
         };
         assert!(!tool.should_fallback_to_firecrawl(&result));
     }
@@ -1262,6 +1274,7 @@ mod tests {
             success: false,
             output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
+            diagnostics: None,
         };
         assert!(tool.should_fallback_to_firecrawl(&result));
     }
@@ -1276,6 +1289,7 @@ mod tests {
             success: true,
             output: ToolOutput::default(),
             error: None,
+            diagnostics: None,
         };
         assert!(tool.should_fallback_to_firecrawl(&result));
     }
@@ -1290,6 +1304,7 @@ mod tests {
             success: true,
             output: "Loading...".into(), // < 100 chars, JS-only page
             error: None,
+            diagnostics: None,
         };
         assert!(tool.should_fallback_to_firecrawl(&result));
     }
@@ -1304,6 +1319,7 @@ mod tests {
             success: true,
             output: "A".repeat(200).into(), // well above 100 chars
             error: None,
+            diagnostics: None,
         };
         assert!(!tool.should_fallback_to_firecrawl(&result));
     }
@@ -1370,6 +1386,7 @@ mod tests {
             success: true,
             output: "A".repeat(99).into(),
             error: None,
+            diagnostics: None,
         };
         assert!(
             tool.should_fallback_to_firecrawl(&result),
@@ -1387,6 +1404,7 @@ mod tests {
             success: true,
             output: "A".repeat(100).into(),
             error: None,
+            diagnostics: None,
         };
         assert!(
             !tool.should_fallback_to_firecrawl(&result),

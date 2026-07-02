@@ -182,6 +182,7 @@ impl Tool for DatasheetTool {
                     success: false,
                     output: String::new().into(),
                     error: Some("missing required parameter: action".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -200,6 +201,7 @@ impl Tool for DatasheetTool {
                                 "missing required parameter: device_name for action 'search'"
                                     .to_string(),
                             ),
+                            diagnostics: None,
                         });
                     }
                 };
@@ -215,6 +217,7 @@ impl Tool for DatasheetTool {
                         )
                         .into(),
                         error: None,
+                        diagnostics: None,
                     });
                 }
 
@@ -228,6 +231,7 @@ impl Tool for DatasheetTool {
                     )
                     .into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
 
@@ -242,6 +246,7 @@ impl Tool for DatasheetTool {
                                 "missing required parameter: device_name for action 'download'"
                                     .to_string(),
                             ),
+                            diagnostics: None,
                         });
                     }
                 };
@@ -254,6 +259,7 @@ impl Tool for DatasheetTool {
                             error: Some(
                                 "missing required parameter: url for action 'download'".to_string(),
                             ),
+                            diagnostics: None,
                         });
                     }
                 };
@@ -271,11 +277,13 @@ impl Tool for DatasheetTool {
                         )
                         .into(),
                         error: None,
+                        diagnostics: None,
                     }),
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new().into(),
                         error: Some(format!("download failed: {e}")),
+                        diagnostics: None,
                     }),
                 }
             }
@@ -301,6 +309,7 @@ impl Tool for DatasheetTool {
                     success: true,
                     output: output.into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
 
@@ -315,6 +324,7 @@ impl Tool for DatasheetTool {
                                 "missing required parameter: device_name for action 'read'"
                                     .to_string(),
                             ),
+                            diagnostics: None,
                         });
                     }
                 };
@@ -327,6 +337,7 @@ impl Tool for DatasheetTool {
                         )
                         .into(),
                         error: None,
+                        diagnostics: None,
                     }),
                     None => Ok(ToolResult {
                         success: false,
@@ -335,6 +346,7 @@ impl Tool for DatasheetTool {
                             "no datasheet found for '{device}'. \
                              Use action='search' to find one."
                         )),
+                        diagnostics: None,
                     }),
                 }
             }
@@ -345,6 +357,7 @@ impl Tool for DatasheetTool {
                 error: Some(format!(
                     "unknown action '{other}'. Valid: search, download, list, read"
                 )),
+                diagnostics: None,
             }),
         }
     }

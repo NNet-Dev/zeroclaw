@@ -123,12 +123,14 @@ impl Tool for TodoWriteTool {
                     success: true,
                     output: format!("{total} todos tracked ({done} done)").into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new().into(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             }),
         }
     }

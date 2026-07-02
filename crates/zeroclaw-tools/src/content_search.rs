@@ -141,6 +141,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Empty pattern is not allowed.".into()),
+                diagnostics: None,
             });
         }
 
@@ -158,6 +159,7 @@ impl Tool for ContentSearchTool {
                 error: Some(format!(
                     "Invalid output_mode '{output_mode}'. Allowed values: content, files_with_matches, count."
                 )),
+                diagnostics: None,
             });
         }
 
@@ -205,6 +207,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Path traversal ('..') is not allowed.".into()),
+                diagnostics: None,
             });
         }
 
@@ -218,6 +221,7 @@ impl Tool for ContentSearchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Cannot resolve path '{search_path}': {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -229,6 +233,7 @@ impl Tool for ContentSearchTool {
                 error: Some(format!(
                     "Resolved path for '{search_path}' is outside the allowed workspace."
                 )),
+                diagnostics: None,
             });
         }
 
@@ -240,6 +245,7 @@ impl Tool for ContentSearchTool {
                 error: Some(
                     "Multiline matching requires ripgrep (rg), which is not available.".into(),
                 ),
+                diagnostics: None,
             });
         }
 
@@ -309,6 +315,7 @@ impl Tool for ContentSearchTool {
                             success: false,
                             output: ToolOutput::default(),
                             error: Some(format!("Search error: {e}")),
+                            diagnostics: None,
                         });
                     }
                     Ok(Err(e)) => {
@@ -316,6 +323,7 @@ impl Tool for ContentSearchTool {
                             success: false,
                             output: ToolOutput::default(),
                             error: Some(format!("Search task failed: {e}")),
+                            diagnostics: None,
                         });
                     }
                     Err(_) => {
@@ -323,6 +331,7 @@ impl Tool for ContentSearchTool {
                             success: false,
                             output: ToolOutput::default(),
                             error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
+                            diagnostics: None,
                         });
                     }
                 }
@@ -342,6 +351,7 @@ impl Tool for ContentSearchTool {
             success: true,
             output: final_output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -404,6 +414,7 @@ impl ContentSearchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to execute search command: {e}")),
+                    diagnostics: None,
                 });
             }
             Err(_) => {
@@ -411,6 +422,7 @@ impl ContentSearchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
+                    diagnostics: None,
                 });
             }
         };
@@ -423,6 +435,7 @@ impl ContentSearchTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Search error: {}", stderr.trim())),
+                diagnostics: None,
             });
         }
 

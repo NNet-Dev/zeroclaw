@@ -98,6 +98,7 @@ impl Tool for LlmTaskTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -109,6 +110,7 @@ impl Tool for LlmTaskTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing or empty required parameter: prompt".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -153,6 +155,7 @@ impl Tool for LlmTaskTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(format!("Failed to create model_provider: {e}")),
+                        diagnostics: None,
                     });
                 }
             };
@@ -170,6 +173,7 @@ impl Tool for LlmTaskTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("LLM call failed: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -182,11 +186,13 @@ impl Tool for LlmTaskTool {
                     success: true,
                     output: validated_json.into(),
                     error: None,
+                    diagnostics: None,
                 }),
                 Err(validation_error) => Ok(ToolResult {
                     success: false,
                     output: response.into(),
                     error: Some(format!("Schema validation failed: {validation_error}")),
+                    diagnostics: None,
                 }),
             }
         } else {
@@ -194,6 +200,7 @@ impl Tool for LlmTaskTool {
                 success: true,
                 output: response.into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }

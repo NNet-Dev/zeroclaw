@@ -1102,6 +1102,7 @@ impl Tool for WebSearchTool {
             success: true,
             output: result.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

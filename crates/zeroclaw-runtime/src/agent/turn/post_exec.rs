@@ -58,6 +58,7 @@ pub(crate) async fn record_executed_outcomes(
                 success: outcome.success,
                 output: outcome.output.clone().into(),
                 error: outcome.error_reason.clone(),
+                diagnostics: None,
             };
             let decisions = hooks
                 .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)

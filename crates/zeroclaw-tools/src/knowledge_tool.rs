@@ -150,6 +150,7 @@ impl Tool for KnowledgeTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("unknown action: {other}")),
+                diagnostics: None,
             }),
         }
     }
@@ -237,11 +238,13 @@ impl KnowledgeTool {
                 success: true,
                 output: json!({ "node_id": id }).to_string().into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("capture failed: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -324,6 +327,7 @@ impl KnowledgeTool {
                 .to_string()
                 .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -393,11 +397,13 @@ impl KnowledgeTool {
                 success: true,
                 output: "relationship created".to_string().into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("relate failed: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -442,6 +448,7 @@ impl KnowledgeTool {
                 .to_string()
                 .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -461,6 +468,7 @@ impl KnowledgeTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("missing 'tags' for expert_find".into()),
+                diagnostics: None,
             });
         }
 
@@ -483,6 +491,7 @@ impl KnowledgeTool {
                 .to_string()
                 .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -555,6 +564,7 @@ impl KnowledgeTool {
                 .to_string()
                 .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -564,11 +574,13 @@ impl KnowledgeTool {
                 success: true,
                 output: serde_json::to_string(&stats).unwrap_or_default().into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("failed to get stats: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -581,6 +593,7 @@ impl KnowledgeTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("missing 'node_id' for graph_neighbors".into()),
+                    diagnostics: None,
                 });
             }
         };
@@ -593,6 +606,7 @@ impl KnowledgeTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("node not found: {node_id}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -628,6 +642,7 @@ impl KnowledgeTool {
             .to_string()
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -639,6 +654,7 @@ impl KnowledgeTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -702,6 +718,7 @@ impl KnowledgeTool {
             .to_string()
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -713,6 +730,7 @@ impl KnowledgeTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -739,6 +757,7 @@ impl KnowledgeTool {
                 .to_string()
                 .into(),
             error: None,
+            diagnostics: None,
         })
     }
 

@@ -35,6 +35,7 @@ impl DataManagementTool {
             .to_string()
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -55,6 +56,7 @@ impl DataManagementTool {
             .to_string()
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -71,6 +73,7 @@ impl DataManagementTool {
             .to_string()
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -111,6 +114,7 @@ impl Tool for DataManagementTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'command' parameter".into()),
+                    diagnostics: None,
                 });
             }
         };
@@ -129,6 +133,7 @@ impl Tool for DataManagementTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Unknown command: {other}")),
+                diagnostics: None,
             }),
         }
     }

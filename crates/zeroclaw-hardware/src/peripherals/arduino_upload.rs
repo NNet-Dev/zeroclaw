@@ -61,6 +61,7 @@ impl Tool for ArduinoUploadTool {
                 success: false,
                 output: String::new().into(),
                 error: Some("Code cannot be empty".into()),
+                diagnostics: None,
             });
         }
 
@@ -73,6 +74,7 @@ impl Tool for ArduinoUploadTool {
                     "arduino-cli not found. Install it: https://arduino.github.io/arduino-cli/"
                         .into(),
                 ),
+                diagnostics: None,
             });
         }
 
@@ -86,6 +88,7 @@ impl Tool for ArduinoUploadTool {
                 success: false,
                 output: format!("Failed to create sketch dir: {}", e).into(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             });
         }
 
@@ -95,6 +98,7 @@ impl Tool for ArduinoUploadTool {
                 success: false,
                 output: format!("Failed to write sketch: {}", e).into(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             });
         }
 
@@ -114,6 +118,7 @@ impl Tool for ArduinoUploadTool {
                     success: false,
                     output: format!("arduino-cli compile failed: {}", e).into(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -125,6 +130,7 @@ impl Tool for ArduinoUploadTool {
                 success: false,
                 output: format!("Compile failed:\n{}", stderr).into(),
                 error: Some("Arduino compile error".into()),
+                diagnostics: None,
             });
         }
 
@@ -141,6 +147,7 @@ impl Tool for ArduinoUploadTool {
                     success: false,
                     output: format!("arduino-cli upload failed: {}", e).into(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -153,6 +160,7 @@ impl Tool for ArduinoUploadTool {
                 success: false,
                 output: format!("Upload failed:\n{}", stderr).into(),
                 error: Some("Arduino upload error".into()),
+                diagnostics: None,
             });
         }
 
@@ -162,6 +170,7 @@ impl Tool for ArduinoUploadTool {
                 "Sketch compiled and uploaded successfully. The Arduino is now running your code."
                     .into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

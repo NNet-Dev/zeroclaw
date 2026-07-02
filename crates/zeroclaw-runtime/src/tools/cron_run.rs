@@ -48,6 +48,7 @@ impl Tool for CronRunTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -58,6 +59,7 @@ impl Tool for CronRunTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'job_id' parameter".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -71,6 +73,7 @@ impl Tool for CronRunTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Security policy: read-only mode, cannot perform 'cron_run'".into()),
+                diagnostics: None,
             });
         }
 
@@ -79,6 +82,7 @@ impl Tool for CronRunTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                diagnostics: None,
             });
         }
 
@@ -89,6 +93,7 @@ impl Tool for CronRunTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -102,6 +107,7 @@ impl Tool for CronRunTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(reason),
+                diagnostics: None,
             });
         }
 
@@ -110,6 +116,7 @@ impl Tool for CronRunTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                diagnostics: None,
             });
         }
 
@@ -135,6 +142,7 @@ impl Tool for CronRunTool {
             } else {
                 Some("cron job execution failed".to_string())
             },
+            diagnostics: None,
         })
     }
 }

@@ -288,6 +288,7 @@ impl Tool for PipelineTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             });
         }
 
@@ -311,12 +312,14 @@ impl Tool for PipelineTool {
                     success: true,
                     output: output.into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             }),
         }
     }
@@ -675,6 +678,7 @@ mod tests {
                 success: true,
                 output: self.output.clone().into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }

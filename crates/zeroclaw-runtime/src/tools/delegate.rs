@@ -628,6 +628,7 @@ impl DelegateTool {
                 always_ask_label,
                 Self::INDEPENDENT_ALWAYS_ASK_DOC_REF
             )),
+            diagnostics: None,
         })
     }
 
@@ -1093,6 +1094,7 @@ impl Tool for DelegateTool {
                     "Unknown action '{action_value}'. Use {}.",
                     DelegateAction::usage()
                 )),
+                diagnostics: None,
             });
         };
 
@@ -1131,6 +1133,7 @@ impl Tool for DelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("'agent' parameter must not be empty".into()),
+                diagnostics: None,
             });
         }
 
@@ -1155,6 +1158,7 @@ impl Tool for DelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("'prompt' parameter must not be empty".into()),
+                diagnostics: None,
             });
         }
 
@@ -1214,6 +1218,7 @@ impl DelegateTool {
                             available.join(", ")
                         }
                     )),
+                    diagnostics: None,
                 });
             }
         };
@@ -1235,6 +1240,7 @@ impl DelegateTool {
                     depth = self.depth,
                     max = max_depth
                 )),
+                diagnostics: None,
             });
         }
 
@@ -1247,6 +1253,7 @@ impl DelegateTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(error),
+                    diagnostics: None,
                 });
             }
 
@@ -1255,6 +1262,7 @@ impl DelegateTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("{e:#}")),
+                    diagnostics: None,
                 });
             }
             if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
@@ -1276,6 +1284,7 @@ impl DelegateTool {
                     error: Some(format!(
                         "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
                     )),
+                    diagnostics: None,
                 });
             }
         };
@@ -1335,6 +1344,7 @@ impl DelegateTool {
                     error: Some(format!(
                         "Agent '{agent_name}' timed out after {timeout_secs}s"
                     )),
+                    diagnostics: None,
                 });
             }
         };
@@ -1352,12 +1362,14 @@ impl DelegateTool {
                         format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{rendered}",)
                             .into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}",)),
+                diagnostics: None,
             }),
         }
     }
@@ -1391,6 +1403,7 @@ impl DelegateTool {
                             available.join(", ")
                         }
                     )),
+                    diagnostics: None,
                 });
             }
         };
@@ -1405,6 +1418,7 @@ impl DelegateTool {
                     depth = self.depth,
                     max = max_depth
                 )),
+                diagnostics: None,
             });
         }
 
@@ -1416,6 +1430,7 @@ impl DelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -1426,6 +1441,7 @@ impl DelegateTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("{e:#}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -1447,6 +1463,7 @@ impl DelegateTool {
                      finish (check_result) or cancel one (cancel_task) before starting more.",
                     Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS
                 )),
+                diagnostics: None,
             });
         }
 
@@ -1663,6 +1680,7 @@ impl DelegateTool {
             )
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -1695,6 +1713,7 @@ impl DelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("'prompt' parameter must not be empty".into()),
+                diagnostics: None,
             });
         }
 
@@ -1709,6 +1728,7 @@ impl DelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("'parallel' array must contain at least one agent name".into()),
+                diagnostics: None,
             });
         }
 
@@ -1728,6 +1748,7 @@ impl DelegateTool {
                             available.join(", ")
                         }
                     )),
+                    diagnostics: None,
                 });
             }
         }
@@ -1742,6 +1763,7 @@ impl DelegateTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("{e:#}")),
+                    diagnostics: None,
                 });
             }
             if let Some(refusal) = self.independent_always_ask_refusal(name) {
@@ -1870,6 +1892,7 @@ impl DelegateTool {
             } else {
                 Some("One or more parallel agents failed".into())
             },
+            diagnostics: None,
         })
     }
 
@@ -2012,6 +2035,7 @@ impl DelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e),
+                diagnostics: None,
             });
         }
 
@@ -2020,6 +2044,7 @@ impl DelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("No result found for task_id '{task_id}'")),
+                diagnostics: None,
             });
         };
         let error = result.error.clone();
@@ -2041,6 +2066,7 @@ impl DelegateTool {
             } else {
                 None
             },
+            diagnostics: None,
         })
     }
 
@@ -2052,6 +2078,7 @@ impl DelegateTool {
                     success: false,
                     output: String::new().into(),
                     error: Some(error.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -2062,6 +2089,7 @@ impl DelegateTool {
                     success: false,
                     output: String::new().into(),
                     error: Some(error.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -2114,6 +2142,7 @@ impl DelegateTool {
                     }))?
                     .into(),
                     error,
+                    diagnostics: None,
                 });
             }
 
@@ -2129,6 +2158,7 @@ impl DelegateTool {
                 success: true,
                 output: "No background delegate results found.".into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -2163,6 +2193,7 @@ impl DelegateTool {
                 success: true,
                 output: "No background delegate results found.".into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -2170,6 +2201,7 @@ impl DelegateTool {
             success: true,
             output: serde_json::to_string_pretty(&results)?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -2214,6 +2246,7 @@ impl DelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e),
+                diagnostics: None,
             });
         }
 
@@ -2223,6 +2256,7 @@ impl DelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("No task found for task_id '{task_id}'")),
+                diagnostics: None,
             });
         }
 
@@ -2238,6 +2272,7 @@ impl DelegateTool {
                     "Task '{task_id}' is not running (status: {:?})",
                     result.status
                 )),
+                diagnostics: None,
             });
         }
 
@@ -2276,6 +2311,7 @@ impl DelegateTool {
                 format!("Task '{task_id}' marked cancelled (it had already settled).").into()
             },
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -2468,6 +2504,7 @@ impl DelegateTool {
                     "Agent '{agent_name}' is agentic but risk_profile '{}' is not configured",
                     agent_config.risk_profile
                 )),
+                diagnostics: None,
             });
         };
 
@@ -2479,6 +2516,7 @@ impl DelegateTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(format!("{e:#}")),
+                        diagnostics: None,
                     });
                 }
             },
@@ -2520,6 +2558,7 @@ impl DelegateTool {
                             error: Some(format!(
                                 "Failed to initialize independent delegate tools for target '{agent_name}': {e:#}"
                             )),
+                            diagnostics: None,
                         });
                     }
                 }
@@ -2548,6 +2587,7 @@ impl DelegateTool {
                                 error: Some(format!(
                                     "Failed to initialize memory for delegate target '{agent_name}': {e:#}"
                                 )),
+                                diagnostics: None,
                             });
                         }
                     }
@@ -2697,12 +2737,14 @@ impl DelegateTool {
                     )
                     .into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}")),
+                diagnostics: None,
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -2710,6 +2752,7 @@ impl DelegateTool {
                 error: Some(format!(
                     "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
                 )),
+                diagnostics: None,
             }),
         }
     }
@@ -3090,6 +3133,7 @@ mod tests {
                 success: true,
                 output: format!("echo:{value}").into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -5078,6 +5122,7 @@ mod tests {
                 success: true,
                 output: "mcp_fake_output".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -5525,6 +5570,7 @@ mod tests {
                     success: true,
                     output: ToolOutput::default(),
                     error: None,
+                    diagnostics: None,
                 })
             }
         }
@@ -7812,6 +7858,7 @@ command = "echo hi"
                 success: true,
                 output: "read".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -7841,6 +7888,7 @@ command = "echo hi"
                 success: true,
                 output: "written".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -7870,6 +7918,7 @@ command = "echo hi"
                 success: true,
                 output: ToolOutput::default(),
                 error: None,
+                diagnostics: None,
             })
         }
     }

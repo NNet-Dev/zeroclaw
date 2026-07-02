@@ -134,6 +134,7 @@ impl Tool for ChannelRoomTool {
                     "tool-channel-room-error-security",
                     &[("err", &error)],
                 )),
+                diagnostics: None,
             });
         }
 
@@ -147,6 +148,7 @@ impl Tool for ChannelRoomTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(error),
+                    diagnostics: None,
                 });
             }
         };
@@ -193,6 +195,7 @@ async fn create_room(
             .to_string()
             .into(),
             error: None,
+            diagnostics: None,
         }),
         Err(error) => {
             let error = error.to_string();
@@ -203,6 +206,7 @@ async fn create_room(
                     "tool-channel-room-error-create-failed",
                     &[("err", &error)],
                 )),
+                diagnostics: None,
             })
         }
     }
@@ -228,6 +232,7 @@ async fn invite_user(
             .to_string()
             .into(),
             error: None,
+            diagnostics: None,
         }),
         Err(error) => {
             let error = error.to_string();
@@ -238,6 +243,7 @@ async fn invite_user(
                     "tool-channel-room-error-invite-failed",
                     &[("err", &error)],
                 )),
+                diagnostics: None,
             })
         }
     }

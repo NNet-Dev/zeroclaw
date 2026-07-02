@@ -23,6 +23,7 @@ pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
 pub mod data_management;
+pub mod diagnostics;
 pub mod discord_search;
 pub mod email_imap;
 pub mod email_read;

@@ -40,6 +40,7 @@ impl Tool for CronListTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -54,11 +55,13 @@ impl Tool for CronListTool {
                 )?
                 .into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             }),
         }
     }

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_tools::diagnostics::strip_ansi;
 
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -290,6 +291,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(reason),
+                    diagnostics: None,
                 });
             }
         }
@@ -307,6 +309,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to build runtime command: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -379,6 +382,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to spawn command: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -400,8 +404,8 @@ impl Tool for ShellTool {
                     let (stdout_capture, stderr_capture) =
                         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    let mut stdout = decode_output(&stdout_capture.bytes);
-                    let mut stderr = decode_output(&stderr_capture.bytes);
+                    let mut stdout = strip_ansi(&decode_output(&stdout_capture.bytes));
+                    let mut stderr = strip_ansi(&decode_output(&stderr_capture.bytes));
 
                     if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
                         append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
@@ -418,6 +422,7 @@ impl Tool for ShellTool {
                         } else {
                             Some(stderr)
                         },
+                        diagnostics: None,
                     }
                 }
                 Ok(Err(e)) => {
@@ -426,6 +431,7 @@ impl Tool for ShellTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(format!("Failed to execute command: {e}")),
+                        diagnostics: None,
                     }
                 }
                 Err(_) => {
@@ -437,6 +443,7 @@ impl Tool for ShellTool {
                         error: Some(format!(
                             "Command timed out after {timeout_secs}s and was killed"
                         )),
+                        diagnostics: None,
                     }
                 }
             };
@@ -736,6 +743,18 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn shell_strips_ansi_from_output() {
+        let tool = ShellTool::new(unrestricted_shell_test_security(), test_runtime());
+        let result = tool
+            .execute(json!({"command": "printf '\\033[31merror\\033[0m'"}))
+            .await
+            .expect("ansi command execution should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "error");
     }
 
     #[tokio::test]

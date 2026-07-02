@@ -32,6 +32,7 @@ impl SessionValidationError {
             success: false,
             output: ToolOutput::default(),
             error: Some(self.message().into()),
+            diagnostics: None,
         }
     }
 }
@@ -175,6 +176,7 @@ impl Tool for SessionsListTool {
                 success: true,
                 output: "No active sessions found.".into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -194,6 +196,7 @@ impl Tool for SessionsListTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -248,6 +251,7 @@ impl Tool for SessionsHistoryTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -282,6 +286,7 @@ impl Tool for SessionsHistoryTool {
                 success: true,
                 output: format!("No messages found for session '{session_id}'.").into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -303,6 +308,7 @@ impl Tool for SessionsHistoryTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -357,6 +363,7 @@ impl Tool for SessionsSendTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -397,6 +404,7 @@ impl Tool for SessionsSendTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Message content must not be empty.".into()),
+                diagnostics: None,
             });
         }
 
@@ -409,6 +417,7 @@ impl Tool for SessionsSendTool {
                 error: Some(format!(
                     "Session '{session_id}' not found. Use sessions_list or sessions_current to choose an existing session. Gateway dashboard sessions are stored as 'gw_<session_id>'."
                 )),
+                diagnostics: None,
             });
         };
 
@@ -427,12 +436,14 @@ impl Tool for SessionsSendTool {
                     success: true,
                     output: output.into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to send message: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -483,7 +494,8 @@ impl Tool for SessionsCurrentTool {
                 error: Some(
                     "No active session context. This tool is only available during a gateway session.".into(),
                 ),
-            });
+                            diagnostics: None,
+});
         };
 
         let mut output = format!("Current session: {key}\n");
@@ -500,6 +512,7 @@ impl Tool for SessionsCurrentTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -569,6 +582,7 @@ impl Tool for SessionResetTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -598,6 +612,7 @@ impl Tool for SessionResetTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(error),
+                        diagnostics: None,
                     });
                 }
             },
@@ -610,17 +625,20 @@ impl Tool for SessionResetTool {
                 success: true,
                 output: format!("Session '{target_session_key}' is already empty.").into(),
                 error: None,
+                diagnostics: None,
             }),
             Ok(count) => Ok(ToolResult {
                 success: true,
                 output: format!("Session '{target_session_key}' reset ({count} messages cleared).")
                     .into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to reset session: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -690,6 +708,7 @@ impl Tool for SessionDeleteTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -719,6 +738,7 @@ impl Tool for SessionDeleteTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(error),
+                        diagnostics: None,
                     });
                 }
             },
@@ -733,6 +753,7 @@ impl Tool for SessionDeleteTool {
                 success: true,
                 output: format!("Session '{target_session_key}' deleted.").into(),
                 error: None,
+                diagnostics: None,
             }),
             Ok(false) if !existed => Ok(ToolResult {
                 success: true,
@@ -741,6 +762,7 @@ impl Tool for SessionDeleteTool {
                 )
                 .into(),
                 error: None,
+                diagnostics: None,
             }),
             Ok(false) => Ok(ToolResult {
                 success: false,
@@ -749,11 +771,13 @@ impl Tool for SessionDeleteTool {
                     "Session '{target_session_key}' exists but could not be deleted \
                      — the storage backend may not support this operation."
                 )),
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to delete session: {e}")),
+                diagnostics: None,
             }),
         }
     }

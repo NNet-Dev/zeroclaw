@@ -70,6 +70,7 @@ impl Tool for MemoryPurgeTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -87,6 +88,7 @@ impl Tool for MemoryPurgeTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(format!("Failed to purge namespace: {e}")),
+                        diagnostics: None,
                     });
                 }
             }
@@ -103,6 +105,7 @@ impl Tool for MemoryPurgeTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(format!("Failed to purge session: {e}")),
+                        diagnostics: None,
                     });
                 }
             }
@@ -116,6 +119,7 @@ impl Tool for MemoryPurgeTool {
                 output_parts.join("; ").into()
             },
             error: None,
+            diagnostics: None,
         })
     }
 }

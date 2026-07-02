@@ -176,6 +176,7 @@ impl Tool for SubprocessTool {
                         "plugin '{}': could not attach stdout pipe",
                         self.manifest.tool.name
                     )),
+                    diagnostics: None,
                 });
             }
             Some(stdout) => {
@@ -211,6 +212,7 @@ impl Tool for SubprocessTool {
                             format!("; stderr: {}", stderr_msg)
                         }
                     )),
+                    diagnostics: None,
                 })
             }
 
@@ -232,6 +234,7 @@ impl Tool for SubprocessTool {
                             format!("; stderr: {}", stderr_msg)
                         }
                     )),
+                    diagnostics: None,
                 })
             }
 
@@ -260,6 +263,7 @@ impl Tool for SubprocessTool {
                                 format!("; stderr: {}", stderr_msg)
                             }
                         )),
+                        diagnostics: None,
                     });
                 }
 
@@ -283,6 +287,7 @@ impl Tool for SubprocessTool {
                                         format!("; stderr: {}", stderr_msg)
                                     }
                                 )),
+                                diagnostics: None,
                             });
                         }
                         Ok(result)
@@ -303,6 +308,7 @@ impl Tool for SubprocessTool {
                                 line.to_string()
                             }
                         )),
+                        diagnostics: None,
                     }),
                 }
             }

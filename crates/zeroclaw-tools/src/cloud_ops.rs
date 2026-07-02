@@ -72,6 +72,7 @@ impl Tool for CloudOpsTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("'action' parameter is required".into()),
+                    diagnostics: None,
                 });
             }
         };
@@ -113,6 +114,7 @@ impl Tool for CloudOpsTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("'input' parameter is required and cannot be empty".into()),
+                diagnostics: None,
             });
         }
 
@@ -124,6 +126,7 @@ impl Tool for CloudOpsTool {
                     "Cloud model_provider '{}' is not in supported_clouds: {:?}",
                     cloud, self.config.supported_clouds
                 )),
+                diagnostics: None,
             });
         }
 
@@ -139,6 +142,7 @@ impl Tool for CloudOpsTool {
                     "Unknown action '{}'. Valid: review_iac, assess_migration, cost_analysis, architecture_review",
                     action
                 )),
+                diagnostics: None,
             }),
         }
     }
@@ -179,6 +183,7 @@ impl CloudOpsTool {
             success: true,
             output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -195,6 +200,7 @@ impl CloudOpsTool {
             success: true,
             output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -213,6 +219,7 @@ impl CloudOpsTool {
             success: true,
             output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -230,6 +237,7 @@ impl CloudOpsTool {
             success: true,
             output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

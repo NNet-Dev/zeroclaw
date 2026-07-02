@@ -63,6 +63,7 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                diagnostics: None,
             });
         }
 
@@ -73,6 +74,7 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                diagnostics: None,
             });
         }
 
@@ -176,6 +178,7 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Path blocked by security policy: {path}")),
+                    diagnostics: None,
                 });
             }
         }
@@ -250,6 +253,7 @@ mod tests {
                 success: true,
                 output: "ok".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -412,6 +416,7 @@ mod tests {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("validation failed".into()),
+                    diagnostics: None,
                 })
             }
         }

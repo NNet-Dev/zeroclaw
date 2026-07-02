@@ -61,6 +61,7 @@ impl Tool for MemoryForgetTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -69,16 +70,19 @@ impl Tool for MemoryForgetTool {
                 success: true,
                 output: format!("Forgot memory: {key}").into(),
                 error: None,
+                diagnostics: None,
             }),
             Ok(false) => Ok(ToolResult {
                 success: true,
                 output: format!("No memory found with key: {key}").into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to forget memory: {e}")),
+                diagnostics: None,
             }),
         }
     }

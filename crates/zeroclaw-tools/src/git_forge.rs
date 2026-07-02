@@ -903,6 +903,7 @@ impl Tool for GitForgeTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -913,6 +914,7 @@ impl Tool for GitForgeTool {
                 success: true,
                 output: Self::describe().to_string().into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -924,6 +926,7 @@ impl Tool for GitForgeTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e),
+                    diagnostics: None,
                 });
             }
         };
@@ -936,6 +939,7 @@ impl Tool for GitForgeTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(ferr("tool-git-forge-error-raw-requires-method")),
+                        diagnostics: None,
                     });
                 }
             };
@@ -946,6 +950,7 @@ impl Tool for GitForgeTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(ferr("tool-git-forge-error-raw-requires-path")),
+                        diagnostics: None,
                     });
                 }
             };
@@ -964,6 +969,7 @@ impl Tool for GitForgeTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(ferr("tool-git-forge-error-requires-resource")),
+                    diagnostics: None,
                 });
             }
             let repo = match Self::str_arg(&args, "repo") {
@@ -973,6 +979,7 @@ impl Tool for GitForgeTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(ferr("tool-git-forge-error-missing-repo")),
+                        diagnostics: None,
                     });
                 }
             };
@@ -990,6 +997,7 @@ impl Tool for GitForgeTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(e),
+                        diagnostics: None,
                     });
                 }
             }
@@ -1005,6 +1013,7 @@ impl Tool for GitForgeTool {
                             .to_string()
                             .into(),
                         error: None,
+                        diagnostics: None,
                     })
                 } else {
                     Ok(ToolResult {
@@ -1014,6 +1023,7 @@ impl Tool for GitForgeTool {
                             "{label} failed: HTTP {}: {}",
                             resp.status, resp.body
                         )),
+                        diagnostics: None,
                     })
                 }
             }
@@ -1021,6 +1031,7 @@ impl Tool for GitForgeTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("{label} failed: {e}")),
+                diagnostics: None,
             }),
         }
     }

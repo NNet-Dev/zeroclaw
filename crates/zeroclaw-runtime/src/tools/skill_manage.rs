@@ -90,6 +90,7 @@ impl Tool for SkillsListTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to read skills directory: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -99,6 +100,7 @@ impl Tool for SkillsListTool {
                 success: true,
                 output: "0 installed skills.".to_string().into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -114,6 +116,7 @@ impl Tool for SkillsListTool {
             success: true,
             output: out.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -205,6 +208,7 @@ impl Tool for SkillViewTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -217,6 +221,7 @@ impl Tool for SkillViewTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Skill '{slug}' not found: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -249,6 +254,7 @@ impl Tool for SkillViewTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -359,6 +365,7 @@ impl Tool for SkillManageTool {
                 error: Some(format!(
                     "Unknown action '{other}'. Valid: patch, write_file, archive"
                 )),
+                diagnostics: None,
             }),
         }
     }
@@ -422,6 +429,7 @@ impl SkillManageTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -431,6 +439,7 @@ impl SkillManageTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Skill '{slug}' not found (no SKILL.md)")),
+                diagnostics: None,
             });
         }
         // Reject symlinks — the patch target must be a regular file.
@@ -441,6 +450,7 @@ impl SkillManageTool {
                 error: Some(format!(
                     "SKILL.md for '{slug}' is a symlink — refusing patch"
                 )),
+                diagnostics: None,
             });
         }
         let content = args
@@ -455,6 +465,7 @@ impl SkillManageTool {
                     "patch content exceeds {MAX_FILE_BYTES} bytes ({} given)",
                     content.len()
                 )),
+                diagnostics: None,
             });
         }
         let reason = args
@@ -467,6 +478,7 @@ impl SkillManageTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Skill improvement is disabled (enabled: false)".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -479,6 +491,7 @@ impl SkillManageTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Skill '{slug}' is on cooldown — try again later")),
+                diagnostics: None,
             });
         }
 
@@ -499,18 +512,21 @@ impl SkillManageTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(err),
+                        diagnostics: None,
                     });
                 }
                 Ok(ToolResult {
                     success: true,
                     output: format!("Patched skill '{slug}'.").into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Patch failed: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -523,6 +539,7 @@ impl SkillManageTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -546,6 +563,7 @@ impl SkillManageTool {
                     "file_path must start with one of: {}",
                     ALLOWED_FILE_PREFIXES.join(", ")
                 )),
+                diagnostics: None,
             });
         }
         if file_path.contains("..") || file_path.contains('\0') {
@@ -553,6 +571,7 @@ impl SkillManageTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("file_path contains forbidden segment".to_string()),
+                diagnostics: None,
             });
         }
         if content.len() > MAX_FILE_BYTES {
@@ -563,6 +582,7 @@ impl SkillManageTool {
                     "content exceeds {MAX_FILE_BYTES} bytes ({} given)",
                     content.len()
                 )),
+                diagnostics: None,
             });
         }
 
@@ -581,6 +601,7 @@ impl SkillManageTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("file_path escapes skill directory".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -591,6 +612,7 @@ impl SkillManageTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("target path is a symlink — refusing write".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -619,6 +641,7 @@ impl SkillManageTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Post-write audit errored: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -631,12 +654,14 @@ impl SkillManageTool {
                     "Wrote {file_path} but skill failed audit (rolled back): {}",
                     report.summary()
                 )),
+                diagnostics: None,
             });
         }
         Ok(ToolResult {
             success: true,
             output: format!("Wrote {file_path} for skill '{slug}'.").into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -649,6 +674,7 @@ impl SkillManageTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(e.to_string()),
+                        diagnostics: None,
                     });
                 }
             };
@@ -667,6 +693,7 @@ impl SkillManageTool {
                 error: Some(format!(
                     "Archive directory {ARCHIVE_DIRNAME} is a symlink — refusing archive"
                 )),
+                diagnostics: None,
             });
         }
         let canonical_archive_dir = archive_dir_path
@@ -677,6 +704,7 @@ impl SkillManageTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("archive directory escapes canonical skills root".to_string()),
+                diagnostics: None,
             });
         }
         let target = canonical_archive_dir.join(slug);
@@ -693,6 +721,7 @@ impl SkillManageTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("archive target escapes archive directory".to_string()),
+                diagnostics: None,
             });
         }
         tokio::fs::rename(&canonical_skill_dir, &final_target).await?;
@@ -700,6 +729,7 @@ impl SkillManageTool {
             success: true,
             output: format!("Archived skill '{slug}' to {}", final_target.display()).into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

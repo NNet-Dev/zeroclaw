@@ -408,6 +408,7 @@ impl Tool for WeatherTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing required parameter 'location'".into()),
+                    diagnostics: None,
                 });
             }
         };
@@ -431,12 +432,14 @@ impl Tool for WeatherTool {
                     success: true,
                     output: output.into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             }),
         }
     }

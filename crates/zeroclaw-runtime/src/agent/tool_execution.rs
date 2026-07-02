@@ -9,6 +9,8 @@ use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::diagnostics::Diagnostic;
+use zeroclaw_tools::diagnostics::parse_diagnostics;
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
@@ -75,6 +77,7 @@ fn unavailable_tool_outcome(
         output: reason.clone(),
         success: false,
         error_reason: Some(reason),
+        diagnostics: None,
         duration,
         receipt: None,
         output_data: None,
@@ -90,6 +93,7 @@ pub struct ToolExecutionOutcome {
     /// `output`.
     pub output_data: Option<serde_json::Value>,
     pub success: bool,
+    pub diagnostics: Option<Vec<Diagnostic>>,
     /// Raw failure text on the data path. Credential scrubbing is a rendering
     /// concern applied at each human-facing surface (observer events,
     /// post-execution log line, CLI progress), never stored pre-scrubbed here.
@@ -185,6 +189,7 @@ pub(crate) async fn execute_one_tool(
             output: reason.clone(),
             success: false,
             error_reason: Some(reason),
+            diagnostics: None,
             duration,
             receipt: None,
             output_data: None,
@@ -316,11 +321,13 @@ pub(crate) async fn execute_one_tool(
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
                     });
+                    let diagnostics = diagnostics_from_result(call_name, &call_arguments, &r);
                     Ok(ToolExecutionOutcome {
                         output: normalized_output.to_string(),
                         output_data: r.output.into_data(),
                         success: true,
                         error_reason: None,
+                        diagnostics,
                         duration,
                         receipt,
                     })
@@ -341,6 +348,7 @@ pub(crate) async fn execute_one_tool(
                         output: format!("Error: {reason}"),
                         success: false,
                         error_reason: Some(reason),
+                        diagnostics: None,
                         duration,
                         receipt: None,
                         output_data: None,
@@ -379,6 +387,7 @@ pub(crate) async fn execute_one_tool(
                     output: reason.clone(),
                     success: false,
                     error_reason: Some(reason),
+                    diagnostics: None,
                     duration,
                     receipt: None,
                     output_data: None,
@@ -410,6 +419,19 @@ pub(crate) async fn execute_one_tool(
     }
 
     outcome
+}
+
+fn diagnostics_from_result(
+    tool_name: &str,
+    call_arguments: &serde_json::Value,
+    result: &zeroclaw_api::tool::ToolResult,
+) -> Option<Vec<Diagnostic>> {
+    if result.diagnostics.is_some() {
+        return result.diagnostics.clone();
+    }
+
+    let diagnostics = parse_diagnostics(tool_name, call_arguments, &result.output);
+    (!diagnostics.is_empty()).then_some(diagnostics)
 }
 
 // ── Parallel / sequential decision ───────────────────────────────────────
@@ -524,12 +546,13 @@ pub(crate) async fn execute_tools_sequential(
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolDispatchContext, execute_one_tool};
+    use super::{ToolDispatchContext, diagnostics_from_result, execute_one_tool};
     use crate::observability::noop::NoopObserver;
     use crate::tools::ActivatedToolSet;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use zeroclaw_api::diagnostics::{Diagnostic, DiagnosticSeverity};
     use zeroclaw_api::tool::Tool;
 
     /// Minimal tool that records invocations. Used to verify that the
@@ -585,10 +608,47 @@ mod tests {
                 success: true,
                 output: "executed via poisoned lock recovery".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
 
+    #[test]
+    fn tool_supplied_diagnostics_take_precedence_over_parser_diagnostics() {
+        let producer_diagnostic = Diagnostic {
+            file: "src/producer.rs".to_string(),
+            line: Some(7),
+            col: Some(2),
+            severity: DiagnosticSeverity::Warning,
+            code: Some("PRODUCER001".to_string()),
+            message: "diagnostic supplied directly by the tool".to_string(),
+        };
+        let parseable_cargo_output = r#"{"reason":"compiler-message","message":{"message":"cannot find value `parsed` in this scope","code":{"code":"E0425"},"level":"error","spans":[{"file_name":"src/parsed.rs","line_start":42,"column_start":17,"is_primary":true}]}}"#;
+        let result = crate::tools::ToolResult {
+            success: true,
+            output: parseable_cargo_output.into(),
+            error: None,
+            diagnostics: Some(vec![producer_diagnostic.clone()]),
+        };
+
+        let diagnostics = diagnostics_from_result(
+            "shell",
+            &serde_json::json!({"command":"cargo check --message-format=json"}),
+            &result,
+        )
+        .expect("tool-supplied diagnostics should be returned");
+
+        assert_eq!(diagnostics, vec![producer_diagnostic]);
+    }
+
+    /// Regression: execute_one_tool must recover a poisoned
+    /// ActivatedToolSet mutex and still resolve the activated tool
+    /// instead of panicking.
+    ///
+    /// Before the fix, the code used `.lock().unwrap()`, which panics
+    /// on a poisoned mutex. The recovery path (`into_inner()`) allows
+    /// the turn to proceed with the last valid state of the activated
+    /// tool set.
     #[tokio::test]
     async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));

@@ -275,6 +275,7 @@ impl GitOperationsTool {
                 .unwrap_or_default()
                 .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -360,6 +361,7 @@ impl GitOperationsTool {
                 .unwrap_or_default()
                 .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -405,6 +407,7 @@ impl GitOperationsTool {
                 .unwrap_or_default()
                 .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -445,6 +448,7 @@ impl GitOperationsTool {
             .unwrap_or_default()
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -518,11 +522,13 @@ impl GitOperationsTool {
                 success: true,
                 output: format!("Committed: {message}").into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Commit failed: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -561,11 +567,13 @@ impl GitOperationsTool {
                 success: true,
                 output: format!("Staged: {}", sanitized.join(" ")).into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Add failed: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -609,11 +617,13 @@ impl GitOperationsTool {
                 success: true,
                 output: format!("Switched to branch: {branch_name}").into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Checkout failed: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -694,11 +704,13 @@ impl GitOperationsTool {
                 success: true,
                 output: out.into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Stash {action} failed: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -774,6 +786,7 @@ impl GitOperationsTool {
                         .unwrap_or_default()
                         .into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             "add" => {
@@ -809,6 +822,7 @@ impl GitOperationsTool {
                     success: true,
                     output: format!("Worktree added at: {worktree_path}").into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             "remove" => {
@@ -834,6 +848,7 @@ impl GitOperationsTool {
                     success: true,
                     output: format!("Worktree removed: {worktree_path}").into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             "prune" => {
@@ -843,6 +858,7 @@ impl GitOperationsTool {
                     success: true,
                     output: "Worktree prune completed".to_string().into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             _ => anyhow::bail!(
@@ -938,6 +954,7 @@ impl Tool for GitOperationsTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'operation' parameter".into()),
+                    diagnostics: None,
                 });
             }
         };
@@ -950,6 +967,7 @@ impl Tool for GitOperationsTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Invalid path: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -977,6 +995,7 @@ impl Tool for GitOperationsTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(error_msg),
+                    diagnostics: None,
                 });
             }
         }
@@ -990,6 +1009,7 @@ impl Tool for GitOperationsTool {
                     error: Some(
                         "Action blocked: git write operations require higher autonomy level".into(),
                     ),
+                    diagnostics: None,
                 });
             }
 
@@ -999,6 +1019,7 @@ impl Tool for GitOperationsTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some("Action blocked: read-only mode".into()),
+                        diagnostics: None,
                     });
                 }
                 AutonomyLevel::Supervised | AutonomyLevel::Full => {}
@@ -1011,6 +1032,7 @@ impl Tool for GitOperationsTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                diagnostics: None,
             });
         }
 
@@ -1029,6 +1051,7 @@ impl Tool for GitOperationsTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Unknown operation: {operation}")),
+                diagnostics: None,
             }),
         }
     }

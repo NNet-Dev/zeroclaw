@@ -119,6 +119,7 @@ impl FileEditTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("old_string must not be empty".into()),
+                diagnostics: None,
             });
         }
 
@@ -128,6 +129,7 @@ impl FileEditTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                diagnostics: None,
             });
         }
 
@@ -143,6 +145,7 @@ impl FileEditTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Invalid path: missing parent directory".into()),
+                diagnostics: None,
             });
         };
 
@@ -153,6 +156,7 @@ impl FileEditTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to resolve file path: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -166,6 +170,7 @@ impl FileEditTool {
                     self.security
                         .resolved_path_violation_message(&resolved_parent),
                 ),
+                diagnostics: None,
             });
         }
 
@@ -174,6 +179,7 @@ impl FileEditTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Invalid path: missing file name".into()),
+                diagnostics: None,
             });
         };
 
@@ -187,6 +193,7 @@ impl FileEditTool {
                     self.security
                         .runtime_config_violation_message(&resolved_target),
                 ),
+                diagnostics: None,
             });
         }
 
@@ -201,6 +208,7 @@ impl FileEditTool {
                     "Refusing to edit through symlink: {}",
                     resolved_target.display()
                 )),
+                diagnostics: None,
             });
         }
 
@@ -212,6 +220,7 @@ impl FileEditTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to read file: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -223,6 +232,7 @@ impl FileEditTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(no_match_diagnostic(&content, old_string)),
+                diagnostics: None,
             });
         }
 
@@ -233,6 +243,7 @@ impl FileEditTool {
                 error: Some(format!(
                     "old_string matches {match_count} times; must match exactly once"
                 )),
+                diagnostics: None,
             });
         }
 
@@ -247,11 +258,13 @@ impl FileEditTool {
                 )
                 .into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to write file: {e}")),
+                diagnostics: None,
             }),
         }
     }

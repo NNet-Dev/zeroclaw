@@ -260,6 +260,7 @@ impl Tool for TextBrowserTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                diagnostics: None,
             });
         }
 
@@ -268,6 +269,7 @@ impl Tool for TextBrowserTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                diagnostics: None,
             });
         }
 
@@ -278,6 +280,7 @@ impl Tool for TextBrowserTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -291,6 +294,7 @@ impl Tool for TextBrowserTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -326,6 +330,7 @@ impl Tool for TextBrowserTool {
                         success: true,
                         output: text.into(),
                         error: None,
+                        diagnostics: None,
                     })
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -337,6 +342,7 @@ impl Tool for TextBrowserTool {
                             output.status,
                             stderr.trim()
                         )),
+                        diagnostics: None,
                     })
                 }
             }
@@ -344,6 +350,7 @@ impl Tool for TextBrowserTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to execute {browser}: {e}")),
+                diagnostics: None,
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -352,6 +359,7 @@ impl Tool for TextBrowserTool {
                     "{browser} timed out after {} seconds",
                     timeout.as_secs()
                 )),
+                diagnostics: None,
             }),
         }
     }

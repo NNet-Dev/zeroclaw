@@ -68,6 +68,7 @@ impl ModelRoutingConfigTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                diagnostics: None,
             });
         }
 
@@ -76,6 +77,7 @@ impl ModelRoutingConfigTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                diagnostics: None,
             });
         }
 
@@ -476,6 +478,7 @@ impl ModelRoutingConfigTool {
             success: true,
             output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -522,6 +525,7 @@ impl ModelRoutingConfigTool {
             }))?
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -633,6 +637,7 @@ impl ModelRoutingConfigTool {
                         "Model '{model_name}' is not available: {probe_err}. Reverted to '{reverted_model}'.",
                     ).into(),
                     error: None,
+                    diagnostics: None,
                 });
             }
             // Retryable errors (e.g. transient network issues) — keep the
@@ -648,6 +653,7 @@ impl ModelRoutingConfigTool {
             }))?
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -821,6 +827,7 @@ impl ModelRoutingConfigTool {
             }))?
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -867,6 +874,7 @@ impl ModelRoutingConfigTool {
             }))?
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -994,6 +1002,7 @@ impl ModelRoutingConfigTool {
             }))?
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -1016,6 +1025,7 @@ impl ModelRoutingConfigTool {
             }))?
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -1201,6 +1211,7 @@ impl Tool for ModelRoutingConfigTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error.to_string()),
+                diagnostics: None,
             }),
         }
     }

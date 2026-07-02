@@ -43,6 +43,7 @@ async fn resolve_device_port(
                         success: false,
                         output: String::new().into(),
                         error: Some("no device found — is a board connected via USB?".to_string()),
+                        diagnostics: None,
                     });
                 }
                 multiple => {
@@ -53,6 +54,7 @@ async fn resolve_device_port(
                             "multiple devices found ({}); specify the \"device\" parameter",
                             multiple.join(", ")
                         )),
+                        diagnostics: None,
                     });
                 }
             }
@@ -63,6 +65,7 @@ async fn resolve_device_port(
         success: false,
         output: String::new().into(),
         error: Some(format!("device '{alias}' not found in registry")),
+        diagnostics: None,
     })?;
 
     let runtime = device.runtime;
@@ -73,6 +76,7 @@ async fn resolve_device_port(
         error: Some(format!(
             "device '{alias}' has no serial port — is it connected?"
         )),
+        diagnostics: None,
     })?;
 
     Ok((alias, port.to_string(), runtime))
@@ -86,6 +90,7 @@ fn unsupported_runtime(runtime: &DeviceRuntime, tool: &str) -> ToolResult {
         error: Some(format!(
             "{runtime} runtime is not yet supported for {tool} — coming soon"
         )),
+        diagnostics: None,
     }
 }
 
@@ -197,6 +202,7 @@ impl Tool for DeviceReadCodeTool {
                     .into()
                 },
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => {
                 // mpremote cat fails if main.py doesn't exist — not a fatal error.
@@ -208,12 +214,14 @@ impl Tool for DeviceReadCodeTool {
                         )
                         .into(),
                         error: None,
+                        diagnostics: None,
                     })
                 } else {
                     Ok(ToolResult {
                         success: false,
                         output: String::new().into(),
                         error: Some(format!("Failed to read code from {alias}: {e}")),
+                        diagnostics: None,
                     })
                 }
             }
@@ -273,6 +281,7 @@ impl Tool for DeviceWriteCodeTool {
                     success: false,
                     output: String::new().into(),
                     error: Some("missing required parameter: code".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -282,6 +291,7 @@ impl Tool for DeviceWriteCodeTool {
                 success: false,
                 output: String::new().into(),
                 error: Some("code parameter is empty — provide a program to write".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -315,6 +325,7 @@ impl Tool for DeviceWriteCodeTool {
                     success: false,
                     output: String::new().into(),
                     error: Some(format!("failed to create temp file: {e}")),
+                    diagnostics: None,
                 });
             }
             Err(e) => {
@@ -322,6 +333,7 @@ impl Tool for DeviceWriteCodeTool {
                     success: false,
                     output: String::new().into(),
                     error: Some(format!("temp file task failed: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -334,6 +346,7 @@ impl Tool for DeviceWriteCodeTool {
                 success: false,
                 output: String::new().into(),
                 error: Some(format!("failed to write temp file: {e}")),
+                diagnostics: None,
             });
         }
 
@@ -382,6 +395,7 @@ impl Tool for DeviceWriteCodeTool {
                         )
                         .into(),
                         error: None,
+                        diagnostics: None,
                     })
                 } else {
                     Ok(ToolResult {
@@ -393,6 +407,7 @@ impl Tool for DeviceWriteCodeTool {
                         )
                         .into(),
                         error: None,
+                        diagnostics: None,
                     })
                 }
             }
@@ -400,6 +415,7 @@ impl Tool for DeviceWriteCodeTool {
                 success: false,
                 output: String::new().into(),
                 error: Some(format!("Failed to deploy code to {alias}: {e}")),
+                diagnostics: None,
             }),
         }
     }
@@ -456,6 +472,7 @@ impl Tool for DeviceExecTool {
                     success: false,
                     output: String::new().into(),
                     error: Some("missing required parameter: code".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -467,6 +484,7 @@ impl Tool for DeviceExecTool {
                 error: Some(
                     "code parameter is empty — provide a code snippet to execute".to_string(),
                 ),
+                diagnostics: None,
             });
         }
 
@@ -500,6 +518,7 @@ impl Tool for DeviceExecTool {
                     success: false,
                     output: String::new().into(),
                     error: Some(format!("failed to create temp file: {e}")),
+                    diagnostics: None,
                 });
             }
             Err(e) => {
@@ -507,6 +526,7 @@ impl Tool for DeviceExecTool {
                     success: false,
                     output: String::new().into(),
                     error: Some(format!("temp file task failed: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -519,6 +539,7 @@ impl Tool for DeviceExecTool {
                 success: false,
                 output: String::new().into(),
                 error: Some(format!("failed to write temp file: {e}")),
+                diagnostics: None,
             });
         }
 
@@ -554,12 +575,14 @@ impl Tool for DeviceExecTool {
                         format!("Output from {alias}:\n{output}").into()
                     },
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new().into(),
                 error: Some(format!("Failed to execute code on {alias}: {e}")),
+                diagnostics: None,
             }),
         }
     }

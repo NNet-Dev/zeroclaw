@@ -66,6 +66,7 @@ impl CronAddTool {
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
+                diagnostics: None,
             });
         }
 
@@ -74,6 +75,7 @@ impl CronAddTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -82,6 +84,7 @@ impl CronAddTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -151,6 +154,7 @@ fn schedule_error_result(error: String) -> ToolResult {
         success: false,
         output: ToolOutput::default(),
         error: Some(error),
+        diagnostics: None,
     }
 }
 
@@ -307,6 +311,7 @@ impl Tool for CronAddTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -317,6 +322,7 @@ impl Tool for CronAddTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(error),
+                        diagnostics: None,
                     });
                 }
 
@@ -327,6 +333,7 @@ impl Tool for CronAddTool {
                             success: false,
                             output: ToolOutput::default(),
                             error: Some(error),
+                            diagnostics: None,
                         });
                     }
                 }
@@ -338,6 +345,7 @@ impl Tool for CronAddTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(error),
+                        diagnostics: None,
                     });
                 }
             },
@@ -346,6 +354,7 @@ impl Tool for CronAddTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'schedule' parameter".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -363,6 +372,7 @@ impl Tool for CronAddTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Invalid job_type: {other}")),
+                    diagnostics: None,
                 });
             }
             None => {
@@ -391,6 +401,7 @@ impl Tool for CronAddTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(format!("Invalid delivery config: {e}")),
+                        diagnostics: None,
                     });
                 }
             },
@@ -406,6 +417,7 @@ impl Tool for CronAddTool {
                             success: false,
                             output: ToolOutput::default(),
                             error: Some("Missing 'command' for shell job".to_string()),
+                            diagnostics: None,
                         });
                     }
                 };
@@ -415,6 +427,7 @@ impl Tool for CronAddTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(reason),
+                        diagnostics: None,
                     });
                 }
 
@@ -445,6 +458,7 @@ impl Tool for CronAddTool {
                             success: false,
                             output: ToolOutput::default(),
                             error: Some("Missing 'prompt' for agent job".to_string()),
+                            diagnostics: None,
                         });
                     }
                 };
@@ -457,6 +471,7 @@ impl Tool for CronAddTool {
                                 success: false,
                                 output: ToolOutput::default(),
                                 error: Some(format!("Invalid session_target: {e}")),
+                                diagnostics: None,
                             });
                         }
                     },
@@ -481,6 +496,7 @@ impl Tool for CronAddTool {
                                 success: false,
                                 output: ToolOutput::default(),
                                 error: Some(format!("Invalid allowed_tools: {e}")),
+                                diagnostics: None,
                             });
                         }
                     },
@@ -521,11 +537,13 @@ impl Tool for CronAddTool {
                 success: true,
                 output: serde_json::to_string_pretty(&cron_add_output(&job))?.into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             }),
         }
     }

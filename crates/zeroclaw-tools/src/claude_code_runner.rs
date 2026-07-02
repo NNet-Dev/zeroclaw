@@ -105,6 +105,7 @@ impl Tool for ClaudeCodeRunnerTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -139,6 +140,7 @@ impl Tool for ClaudeCodeRunnerTool {
                             "working_directory '{}' does not exist or is not accessible",
                             wd
                         )),
+                        diagnostics: None,
                     });
                 }
             };
@@ -152,6 +154,7 @@ impl Tool for ClaudeCodeRunnerTool {
                             "workspace directory '{}' does not exist or is not accessible",
                             workspace.display()
                         )),
+                        diagnostics: None,
                     });
                 }
             };
@@ -164,6 +167,7 @@ impl Tool for ClaudeCodeRunnerTool {
                         wd,
                         workspace.display()
                     )),
+                    diagnostics: None,
                 });
             }
             canonical_wd
@@ -233,6 +237,7 @@ impl Tool for ClaudeCodeRunnerTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to create tmux session: {stderr}")),
+                    diagnostics: None,
                 });
             }
             Err(e) => {
@@ -242,6 +247,7 @@ impl Tool for ClaudeCodeRunnerTool {
                     error: Some(format!(
                         "tmux not found or failed to execute: {e}. Install tmux to use claude_code_runner."
                     )),
+                    diagnostics: None,
                 });
             }
             _ => {}
@@ -273,6 +279,7 @@ impl Tool for ClaudeCodeRunnerTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to send command to tmux session: {e}")),
+                diagnostics: None,
             });
         }
 
@@ -316,6 +323,7 @@ impl Tool for ClaudeCodeRunnerTool {
             success: true,
             output: output_parts.join("\n").into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

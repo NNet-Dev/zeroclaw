@@ -107,6 +107,7 @@ impl Tool for CloudPatternsTool {
                     success: true,
                     output: serde_json::to_string_pretty(&output)?.into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             "match" => {
@@ -115,6 +116,7 @@ impl Tool for CloudPatternsTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some("'workload' parameter is required for 'match' action".into()),
+                        diagnostics: None,
                     });
                 }
 
@@ -130,12 +132,14 @@ impl Tool for CloudPatternsTool {
                     success: true,
                     output: serde_json::to_string_pretty(&output)?.into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             _ => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Unknown action '{}'. Valid: match, list", action)),
+                diagnostics: None,
             }),
         }
     }

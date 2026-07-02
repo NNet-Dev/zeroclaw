@@ -173,6 +173,7 @@ impl Tool for ImageInfoTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(error),
+                    diagnostics: None,
                 });
             }
         };
@@ -184,6 +185,7 @@ impl Tool for ImageInfoTool {
                 error: Some(
                     "Resolved image path is outside the allowed readable roots.".to_string(),
                 ),
+                diagnostics: None,
             });
         }
 
@@ -210,6 +212,7 @@ impl Tool for ImageInfoTool {
                 error: Some(format!(
                     "Image too large: {file_size} bytes (max {MAX_IMAGE_BYTES} bytes)"
                 )),
+                diagnostics: None,
             });
         }
 
@@ -244,6 +247,7 @@ impl Tool for ImageInfoTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

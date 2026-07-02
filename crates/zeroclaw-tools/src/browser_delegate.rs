@@ -174,6 +174,7 @@ impl Tool for BrowserDelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("browser_delegate tool is denied by security policy".into()),
+                diagnostics: None,
             });
         }
         if !self.security.record_action() {
@@ -181,6 +182,7 @@ impl Tool for BrowserDelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("browser_delegate action rate-limited".into()),
+                diagnostics: None,
             });
         }
 
@@ -195,6 +197,7 @@ impl Tool for BrowserDelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("'task' parameter is required and cannot be empty".into()),
+                diagnostics: None,
             });
         }
 
@@ -212,6 +215,7 @@ impl Tool for BrowserDelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("URL validation failed: {e}")),
+                diagnostics: None,
             });
         }
 
@@ -223,6 +227,7 @@ impl Tool for BrowserDelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("task text contains a disallowed URL: {e}")),
+                diagnostics: None,
             });
         }
 
@@ -240,6 +245,7 @@ impl Tool for BrowserDelegateTool {
                     "unsupported extract_format '{}': allowed values are 'text', 'json', 'summary'",
                     extract_format
                 )),
+                diagnostics: None,
             });
         }
 
@@ -272,6 +278,7 @@ impl Tool for BrowserDelegateTool {
                         } else {
                             Some(stderr_truncated)
                         },
+                        diagnostics: None,
                     })
                 } else {
                     Ok(ToolResult {
@@ -281,6 +288,7 @@ impl Tool for BrowserDelegateTool {
                             "CLI exited with status {}: {}",
                             output.status, stderr_truncated
                         )),
+                        diagnostics: None,
                     })
                 }
             }
@@ -288,6 +296,7 @@ impl Tool for BrowserDelegateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("failed to spawn browser CLI: {e}")),
+                diagnostics: None,
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -296,6 +305,7 @@ impl Tool for BrowserDelegateTool {
                     "browser task timed out after {}s",
                     self.config.task_timeout_secs
                 )),
+                diagnostics: None,
             }),
         }
     }

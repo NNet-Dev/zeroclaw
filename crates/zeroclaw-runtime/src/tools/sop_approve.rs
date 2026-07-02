@@ -134,6 +134,7 @@ impl Tool for SopApproveTool {
                     success: true,
                     output: output.into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Ok(BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)) => Ok(ToolResult {
@@ -145,16 +146,19 @@ impl Tool for SopApproveTool {
                      or the dashboard."
                         .to_string(),
                 ),
+                diagnostics: None,
             }),
             Ok(BrokerOutcome::Resolved(ResolveOutcome::AlreadyResolved)) => Ok(ToolResult {
                 success: true,
                 output: format!("Run {run_id} was already resolved.").into(),
                 error: None,
+                diagnostics: None,
             }),
             Ok(BrokerOutcome::Resolved(ResolveOutcome::Denied)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Run {run_id} was denied.")),
+                diagnostics: None,
             }),
             Ok(BrokerOutcome::Resolved(ResolveOutcome::NotWaiting))
             | Ok(BrokerOutcome::NotWaiting) => Ok(ToolResult {
@@ -163,6 +167,7 @@ impl Tool for SopApproveTool {
                 error: Some(format!(
                     "Approval failed: run {run_id} is not waiting for approval."
                 )),
+                diagnostics: None,
             }),
             // A quorum can record a valid vote without clearing the gate yet.
             Ok(BrokerOutcome::PendingQuorum { have, need }) => Ok(ToolResult {
@@ -173,6 +178,7 @@ impl Tool for SopApproveTool {
                 )
                 .into(),
                 error: None,
+                diagnostics: None,
             }),
             Ok(BrokerOutcome::NotAuthorized { required_group }) => Ok(ToolResult {
                 success: false,
@@ -181,6 +187,7 @@ impl Tool for SopApproveTool {
                     "Not authorized: approving this step requires membership in the \
                      '{required_group}' group."
                 )),
+                diagnostics: None,
             }),
             // Fail closed: the step names an approval policy absent from config, so
             // the gate is left waiting rather than cleared.
@@ -191,11 +198,13 @@ impl Tool for SopApproveTool {
                     "Approval failed: step names approval policy '{name}', which is not \
                      defined in [sop.approval].policies; the gate is left waiting."
                 )),
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Approval failed: {e}")),
+                diagnostics: None,
             }),
         }
     }

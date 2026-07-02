@@ -169,12 +169,14 @@ impl Tool for SopExecuteTool {
                     success: true,
                     output: output.into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to start SOP: {e}")),
+                diagnostics: None,
             }),
         }
     }

@@ -112,6 +112,7 @@ impl ProjectIntelTool {
             success: true,
             output: rendered.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -219,6 +220,7 @@ impl ProjectIntelTool {
             success: true,
             output: tpl.render(&vars).into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -296,6 +298,7 @@ impl ProjectIntelTool {
             success: true,
             output: body.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -337,6 +340,7 @@ impl ProjectIntelTool {
             success: true,
             output: tpl.render(&vars).into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -348,6 +352,7 @@ impl ProjectIntelTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("No task descriptions provided".into()),
+                diagnostics: None,
             });
         }
 
@@ -370,6 +375,7 @@ impl ProjectIntelTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -563,6 +569,7 @@ impl Tool for ProjectIntelTool {
                 error: Some(format!(
                     "Unknown action '{other}'. Valid actions: status_report, risk_scan, draft_update, sprint_summary, effort_estimate"
                 )),
+                diagnostics: None,
             }),
         }
     }

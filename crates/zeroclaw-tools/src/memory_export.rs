@@ -93,12 +93,14 @@ impl Tool for MemoryExportTool {
                     success: true,
                     output: json_output.into(),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Export failed: {e}")),
+                diagnostics: None,
             }),
         }
     }

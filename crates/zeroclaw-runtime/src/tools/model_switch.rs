@@ -123,6 +123,7 @@ impl Tool for ModelSwitchTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -138,6 +139,7 @@ impl Tool for ModelSwitchTool {
                     "Unknown action: {}. Valid actions: get, set, list_model_providers, list_models",
                     action
                 )),
+                diagnostics: None,
             }),
         }
     }
@@ -155,6 +157,7 @@ impl ModelSwitchTool {
                 "note": "To switch models, use action 'set' with dotted <type>.<alias> model_provider and model parameters"
             }))?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -168,6 +171,7 @@ impl ModelSwitchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'model_provider' parameter for 'set' action".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -181,6 +185,7 @@ impl ModelSwitchTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'model' parameter for 'set' action".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -199,6 +204,7 @@ impl ModelSwitchTool {
                         "configured_provider_profiles": configured_profiles
                     }))?.into(),
                     error: Some(error),
+                    diagnostics: None,
                 });
             }
         };
@@ -209,6 +215,7 @@ impl ModelSwitchTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Model ID cannot be empty".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -225,6 +232,7 @@ impl ModelSwitchTool {
                 "note": "The active runtime path will consume this provider-profile/model switch where model_switch is supported. This does not write persisted config."
             }))?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -255,6 +263,7 @@ impl ModelSwitchTool {
                 "example": "Use action 'set' with a dotted provider profile ref such as 'openai.default'"
             }))?.into(),
             error: None,
+            diagnostics: None,
         })
     }
 
@@ -278,6 +287,7 @@ impl ModelSwitchTool {
                     error: Some(
                         "Missing 'model_provider' parameter for 'list_models' action".to_string(),
                     ),
+                    diagnostics: None,
                 });
             }
         };
@@ -293,6 +303,7 @@ impl ModelSwitchTool {
                         "configured_provider_profiles": configured_model_provider_profiles(&self.config)
                     }))?.into(),
                     error: Some(error),
+                    diagnostics: None,
                 });
             }
         };
@@ -330,6 +341,7 @@ impl ModelSwitchTool {
                     "note": "No common models listed for this model_provider family. Check model_provider documentation for available models."
                 }))?.into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -342,6 +354,7 @@ impl ModelSwitchTool {
             }))?
             .into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

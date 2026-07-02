@@ -3412,6 +3412,7 @@ mod tests {
                 success: true,
                 output: "tool-out".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -3624,6 +3625,7 @@ mod tests {
                 success: true,
                 output: "tool-out".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -3652,6 +3654,7 @@ mod tests {
                 success: true,
                 output: "tool-out".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -7526,6 +7529,7 @@ mod tests {
                 success: true,
                 output: "ok".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }
@@ -8816,6 +8820,7 @@ mod tests {
                 success: true,
                 output: "model switch queued".into(),
                 error: None,
+                diagnostics: None,
             })
         }
     }

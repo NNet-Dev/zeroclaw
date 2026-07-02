@@ -37,6 +37,7 @@ impl CronUpdateTool {
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
+                diagnostics: None,
             });
         }
 
@@ -45,6 +46,7 @@ impl CronUpdateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -53,6 +55,7 @@ impl CronUpdateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -204,6 +207,7 @@ impl Tool for CronUpdateTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
+                diagnostics: None,
             });
         }
 
@@ -214,6 +218,7 @@ impl Tool for CronUpdateTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'job_id' parameter".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -226,6 +231,7 @@ impl Tool for CronUpdateTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(e.to_string()),
+                        diagnostics: None,
                     });
                 }
             };
@@ -238,6 +244,7 @@ impl Tool for CronUpdateTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'patch' parameter".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -249,6 +256,7 @@ impl Tool for CronUpdateTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(error),
+                    diagnostics: None,
                 });
             }
         };
@@ -272,11 +280,13 @@ impl Tool for CronUpdateTool {
                 success: true,
                 output: serde_json::to_string_pretty(&cron_job_output(&job)?)?.into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
+                diagnostics: None,
             }),
         }
     }

@@ -159,6 +159,7 @@ impl Tool for EmailSearchTool {
                 success: true,
                 output: "No emails found matching your criteria.".into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -217,6 +218,7 @@ impl Tool for EmailSearchTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

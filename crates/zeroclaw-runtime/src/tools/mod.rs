@@ -2490,6 +2490,7 @@ mod tests {
             success: true,
             output: "hello".into(),
             error: None,
+            diagnostics: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();
@@ -2504,6 +2505,7 @@ mod tests {
             success: false,
             output: ToolOutput::default(),
             error: Some("boom".into()),
+            diagnostics: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();

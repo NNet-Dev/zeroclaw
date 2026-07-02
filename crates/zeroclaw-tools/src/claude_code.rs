@@ -94,6 +94,7 @@ impl Tool for ClaudeCodeTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -152,6 +153,7 @@ impl Tool for ClaudeCodeTool {
                             "working_directory '{}' does not exist or is not accessible",
                             wd
                         )),
+                        diagnostics: None,
                     });
                 }
             };
@@ -165,6 +167,7 @@ impl Tool for ClaudeCodeTool {
                             "workspace directory '{}' does not exist or is not accessible",
                             workspace.display()
                         )),
+                        diagnostics: None,
                     });
                 }
             };
@@ -177,6 +180,7 @@ impl Tool for ClaudeCodeTool {
                         wd,
                         workspace.display()
                     )),
+                    diagnostics: None,
                 });
             }
             canonical_wd
@@ -287,6 +291,7 @@ impl Tool for ClaudeCodeTool {
                         } else {
                             Some(stderr)
                         },
+                        diagnostics: None,
                     })
                 } else {
                     // JSON parse failed — return raw stdout (defensive)
@@ -298,6 +303,7 @@ impl Tool for ClaudeCodeTool {
                         } else {
                             Some(stderr)
                         },
+                        diagnostics: None,
                     })
                 }
             }
@@ -315,6 +321,7 @@ impl Tool for ClaudeCodeTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(msg),
+                    diagnostics: None,
                 })
             }
             Err(_) => {
@@ -327,6 +334,7 @@ impl Tool for ClaudeCodeTool {
                         "Claude Code timed out after {}s and was killed",
                         self.config.timeout_secs
                     )),
+                    diagnostics: None,
                 })
             }
         }

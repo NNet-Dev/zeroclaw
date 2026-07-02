@@ -116,6 +116,7 @@ impl Tool for CalculatorTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing required parameter: function".to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -163,12 +164,14 @@ impl Tool for CalculatorTool {
                         output,
                     ),
                     error: None,
+                    diagnostics: None,
                 })
             }
             Err(err) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(err),
+                diagnostics: None,
             }),
         }
     }

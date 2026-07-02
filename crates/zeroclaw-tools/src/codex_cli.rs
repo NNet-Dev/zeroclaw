@@ -64,6 +64,7 @@ impl Tool for CodexCliTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 
@@ -101,6 +102,7 @@ impl Tool for CodexCliTool {
                             "working_directory '{}' does not exist or is not accessible",
                             wd
                         )),
+                        diagnostics: None,
                     });
                 }
             };
@@ -114,6 +116,7 @@ impl Tool for CodexCliTool {
                             "workspace directory '{}' does not exist or is not accessible",
                             workspace.display()
                         )),
+                        diagnostics: None,
                     });
                 }
             };
@@ -126,6 +129,7 @@ impl Tool for CodexCliTool {
                         wd,
                         workspace.display()
                     )),
+                    diagnostics: None,
                 });
             }
             canonical_wd
@@ -200,6 +204,7 @@ impl Tool for CodexCliTool {
                     } else {
                         Some(stderr)
                     },
+                    diagnostics: None,
                 })
             }
             Ok(Err(e)) => {
@@ -216,6 +221,7 @@ impl Tool for CodexCliTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(msg),
+                    diagnostics: None,
                 })
             }
             Err(_) => {
@@ -228,6 +234,7 @@ impl Tool for CodexCliTool {
                         "Codex CLI timed out after {}s and was killed",
                         self.config.timeout_secs
                     )),
+                    diagnostics: None,
                 })
             }
         }

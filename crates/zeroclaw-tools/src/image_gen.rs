@@ -105,6 +105,7 @@ impl ImageGenTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing required parameter: 'prompt'".into()),
+                    diagnostics: None,
                 });
             }
         };
@@ -140,6 +141,7 @@ impl ImageGenTool {
                     "Invalid size '{size}'. Valid values: {}",
                     VALID_SIZES.join(", ")
                 )),
+                diagnostics: None,
             });
         }
 
@@ -165,6 +167,7 @@ impl ImageGenTool {
                     "Invalid model identifier '{model}'. \
                      Must be a fal.ai model path (e.g. 'fal-ai/flux/schnell')."
                 )),
+                diagnostics: None,
             });
         }
 
@@ -176,6 +179,7 @@ impl ImageGenTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(msg),
+                    diagnostics: None,
                 });
             }
         };
@@ -206,6 +210,7 @@ impl ImageGenTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("fal.ai API error ({status}): {body_text}")),
+                diagnostics: None,
             });
         }
 
@@ -242,6 +247,7 @@ impl ImageGenTool {
                     "Failed to download image from {image_url} ({})",
                     img_resp.status()
                 )),
+                diagnostics: None,
             });
         }
 
@@ -270,6 +276,7 @@ impl ImageGenTool {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -321,6 +328,7 @@ impl Tool for ImageGenTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(error),
+                diagnostics: None,
             });
         }
 

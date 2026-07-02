@@ -100,6 +100,7 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                diagnostics: None,
             });
         }
 
@@ -115,6 +116,7 @@ impl Tool for FileWriteTool {
                      workspace directory is bind-mounted into the container."
                         .into(),
                 ),
+                diagnostics: None,
             });
         }
 
@@ -133,6 +135,7 @@ impl Tool for FileWriteTool {
                             success: false,
                             output: ToolOutput::default(),
                             error: Some(format!("Invalid base64 content: {e}")),
+                            diagnostics: None,
                         });
                     }
                 }
@@ -144,6 +147,7 @@ impl Tool for FileWriteTool {
                     error: Some(format!(
                         "Unsupported encoding '{other}' (expected 'utf8' or 'base64')"
                     )),
+                    diagnostics: None,
                 });
             }
         };
@@ -159,6 +163,7 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Invalid path: missing parent directory".into()),
+                diagnostics: None,
             });
         };
 
@@ -173,6 +178,7 @@ impl Tool for FileWriteTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!("Failed to resolve file path: {e}")),
+                    diagnostics: None,
                 });
             }
         };
@@ -185,6 +191,7 @@ impl Tool for FileWriteTool {
                     self.security
                         .resolved_path_violation_message(&resolved_parent),
                 ),
+                diagnostics: None,
             });
         }
 
@@ -193,6 +200,7 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Invalid path: missing file name".into()),
+                diagnostics: None,
             });
         };
 
@@ -206,6 +214,7 @@ impl Tool for FileWriteTool {
                     self.security
                         .runtime_config_violation_message(&resolved_target),
                 ),
+                diagnostics: None,
             });
         }
 
@@ -220,6 +229,7 @@ impl Tool for FileWriteTool {
                     "Refusing to write through symlink: {}",
                     resolved_target.display()
                 )),
+                diagnostics: None,
             });
         }
 
@@ -228,11 +238,13 @@ impl Tool for FileWriteTool {
                 success: true,
                 output: format!("Written {} bytes to {path}", bytes.len()).into(),
                 error: None,
+                diagnostics: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Failed to write file: {e}")),
+                diagnostics: None,
             }),
         }
     }

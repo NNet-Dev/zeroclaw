@@ -762,6 +762,7 @@ impl BrowserTool {
                     .unwrap_or_default()
                     .into(),
                 error: None,
+                diagnostics: None,
             })
         }
 
@@ -924,6 +925,7 @@ impl BrowserTool {
                     success: true,
                     output: output.into(),
                     error: None,
+                    diagnostics: None,
                 });
             }
 
@@ -941,6 +943,7 @@ impl BrowserTool {
                 success: false,
                 output: ToolOutput::default(),
                 error,
+                diagnostics: None,
             });
         }
 
@@ -949,6 +952,7 @@ impl BrowserTool {
                 success: true,
                 output: body.into(),
                 error: None,
+                diagnostics: None,
             });
         }
 
@@ -959,6 +963,7 @@ impl BrowserTool {
                 "computer-use sidecar request failed with status {status}: {}",
                 body.trim()
             )),
+            diagnostics: None,
         })
     }
 
@@ -987,12 +992,14 @@ impl BrowserTool {
                 success: true,
                 output: output.into(),
                 error: None,
+                diagnostics: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: resp.error,
+                diagnostics: None,
             })
         }
     }
@@ -1134,6 +1141,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                diagnostics: None,
             });
         }
 
@@ -1147,6 +1155,7 @@ impl Tool for BrowserTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(error.to_string()),
+                    diagnostics: None,
                 });
             }
         };
@@ -1167,6 +1176,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Unknown action: {action_str}")),
+                diagnostics: None,
             });
         }
 
@@ -1179,6 +1189,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(unavailable_action_for_backend_error(action_str, backend)),
+                diagnostics: None,
             });
         }
 
@@ -1189,6 +1200,7 @@ impl Tool for BrowserTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(e.to_string()),
+                    diagnostics: None,
                 });
             }
         };

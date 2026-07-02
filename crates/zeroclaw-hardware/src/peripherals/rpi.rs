@@ -117,6 +117,7 @@ impl Tool for RpiGpioReadTool {
             success: true,
             output: format!("pin {} = {}", pin, value).into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
@@ -190,6 +191,7 @@ impl Tool for RpiGpioWriteTool {
             success: true,
             output: format!("pin {} = {}", pin, value).into(),
             error: None,
+            diagnostics: None,
         })
     }
 }

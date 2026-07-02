@@ -1,6 +1,17 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostics::Diagnostic;
+
+/// Boilerplate-collapsing macro: pair a concrete `Tool` impl with a
+/// matching `Attributable` impl that surfaces the supplied `ToolKind`
+/// and uses the tool's `name()` as its alias.
+///
+/// Invoke once per `Tool` struct, in the same module as the struct:
+///
+/// ```ignore
+/// crate::tool_attribution!(ShellTool, ::zeroclaw_api::attribution::ToolKind::Shell);
+/// ```
 #[macro_export]
 macro_rules! tool_attribution {
     ($ty:ty, $kind:expr) => {
@@ -171,6 +182,8 @@ pub struct ToolResult {
     pub success: bool,
     pub output: ToolOutput,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Vec<Diagnostic>>,
 }
 
 impl ToolResult {
@@ -180,6 +193,7 @@ impl ToolResult {
             success: true,
             output: output.into(),
             error: None,
+            diagnostics: None,
         }
     }
 
@@ -189,6 +203,7 @@ impl ToolResult {
             success: false,
             output: ToolOutput::default(),
             error: Some(error.into()),
+            diagnostics: None,
         }
     }
 
@@ -198,6 +213,7 @@ impl ToolResult {
             success: false,
             output: output.into(),
             error: Some(error.into()),
+            diagnostics: None,
         }
     }
 }
@@ -467,5 +483,22 @@ mod tests {
         let out = with_ephemeral_workspace_warning("body");
         assert!(out.starts_with(EPHEMERAL_WORKSPACE_WARNING));
         assert!(out.ends_with("\n\nbody"));
+    }
+
+    #[test]
+    fn legacy_tool_result_json_defaults_diagnostics() {
+        let result: ToolResult =
+            serde_json::from_str(r#"{"success":true,"output":"ok","error":null}"#).unwrap();
+
+        assert_eq!(result.output, "ok");
+        assert!(result.diagnostics.is_none());
+    }
+
+    #[test]
+    fn empty_diagnostics_are_not_serialized() {
+        let result = ToolResult::ok("ok");
+        let encoded = serde_json::to_value(result).unwrap();
+
+        assert!(encoded.get("diagnostics").is_none());
     }
 }

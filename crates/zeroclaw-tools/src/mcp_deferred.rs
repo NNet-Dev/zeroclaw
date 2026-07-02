@@ -334,6 +334,7 @@ mod tests {
                     success: true,
                     output: ToolOutput::default(),
                     error: None,
+                    diagnostics: None,
                 })
             }
         }
@@ -378,6 +379,7 @@ mod tests {
                     success: true,
                     output: ToolOutput::default(),
                     error: None,
+                    diagnostics: None,
                 })
             }
         }
@@ -419,6 +421,7 @@ mod tests {
                     success: true,
                     output: ToolOutput::default(),
                     error: None,
+                    diagnostics: None,
                 })
             }
         }

@@ -91,6 +91,7 @@ impl Tool for NodeTool {
                         "Capability '{}' requires approval. Set approved=true to proceed.",
                         self.capability_name
                     )),
+                    diagnostics: None,
                 });
             }
         }
@@ -112,6 +113,7 @@ impl Tool for NodeTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(format!("Node '{}' is not connected", self.node_id)),
+                        diagnostics: None,
                     });
                 }
             };
@@ -134,6 +136,7 @@ impl Tool for NodeTool {
                     "Failed to send invocation to node '{}'",
                     self.node_id
                 )),
+                diagnostics: None,
             });
         }
 
@@ -144,6 +147,7 @@ impl Tool for NodeTool {
                 success: result.success,
                 output: result.output.into(),
                 error: result.error,
+                diagnostics: None,
             }),
             Ok(Err(_)) => Ok(ToolResult {
                 success: false,
@@ -152,6 +156,7 @@ impl Tool for NodeTool {
                     "Node '{}' dropped the invocation channel",
                     self.node_id
                 )),
+                diagnostics: None,
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -160,6 +165,7 @@ impl Tool for NodeTool {
                     "Node '{}' invocation timed out after {NODE_INVOKE_TIMEOUT_SECS}s",
                     self.node_id
                 )),
+                diagnostics: None,
             }),
         }
     }

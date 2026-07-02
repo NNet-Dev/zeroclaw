@@ -34,6 +34,7 @@ mod tests {
             output_data: None,
             success: true,
             error_reason: None,
+            diagnostics: None,
             duration: Duration::ZERO,
             receipt: None,
         }
@@ -58,6 +59,7 @@ mod tests {
                 success: false,
                 output: "rewritten".into(),
                 error: Some("hook error".to_string()),
+                diagnostics: None,
             })],
         );
 

@@ -47,6 +47,7 @@ impl Tool for EchoTool {
             success: true,
             output: msg.into(),
             error: None,
+            diagnostics: None,
         })
     }
 }
