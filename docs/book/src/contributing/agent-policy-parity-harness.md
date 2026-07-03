@@ -69,12 +69,33 @@ the work later surface PRs do.
 
 ## The harness
 
-The parity harness does not exist on `master` yet: today the runtime has
-`agent/safety_net.rs` and `agent/turn/execution.rs`, not `agent/parity.rs`. The
-harness will live in `crates/zeroclaw-runtime/src/agent/parity.rs`, a `#[cfg(test)]`
-sibling of the `#7415` `safety_net.rs` turn-engine oracle - that is the intended
-location if it remains the chosen shape. A future surface PR creates it; thereafter
-it grows one surface at a time and asserts only what no other test covers:
+The parity harness lives at `crates/zeroclaw-runtime/src/agent/parity.rs`, a
+`#[cfg(test)]` sibling of the `#7415` `safety_net.rs` turn-engine oracle, reusing
+its fixtures. It carries an INDEX of parity rows - each naming its owner epic, a
+public tracking reference, and the test (or tracked-divergence record) that backs
+it - plus two layers of tests. The index deliberately encodes no per-path verdict
+grid: a static grid of hand-written cells would itself be data that goes stale
+when another PR changes a path, with no test noticing - the very failure this
+program exists to end. So the enforceable claims live only in the tests; a
+meta-test enforces the index's bookkeeping (owner, tracking, and evidence
+present), nothing more. The human-readable (setting x path) grid lives in this
+page. The two test layers:
+
+- **L1 engine locks**: when a setting reaches `run_tool_call_loop`, the engine
+  honors it (e.g. an `excluded_tools` entry never executes, even if the model
+  calls it).
+- **L2 path-parity** is what asserts a setting resolves the same on every
+  construction path. Where a surface already resolves through one seam, its L2
+  test is a positive parity assertion. Where a confirmed divergence has no single
+  seam yet, it ships as an always-running characterization test that pins the
+  divergence as it exists (asserting the two paths currently differ) - so when the
+  owning epic unifies the semantic, that assertion fails in the same PR and must be
+  rewritten into the positive parity assertion. The divergence can change only
+  loudly, never silently. There are no `#[ignore]`d specs: a known-failing ignored
+  test never runs in CI and protects nothing, so the goal is carried as a live
+  assertion of the current state.
+
+It grows one surface at a time and asserts only what no other test covers:
 
 - A surface (tools, approval, runtime budgets, context and history, memory,
   skills) is strangled into `resolve` one PR at a time.
@@ -85,8 +106,8 @@ it grows one surface at a time and asserts only what no other test covers:
   cross-path parity assertion, which is the property no per-primitive test makes.
 
 Until a surface has a single resolution seam, there is nothing to assert parity
-against, so its row stays in the divergence record as documentation rather than as
-a premature test.
+against, so its row stays in the divergence record (or as an ignored spec plus a
+divergence characterization) rather than as a premature green test.
 
 ## Adding a surface (the workflow each future surface PR follows)
 
