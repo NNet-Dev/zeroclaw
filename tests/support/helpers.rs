@@ -72,7 +72,7 @@ pub fn build_agent_xml(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dy
         .unwrap()
 }
 
-/// Build an agent with optional custom `MemoryStrategy`.
+/// Build an agent with an optional custom `Memory` backend.
 pub fn build_recording_agent(
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,

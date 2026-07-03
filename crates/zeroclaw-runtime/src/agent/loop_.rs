@@ -12063,9 +12063,9 @@ This is an example, not an invocation."#;
     }
 
     /// Counting observer that records every `MemoryRecall` event so the test
-    /// can assert that the runtime hot path emits the variant once per
-    /// `build_context` call. Locks in the wiring contract that motivated the
-    /// memory-OTel work.
+    /// can assert that the runtime hot path emits the variant once per engine
+    /// memory-context render (`agent::memory_inject::render_memory_context`).
+    /// Locks in the wiring contract that motivated the memory-OTel work.
     #[derive(Default)]
     struct RecallCountingObserver {
         recalls: parking_lot::Mutex<Vec<CapturedRecall>>,
@@ -12098,8 +12098,8 @@ This is an example, not an invocation."#;
     }
 
     /// Memory backend whose `recall` always returns `Err`. Used to exercise
-    /// the failure arm of `build_context`'s explicit match — the runtime
-    /// swallows the error and returns an empty context, but observers must
+    /// the recall-failure arm of the engine's memory-context render; the
+    /// runtime swallows the error and injects nothing, but observers must
     /// still see a `MemoryRecall { success: false }` event.
     struct FailingRecallMemory;
 
