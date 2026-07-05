@@ -40,15 +40,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_config::policy::SecurityPolicy;
+use zeroclaw_config::schema::Config;
 use zeroclaw_providers::ChatMessage;
 
 use super::safety_net::{CountingTool, ScriptedProvider, text_response, tool_call, tool_response};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, apply_policy_tool_filter, filter_channel_builtin_tools, run_tool_call_loop,
+    ToolLoop, apply_policy_tool_filter, run_tool_call_loop,
 };
 use crate::observability;
-use crate::tools::Tool;
+use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+use crate::tools::{AllToolsResult, Tool};
 
 // ── The matrix as an index of parity rows ───────────────────────────────────
 
@@ -88,34 +90,38 @@ const MATRIX: &[ParityRow] = &[
         surface: "A",
         setting: "built-in filter minted through the one assemble() seam on every path",
         owner_epic: "A",
-        tracking: "#8640 merged (gateway); remaining sites cut over one PR at a time",
-        // Every construction path DOES apply the built-in filter today - the
-        // former gateway-listings gap (ledger A1) was closed by #8640, now
-        // merged. What is not yet uniform is that only the gateway mints its
-        // registry through the `assemble()` seam; loop_ run / process_message,
-        // Agent::from_config, the orchestrator, and the delegate independent-
-        // target builder still hand-roll the same filter call (verified present,
-        // by convention). Until those cut-overs land - and the engine field
-        // seals to ScopedToolRegistry - cross-path uniformity is enforced by
-        // discipline, not by a single seam, so there is nothing to assert green
-        // here yet. A cross-crate boot path with no in-file seam; each cut-over
-        // PR carries its own site test.
+        tracking: "#8640, #8700, #8701 merged (gateway + loop_::run + process_message); \
+                   remaining sites cut over one PR at a time",
+        // The gateway (#8640), `loop_::run` (#8700), and `process_message`
+        // (#8701) all mint their registry through the `assemble()` seam now.
+        // What is not yet uniform is that `Agent::from_config`, the channels
+        // orchestrator, and the delegate independent-target builder still
+        // hand-roll a direct `apply_policy_tool_filter` call instead of routing
+        // through `assemble()` (verified present, by convention). Until those
+        // cut-overs land - and the engine field seals to ScopedToolRegistry -
+        // cross-path uniformity is enforced by discipline, not by a single
+        // seam, so there is nothing to assert green here yet. A cross-crate
+        // boot path with no in-file seam; each cut-over PR carries its own
+        // site test.
         status: RowStatus::TrackedDivergence,
-        evidence: "gateway routes through assemble() as of #8640 (merged); \
-                   loop_/from_config/orchestrator/delegate still hand-roll the same \
-                   filter, tracked by the remaining Epic A cut-overs + the seal",
+        evidence: "gateway/loop_::run/process_message route through assemble() as of \
+                   #8640/#8700/#8701 (merged); from_config/orchestrator/delegate still \
+                   hand-roll the same filter, tracked by the remaining Epic A cut-overs \
+                   + the seal",
     },
     ParityRow {
         surface: "A",
         setting: "built-in filter semantic uniform (safe-defaults admit)",
         owner_epic: "A",
-        tracking: "#8640 (merged; residual-divergence note) + ledger A4",
-        // process_message admits the canonical read-only defaults past
-        // allowed_tools at non-Full autonomy; the plain policy filter does not.
-        // This IS backed by an in-file test pair, so it changes only loudly.
+        tracking: "#8701 merged - filter_channel_builtin_tools retired, closing ledger A4",
+        // #8701 retired the process_message-only admit-past-allowed_tools
+        // bypass; every path now applies the same plain apply_policy_tool_filter,
+        // whether directly (orchestrator/from_config/delegate) or through
+        // assemble() (gateway/run/process_message). This IS backed by an
+        // in-file positive parity test, so a regression changes it only loudly.
         status: RowStatus::Tested,
-        evidence: "parity_l2_builtin_filter_semantic_divergence_characterized \
-                   (an always-running loud-change guard; no ignored spec)",
+        evidence: "parity_l2_builtin_filter_semantic_parity \
+                   (positive parity assertion; the divergence this row tracked is closed)",
     },
 ];
 
@@ -260,61 +266,85 @@ const A4_NAMES: &[&str] = &["web_fetch", "only_this", "other_tool"];
 
 /// A policy that allowlists one bespoke tool, at default (Supervised, non-Full)
 /// autonomy.
-fn a4_policy() -> SecurityPolicy {
-    SecurityPolicy {
+fn a4_policy() -> Arc<SecurityPolicy> {
+    Arc::new(SecurityPolicy {
         allowed_tools: Some(vec!["only_this".to_string()]),
         workspace_dir: std::env::temp_dir(),
         ..SecurityPolicy::default()
+    })
+}
+
+/// Minimal `AllToolsResult` around a bare tool list, matching the fixture
+/// `scoped::tests::built_with` uses to drive `assemble()` in isolation.
+fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
+    AllToolsResult {
+        tools,
+        delegate_handle: None,
+        ask_user_handle: None,
+        reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        poll_handle: None,
+        escalate_handle: None,
+        channel_room_handle: None,
+        unfiltered_tool_arcs: Vec::new(),
     }
 }
 
-/// L2 characterization of ledger row A4: a single, always-running test that
-/// pins the built-in-filter divergence as it exists today. `process_message`'s
-/// `filter_channel_builtin_tools` admits the canonical read-only default
-/// (`web_fetch`) past `allowed_tools` at non-Full autonomy; the plain
-/// `apply_policy_tool_filter` (every other path) drops it. Both agree on the
-/// allowlisted tool and on a tool that is neither.
+/// L2 positive parity assertion for ledger row A4: the `assemble()` seam
+/// (the `process_message` / `run` / gateway path) and a hand-rolled direct
+/// `apply_policy_tool_filter` call (the orchestrator / `Agent::from_config` /
+/// delegate path, still uncut as of this PR) now resolve the built-in filter
+/// identically.
 ///
-/// This test is the loud-change guard, and it is a PASSING test, not an
-/// `#[ignore]`d one: a known-failing ignored "spec" would never run in CI and
-/// could not protect anything. The parity GOAL is instead expressed as an
-/// assertion of the current divergence - so when Epic A unifies the semantic
-/// into the seam, the `assert_ne!` below fails in that same PR, forcing the
-/// author to rewrite this into the positive parity assertion
-/// (`retained_names(channel) == retained_names(plain)`). The divergence cannot
-/// change silently. Tracked: #8640 residual-divergence note, ledger A4.
-#[test]
-fn parity_l2_builtin_filter_semantic_divergence_characterized() {
-    let policy = a4_policy();
-    let mut via_channel = named_tools(A4_NAMES);
-    let mut via_plain = named_tools(A4_NAMES);
-    filter_channel_builtin_tools(&mut via_channel, &policy);
-    apply_policy_tool_filter(&mut via_plain, Some(&policy), None);
-    let channel_names = retained_names(&via_channel);
-    let plain_names = retained_names(&via_plain);
-    // The loud-change guard: today the two paths diverge. When Epic A unifies
-    // the semantic, this assertion fails and this test must become the positive
-    // parity assertion (`assert_eq!`) in the same PR.
-    assert_ne!(
-        channel_names, plain_names,
-        "A4 divergence unified? rewrite this into the parity assertion (see the doc comment)"
+/// This used to be `parity_l2_builtin_filter_semantic_divergence_characterized`,
+/// an always-running `assert_ne!` pinning a real divergence: `process_message`
+/// filtered built-ins through `filter_channel_builtin_tools`, which admitted
+/// the canonical read-only default (`web_fetch`) past `allowed_tools` at
+/// non-Full autonomy; the plain `apply_policy_tool_filter` (every other path)
+/// dropped it. #8701 retired `filter_channel_builtin_tools` and routed
+/// `process_message` through `assemble()`, which applies the same plain
+/// filter `run` and the orchestrator always used - closing the divergence.
+/// Per the no-ignored-specs rule above, a closed divergence is rewritten into
+/// the positive assertion in the same PR, not left as dead characterization
+/// code. Tracked: #8701, ledger A4.
+#[tokio::test]
+async fn parity_l2_builtin_filter_semantic_parity() {
+    let security = a4_policy();
+
+    let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+        config: &Config::default(),
+        agent_alias: "default",
+        security: &security,
+        built: built_with(named_tools(A4_NAMES)),
+        skills: &[],
+        runtime: Arc::new(crate::platform::NativeRuntime::new()),
+        caller_allowed: None,
+        connect_mcp: false,
+        connect_peripherals: false,
+        exclude_memory: false,
+        emit_assembly_logs: false,
+    })
+    .await;
+    let seam_names = retained_names(&assembled.registry.into_inner());
+
+    let mut via_hand_rolled = named_tools(A4_NAMES);
+    apply_policy_tool_filter(&mut via_hand_rolled, Some(security.as_ref()), None);
+    let hand_rolled_names = retained_names(&via_hand_rolled);
+
+    assert_eq!(
+        seam_names, hand_rolled_names,
+        "the assemble() seam and the still-uncut hand-rolled call must resolve \
+         the built-in filter identically"
     );
     assert!(
-        channel_names.contains(&"web_fetch".to_string()),
-        "channel filter admits the canonical read-only default: {channel_names:?}"
+        !seam_names.contains(&"web_fetch".to_string()),
+        "the canonical read-only default is no longer admitted past allowed_tools: {seam_names:?}"
     );
     assert!(
-        !plain_names.contains(&"web_fetch".to_string()),
-        "plain policy filter drops it (not in allowed_tools): {plain_names:?}"
+        seam_names.contains(&"only_this".to_string()),
+        "the allowlisted tool is retained: {seam_names:?}"
     );
     assert!(
-        channel_names.contains(&"only_this".to_string())
-            && plain_names.contains(&"only_this".to_string()),
-        "both admit the allowlisted tool"
-    );
-    assert!(
-        !channel_names.contains(&"other_tool".to_string())
-            && !plain_names.contains(&"other_tool".to_string()),
-        "both drop a tool that is neither allowlisted nor a canonical default"
+        !seam_names.contains(&"other_tool".to_string()),
+        "a tool that is neither allowlisted nor a canonical default is dropped: {seam_names:?}"
     );
 }
