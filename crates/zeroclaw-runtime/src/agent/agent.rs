@@ -3187,7 +3187,7 @@ pub async fn run(
 #[path = "safety_net.rs"]
 mod safety_net;
 
-// Agent-policy parity harness (Epic H): the cross-path matrix + L1/L2 locks,
+// Agent-policy parity harness: the cross-path matrix + L1/L2 locks,
 // sibling of the safety net so it reuses the same fixtures.
 #[cfg(test)]
 #[path = "parity.rs"]
