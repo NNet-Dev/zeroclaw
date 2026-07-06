@@ -131,8 +131,9 @@ pub struct ScopedAssembled {
     /// The deferred-MCP tool-search listing on its own (deferred mode only): the
     /// `## Deferred Tools` section that names the policy-admitted `<server>__<tool>`
     /// stubs and instructs the model to call `tool_search`. Empty when deferred loading
-    /// is off or no stubs are admitted. Callers that inject one combined MCP prompt
-    /// block (`run`, `process_message`) append [`Self::pinned_section`] onto this via
+    /// is off, no stubs are admitted, or `tool_search` itself is in `excluded_tools`
+    /// (the registry and prompt surfaces move together). Callers that inject one
+    /// combined MCP prompt block (`run`, `process_message`) append [`Self::pinned_section`] onto this via
     /// `append_pinned_mcp_section`; `from_config` threads it into the Agent's separate
     /// `mcp_deferred_section` slot alongside `pinned_section`.
     pub deferred_section: String,
@@ -416,6 +417,13 @@ impl ScopedToolRegistry {
         //    raw target (only the exact excluded name is removed).
         if let Some(excluded) = security.excluded_tools.as_deref() {
             tools_registry.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+            // The registry and prompt surfaces must move together: if `tool_search`
+            // itself is excluded, the deferred-MCP prompt section - which always
+            // instructs the model to call `tool_search` - must not survive either,
+            // or the model is told to call a tool the policy just removed.
+            if excluded.iter().any(|ex| ex == "tool_search") {
+                deferred_section.clear();
+            }
         }
 
         ScopedAssembled {

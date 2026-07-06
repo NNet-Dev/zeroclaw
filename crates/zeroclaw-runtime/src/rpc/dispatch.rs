@@ -4302,6 +4302,23 @@ mod tests {
             "excluded_tools = [\"tool_search\"] must drop the deferred tool_search \
              wrapper (excluded_tools always subtracts); tools: {names:?}"
         );
+        // The registry and prompt surfaces must move together: the system prompt
+        // must not instruct the model to call a tool the policy just removed.
+        let prompt = agent
+            .system_prompt_for_test()
+            .expect("system prompt must render");
+        assert!(
+            !prompt.contains("tool_search"),
+            "excluded tool_search must not be advertised in the system prompt; prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("## Deferred Tools"),
+            "excluded tool_search must suppress the deferred-tools section entirely; prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("remote__domains.list"),
+            "excluded tool_search must not leak the deferred stub it would have activated; prompt: {prompt}"
+        );
     }
 
     /// Regression for #8193. Registering `tool_search` is not enough: the TUI
