@@ -1521,10 +1521,10 @@ impl Agent {
             escalate_handle,
             channel_room_handle,
             // The Agent injects two distinct MCP prompt slots: `mcp_deferred_section`
-            // (the deferred tool-search listing, #8634/#8193) and `mcp_pinned_section`
+            // (the deferred tool-search listing) and `mcp_pinned_section`
             // (pinned resources). `assemble` surfaces the two atomically, so from_config
             // threads each into its own slot below - no duplication, and the deferred
-            // advertisement the #8193 regression asserts is preserved.
+            // advertisement the regression suite asserts is preserved.
             deferred_section,
             pinned_section,
             activated_handle,
