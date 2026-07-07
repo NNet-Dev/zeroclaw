@@ -529,7 +529,7 @@ fn split_name(filename: &str) -> (&str, &str) {
 mod tests {
     use super::*;
     use crate::sqlite::SqliteMemory;
-    use crate::traits::{Memory, MemoryCategory};
+    use crate::traits::{Memory, MemoryCategory, StoreOptions};
     use filetime::{FileTime, set_file_mtime};
     use tempfile::TempDir;
 
@@ -911,6 +911,67 @@ mod tests {
         assert!(
             mem2.get("core_updated").await.unwrap().is_none(),
             "core rows with old created_at should be pruned even if updated_at is recent"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_if_due_enforces_the_core_row_budget() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store_with_options(
+            "core_low",
+            "low value fact",
+            MemoryCategory::Core,
+            None,
+            StoreOptions::default().with_importance(0.1),
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "core_high",
+            "high value fact",
+            MemoryCategory::Core,
+            None,
+            StoreOptions::default().with_importance(0.9),
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "core_pinned",
+            "pinned but low value",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                importance: Some(0.05),
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        cfg.core_max_rows = 2;
+
+        run_if_due(&cfg, workspace).unwrap();
+
+        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
+        assert!(
+            mem2.get("core_low").await.unwrap().is_none(),
+            "lowest-value non-pinned row is evicted to meet the budget"
+        );
+        assert!(
+            mem2.get("core_high").await.unwrap().is_some(),
+            "higher-value row survives compaction"
+        );
+        assert!(
+            mem2.get("core_pinned").await.unwrap().is_some(),
+            "pinned row survives despite the lowest importance"
         );
     }
 
