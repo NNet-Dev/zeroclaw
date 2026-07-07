@@ -116,6 +116,11 @@ pub async fn run_mqtt_sop_listener(
                 };
 
                 let results = dispatch_sop_event(&engine, &audit, event).await;
+                // rumqttc auto-acks PUBACK/PUBREC in its event loop, so this listener
+                // has no manual-ack/requeue primitive: a `Deferred` result cannot be
+                // redelivered here. MQTT is AT-MOST-ONCE for a Deferred occurrence -
+                // process_headless_results logs it as observability, but the trigger
+                // is not retried (unlike AMQP with durable_ack, which nack/requeues).
                 process_headless_results(&results);
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
