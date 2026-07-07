@@ -5403,9 +5403,14 @@ async fn process_channel_message_body(
                     query: msg.content.clone(),
                     sessions: memory_sessions.clone(),
                     suppress: false,
+                    // The relevance floor stays the context's resolved copy;
+                    // the rerank stage settings thread from the live config.
                     cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
                         min_relevance_score: ctx.min_relevance_score,
-                        ..Default::default()
+                        ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                            &ctx.prompt_config.memory,
+                            zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                        )
                     },
                 }),
                 ingress: zeroclaw_api::ingress::IngressContext::channel(),
