@@ -1386,6 +1386,7 @@ pub async fn run(
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
+            list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
         })
         .await;
@@ -2954,6 +2955,7 @@ pub async fn process_message(
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
+            list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
         })
         .await;
@@ -14724,6 +14726,7 @@ Let me check the result."#;
                 connect_mcp: false,   // exercise the filter without MCP fixtures
                 connect_peripherals: false,
                 exclude_memory: false,
+                list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
             },
         )
