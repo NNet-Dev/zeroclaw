@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CHANNEL_SOP_SUBJECT_PREFIX"],"enum":["ChannelApprovalResponse","ChannelConversationScope","RoomVisibility"],"struct":["AttributedApprovalResponse","ChannelApprovalRequest","ChannelMessage","RoomCreationOptions","SendMessage"],"trait":["Channel"]};
