@@ -95,27 +95,40 @@ impl<M: Memory> AuditedMemory<M> {
     ) {
         let now = Local::now().to_rfc3339();
         let op_str = op.to_string();
-        {
+        let started = std::time::Instant::now();
+        let recorded = {
             let conn = self.audit_conn.lock();
-            let _ = conn.execute(
+            conn.execute(
                 "INSERT INTO memory_audit (operation, key, namespace, session_id, timestamp, metadata)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![op_str, key, namespace, session_id, now, metadata],
-            );
-        }
+            )
+            .is_ok()
+        };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Mirror the audit row onto the log stream as a `memory_audit`
         // event. The observer bridge projects this action onto
         // `ObserverEvent::MemoryAudit` for metrics backends; bounded
-        // attributes only (no keys, no content).
+        // attributes only (no keys, no content). Outcome/duration describe
+        // the audit-row insert itself (the trail's own health): the wrapped
+        // memory operation has not run yet at this point, and a failing
+        // audit.db must surface as success=false instead of being silently
+        // swallowed.
+        let outcome = if recorded {
+            ::zeroclaw_log::EventOutcome::Success
+        } else {
+            ::zeroclaw_log::EventOutcome::Failure
+        };
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::MemoryAudit)
                 .with_category(::zeroclaw_log::EventCategory::Memory)
-                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_outcome(outcome)
+                .with_duration(elapsed_ms)
                 .with_attrs(::serde_json::json!({
                     "memory_action": op_str,
                     "backend": self.inner.name(),
-                    "success": true
+                    "success": recorded
                 })),
             "memory.audit"
         );
