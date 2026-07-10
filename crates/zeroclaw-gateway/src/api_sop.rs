@@ -457,15 +457,15 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn loopback_caller_with_a_valid_token_keeps_its_authenticated_identity() {
-        // Regression (Audacity88 B-rebase pass, round 3): a loopback caller is always
-        // allowed (`AdminReloadGate::Allow`), but `authorize()` used to map that
-        // straight to `ApprovalPrincipal::cli(None)` regardless of whether a valid
-        // paired bearer token was ALSO presented - discarding the authenticated
-        // identity. A local dashboard/HTTP client with a valid token whose hash is a
-        // policy's `required_group` member would then be rejected as an anonymous
-        // CLI (no identity, cannot satisfy ANY required-group membership), even
-        // though the exact same token from a non-loopback peer resolves correctly
-        // (see `http_surface_enforces_policy_membership_via_authenticated_subject`).
+        // Regression: a loopback caller is always allowed
+        // (`AdminReloadGate::Allow`), but `authorize()` used to map that straight
+        // to `ApprovalPrincipal::cli(None)` regardless of whether a valid paired
+        // bearer token was also presented, discarding the authenticated identity.
+        // A local dashboard/HTTP client with a valid token whose hash is a policy's
+        // `required_group` member would then be rejected as an anonymous CLI (no
+        // identity, cannot satisfy any required-group membership), even though the
+        // same token from a non-loopback peer resolves correctly (see
+        // `http_surface_enforces_policy_membership_via_authenticated_subject`).
         let run_status = |state: &AppState, id: &str| {
             state
                 .sop_engine
@@ -508,17 +508,16 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn loopback_bearer_identity_is_not_derived_when_pairing_is_disabled() {
-        // Regression (Audacity88 B-rebase pass, round 4): the round-3 fix above
-        // derived a loopback caller's identity from ANY bearer token that
-        // `authenticate_and_hash` accepted - but `PairingGuard::is_authenticated`
-        // treats EVERY token as valid when `require_pairing` is false (a
-        // pass-through for that mode, not real authentication). Without gating on
-        // `require_pairing`, a loopback caller with pairing disabled could present
-        // an arbitrary bearer value and be attributed the derived hash as its
-        // approval identity - fabricating membership in a required group from an
-        // unauthenticated header. The gate must NOT clear from an unauthenticated
-        // loopback request even if its (meaningless, pairing-off) token hash
-        // happens to match a real group member.
+        // Regression: a loopback caller's identity must only be derived from a
+        // bearer token when pairing is required and the token is a real
+        // authentication credential. `PairingGuard::is_authenticated` treats every
+        // token as valid when `require_pairing` is false (a pass-through for that
+        // mode, not real authentication). Without gating on `require_pairing`, a
+        // loopback caller with pairing disabled could present an arbitrary bearer
+        // value and be attributed the derived hash as its approval identity,
+        // fabricating membership in a required group from an unauthenticated
+        // header. The gate must not clear from an unauthenticated loopback request
+        // even if its pairing-off token hash happens to match a real group member.
         let run_status = |state: &AppState, id: &str| {
             state
                 .sop_engine

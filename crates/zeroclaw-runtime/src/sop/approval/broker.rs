@@ -575,14 +575,14 @@ mod tests {
 
     #[test]
     fn quorum_vote_refused_while_park_persist_is_pending() {
-        // Regression (Audacity88 B-rebase pass): a quorum vote is recorded BEFORE
-        // `resolve_gate` runs (only the FINAL vote that reaches quorum calls it), so
-        // `resolve_gate`'s own `is_park_persist_pending` guard cannot protect the
-        // first N-1 votes. A vote recorded while the run's parked snapshot is not
-        // yet durable would durably outlive the run if it never manages to persist
-        // and is lost across a restart - an orphaned `gate_vote` row for a run that
-        // no longer exists. The broker must refuse to record a vote at all while
-        // that pending-persist state holds.
+        // Regression: a quorum vote is recorded before `resolve_gate` runs (only
+        // the final vote that reaches quorum calls it), so `resolve_gate`'s own
+        // `is_park_persist_pending` guard cannot protect the first N-1 votes. A
+        // vote recorded while the run's parked snapshot is not yet durable would
+        // durably outlive the run if it never manages to persist and is lost across
+        // a restart, leaving an orphaned `gate_vote` row for a run that no longer
+        // exists. The broker must refuse to record a vote at all while that
+        // pending-persist state holds.
         let store = std::sync::Arc::new(FailingSaveStore {
             inner: crate::sop::store::InMemoryRunStore::new(),
         });
@@ -633,13 +633,13 @@ mod tests {
 
     #[test]
     fn quorum_vote_refused_from_a_principal_approval_mode_rejects() {
-        // Regression (Audacity88 B-rebase pass, round 2): `resolve_gate` enforces
-        // `approval_mode` (e.g. `OutOfBandRequired` rejects the agent principal), but
-        // a quorum vote is recorded BEFORE `resolve_gate` runs - only the FINAL vote
-        // that reaches quorum ever calls it. Without this guard, an agent principal
-        // under `OutOfBandRequired` (or an out-of-band principal under `AgentTool`)
-        // could durably record a vote toward a quorum it could never actually clear,
-        // even though `approval_mode` says it must not participate at all.
+        // Regression: `resolve_gate` enforces `approval_mode` (for example,
+        // `OutOfBandRequired` rejects the agent principal), but a quorum vote is
+        // recorded before `resolve_gate` runs - only the final vote that reaches
+        // quorum ever calls it. Without this guard, an agent principal under
+        // `OutOfBandRequired` (or an out-of-band principal under `AgentTool`) could
+        // durably record a vote toward a quorum it could never actually clear, even
+        // though `approval_mode` says it must not participate at all.
         let broker = Arc::new(ApprovalBroker::disabled());
         // "bot" is a bare (any-source) group member, so membership passes; the mode
         // check must be what blocks this, not group authorization.
@@ -718,12 +718,11 @@ mod tests {
 
     #[test]
     fn empty_required_group_is_treated_as_no_membership_gate() {
-        // Regression (Audacity88 B-rebase pass, round 3): the config contract says
-        // `required_group`'s "`None`/empty" both mean no membership gate, but the
-        // broker only special-cased `None` - a blank `required_group = ""` matched
-        // `Some("")` and gated every principal against a group nobody could ever be
-        // a member of, permanently stuck. An empty string must behave exactly like
-        // `None`.
+        // Regression: the config contract says `required_group`'s `None` and empty
+        // forms both mean no membership gate, but the broker only special-cased
+        // `None`. A blank `required_group = ""` matched `Some("")` and gated every
+        // principal against a group nobody could ever be a member of, permanently
+        // stuck. An empty string must behave exactly like `None`.
         let mut policies = HashMap::new();
         policies.insert(
             "prod".to_string(),
@@ -766,11 +765,11 @@ mod tests {
 
     #[test]
     fn escalation_route_empty_string_is_treated_as_none() {
-        // Regression (Audacity88 B-rebase pass, round 3): the config contract says
-        // `escalation_route`'s "`None`/empty" both re-surface to the same route, but
-        // `ApprovalBroker::escalation_route` returned `Some("")` verbatim, which
-        // timeout delivery would then send an escalation notice to (a nonsensical
-        // empty route name).
+        // Regression: the config contract says `escalation_route`'s `None` and
+        // empty forms both re-surface to the same route, but
+        // `ApprovalBroker::escalation_route` returned `Some("")` verbatim. Timeout
+        // delivery would then send an escalation notice to a nonsensical empty
+        // route name.
         let mut policies = HashMap::new();
         policies.insert(
             "prod".to_string(),
