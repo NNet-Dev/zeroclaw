@@ -90,6 +90,7 @@ mod tests {
             schema: None,
             scope: None,
             routing: StepRouting::default(),
+            gate_prompt: None,
             on_failure: Default::default(),
             mode: None,
             capability: None,

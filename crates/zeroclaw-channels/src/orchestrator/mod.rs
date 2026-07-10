@@ -6192,6 +6192,7 @@ impl AgentRouter {
 async fn dispatch_channel_sop_gate(
     router: &AgentRouter,
     msg: &zeroclaw_api::channel::ChannelMessage,
+    gate_channel: Option<Arc<dyn Channel>>,
 ) -> bool {
     const MARKER_PREFIX: &str = "sop.gate:";
     enum Form {
@@ -6274,6 +6275,17 @@ async fn dispatch_channel_sop_gate(
                         })),
                     "channel SOP-gate click did not match a parked run (stale or finished)"
                 );
+                // Name the state correctly on the prompt itself: this gate's
+                // approval window has passed.
+                if let Some(channel) = gate_channel {
+                    let _ = channel
+                        .finalize_gate_prompt(
+                            &reference,
+                            "\u{23f0} The approval window for this gate has passed \
+                             (the run already resolved or finished).",
+                        )
+                        .await;
+                }
                 true
             }
             Form::Text => false,
@@ -6313,6 +6325,41 @@ async fn dispatch_channel_sop_gate(
                     })),
                 "channel SOP-gate answer resolved"
             );
+            // Finalize the prompt (strip buttons, show the decision in place)
+            // ONLY on terminal outcomes. Non-terminal ones — pending quorum, a
+            // failed slot re-acquire — leave the buttons alive so the decision
+            // can be retried or CHANGED while the run is still parked.
+            use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
+            let final_text = match &outcome {
+                BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => Some(format!(
+                    "\u{2705} Approved by <@{}> \u{2014} run resumed.",
+                    msg.sender
+                )),
+                BrokerOutcome::Resolved(ResolveOutcome::Denied) => Some(format!(
+                    "\u{1f6ab} Denied by <@{}> \u{2014} run cancelled.",
+                    msg.sender
+                )),
+                BrokerOutcome::Resolved(ResolveOutcome::AlreadyResolved) => Some(
+                    "\u{23f0} The approval window for this gate has passed \
+                     (already resolved)."
+                        .to_string(),
+                ),
+                _ => None,
+            };
+            if let (Some(text), Some(channel)) = (final_text, gate_channel) {
+                if let Err(e) = channel.finalize_gate_prompt(&run_id, &text).await {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
+                        "gate-prompt finalize failed (decision unaffected)"
+                    );
+                }
+            }
         }
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -6427,7 +6474,8 @@ async fn run_message_dispatch_loop(
         // Gate answers (button-click markers / `approve <ref>` text replies)
         // resolve a PARKED run and must never start one, so they are consumed
         // BEFORE SOP-event ingress and before any agent dispatch.
-        if dispatch_channel_sop_gate(&router, &msg).await {
+        let gate_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+        if dispatch_channel_sop_gate(&router, &msg, gate_channel).await {
             continue;
         }
         if dispatch_channel_sop_event(&router, &msg).await {
@@ -24981,7 +25029,7 @@ Done."#;
         };
         let router = router_without_sop_engine();
         assert!(
-            dispatch_channel_sop_gate(&router, &msg).await,
+            dispatch_channel_sop_gate(&router, &msg, None).await,
             "a gate-click marker must be consumed, not become an agent turn"
         );
     }
@@ -25000,7 +25048,7 @@ Done."#;
         };
         let router = router_without_sop_engine();
         assert!(
-            !dispatch_channel_sop_gate(&router, &msg).await,
+            !dispatch_channel_sop_gate(&router, &msg, None).await,
             "a text reply with no parked-run match must fall through to the agent"
         );
     }
@@ -25024,7 +25072,7 @@ Done."#;
             };
             let router = router_without_sop_engine();
             assert!(
-                !dispatch_channel_sop_gate(&router, &msg).await,
+                !dispatch_channel_sop_gate(&router, &msg, None).await,
                 "ordinary chat must fall through: {content:?}"
             );
         }

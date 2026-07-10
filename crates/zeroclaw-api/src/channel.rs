@@ -596,6 +596,17 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(false)
     }
 
+    /// Mark a previously sent gate prompt as resolved: strip its interactive
+    /// controls and replace the body with `outcome` (e.g. "Approved by @user —
+    /// run resumed"), so a decided gate cannot be clicked again and the
+    /// decision is visible in place. `reference` is the same correlation key
+    /// the prompt was sent with. Best-effort: `Ok(false)` when this channel
+    /// has nothing to finalize (no native prompt, or the mapping was lost to a
+    /// restart) — the gate state itself is never affected.
+    async fn finalize_gate_prompt(&self, _reference: &str, _outcome: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// The name of the back-channel that produced the most recent
     /// [`Channel::request_approval`] decision, when this channel fans a single
     /// request out to several registered back-channels (the agent's approval

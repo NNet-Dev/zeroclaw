@@ -1454,16 +1454,34 @@ impl SopEngine {
     /// with no policy, a policy with no request route, or a delivery error all leave
     /// the (already-parked, already-durable) gate untouched.
     fn notify_park_request(&self, run_id: &str) {
-        let (sop_name, step) = match self.get_run(run_id) {
-            Some(r) => (r.sop_name.clone(), r.current_step),
-            None => return,
+        let Some(run) = self.get_run(run_id) else {
+            return;
         };
+        let (sop_name, step) = (run.sop_name.clone(), run.current_step);
+        // The notice carries WHAT is being approved: the parked step's piped
+        // input (trigger payload at step 1, previous step's output later) plus
+        // the step's authored `- prompt:` template when it has one.
+        let context = step_input_value(run, step);
+        let gate_prompt = self
+            .resolve_active_run_sop(run_id)
+            .ok()
+            .and_then(|(_, sop)| self.resolve_sop_step(&sop, step).ok())
+            .and_then(|s| s.gate_prompt.clone());
         let Some(policy_name) = self.current_step_policy_name(run_id) else {
             return;
         };
         let broker = self.approval_broker();
         if let Some(route) = broker.request_route(self.approval_config(), &policy_name) {
-            broker.deliver_request(&route, run_id, &sop_name, step);
+            broker.deliver_request(
+                &route,
+                &super::approval::GateNotice {
+                    run_id,
+                    sop_name: &sop_name,
+                    step,
+                    context: &context,
+                    gate_prompt: gate_prompt.as_deref(),
+                },
+            );
         }
     }
 
@@ -1646,16 +1664,16 @@ impl SopEngine {
         self.reacquire_claim_on_resume(run_id)?;
         // A deterministic run paused at a checkpoint resumes through the
         // deterministic piping path: the checkpoint step is recorded as
-        // completed and its output (or the previous step's) is piped forward.
+        // completed and its input (the previous step's output — or, for a
+        // checkpoint parked at step 1, the trigger payload) is piped forward.
+        // Same step-1 mapping as `step_input_value`; `.last()` alone starved an
+        // intake-gate pipeline (checkpoint BEFORE the first work step) of its
+        // trigger payload.
         let run = self
             .active_runs
             .get_mut(run_id)
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
-        let piped = run
-            .step_results
-            .last()
-            .map(step_result_value)
-            .unwrap_or(serde_json::Value::Null);
+        let piped = step_input_value(run, run.current_step);
         let prior_waiting_since = run.waiting_since.clone();
         run.status = SopRunStatus::Running;
         run.waiting_since = None;
@@ -3214,7 +3232,7 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep, config: &SopConf
     ctx
 }
 
-fn step_input_value(run: &SopRun, step_number: u32) -> Value {
+pub(crate) fn step_input_value(run: &SopRun, step_number: u32) -> Value {
     if step_number <= 1 {
         return run
             .trigger_event
@@ -5013,15 +5031,13 @@ mod tests {
         fn deliver(
             &self,
             route: &str,
-            run_id: &str,
-            sop_name: &str,
-            step: u32,
+            notice: &crate::sop::approval::GateNotice<'_>,
         ) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push((
                 route.to_string(),
-                run_id.to_string(),
-                sop_name.to_string(),
-                step,
+                notice.run_id.to_string(),
+                notice.sop_name.to_string(),
+                notice.step,
             ));
             Ok(())
         }
@@ -7375,6 +7391,91 @@ type = "manual"
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
         }
+    }
+
+    #[test]
+    fn intake_gate_pipeline_pipes_the_trigger_payload_through_a_step_one_checkpoint() {
+        // Marc's double-HITL shape: `checkpoint -> capability -> ...`. The
+        // step-1 checkpoint has no prior step result, so its resume must pipe
+        // the TRIGGER PAYLOAD forward (mapping identical to `step_input_value`),
+        // not Null — otherwise the first work step is starved of the event.
+        let sop = Sop {
+            name: "intake-gate".into(),
+            description: "checkpoint before work".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Intake gate".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Work".into(),
+                    kind: SopStepKind::Capability,
+                    capability: Some("noop".into()),
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        let mut engine = engine_with_sops(vec![sop]);
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:issues.opened".into()),
+            payload: Some(r#"{"repo":"o/r","number":7}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        let first = engine.start_run("intake-gate", event).unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the step-1 intake gate: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("intake gate approve resolves");
+        assert!(
+            matches!(
+                outcome,
+                super::super::approval::BrokerOutcome::Resolved(
+                    super::super::approval::ResolveOutcome::Resumed(_)
+                )
+            ),
+            "expected Resolved(Resumed), got {outcome:?}"
+        );
+        // The noop capability echoes its input: the recorded step-2 output must
+        // BE the trigger payload, proving it crossed the step-1 checkpoint.
+        let run = engine
+            .last_finished_run("intake-gate")
+            .expect("run completed");
+        assert_eq!(run.status, SopRunStatus::Completed);
+        let step2 = run
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 2)
+            .expect("step 2 recorded");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&step2.output).expect("step-2 output is json");
+        assert_eq!(
+            parsed,
+            serde_json::json!({"repo": "o/r", "number": 7}),
+            "the trigger payload must survive the step-1 checkpoint"
+        );
     }
 
     #[test]

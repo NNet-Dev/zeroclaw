@@ -119,6 +119,11 @@ pub struct DiscordChannel {
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
     pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    /// Sent SOP-gate prompts by reference -> (channel_id, message_id, title),
+    /// so a resolved gate's message can be finalized (buttons stripped, outcome
+    /// shown). In-memory: a restart loses the mapping (finalize then no-ops;
+    /// the stale buttons resolve as already-answered via the marker path).
+    gate_prompts: Arc<AsyncMutex<HashMap<String, (String, String, String)>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -197,6 +202,7 @@ impl DiscordChannel {
             multi_message_thread_ts: Mutex::new(HashMap::new()),
             stall_timeout_secs: 0,
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
+            gate_prompts: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
@@ -4191,8 +4197,45 @@ impl Channel for DiscordChannel {
             components: vec![components::action_row(buttons)],
             flags: Default::default(),
         };
-        rest::send_discord_outgoing(&self.http_client(), &self.bot_token, channel_id, &outgoing)
+        let message_id = rest::send_discord_outgoing(
+            &self.http_client(),
+            &self.bot_token,
+            channel_id,
+            &outgoing,
+        )
+        .await?;
+        self.gate_prompts.lock().await.insert(
+            prompt.reference.clone(),
+            (channel_id.to_string(), message_id, prompt.title.clone()),
+        );
+        Ok(true)
+    }
+
+    async fn finalize_gate_prompt(&self, reference: &str, outcome: &str) -> anyhow::Result<bool> {
+        let Some((channel_id, message_id, title)) =
+            self.gate_prompts.lock().await.remove(reference)
+        else {
+            return Ok(false);
+        };
+        // PATCH with an EXPLICIT empty components array: omitting the key would
+        // leave the buttons in place on Discord's side.
+        let body = serde_json::json!({
+            "embeds": [{"title": title, "description": outcome}],
+            "components": [],
+        });
+        let url =
+            format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
+        let resp = self
+            .http_client()
+            .patch(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&body)
+            .send()
             .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            anyhow::bail!("Discord gate-prompt finalize failed ({status})");
+        }
         Ok(true)
     }
 }

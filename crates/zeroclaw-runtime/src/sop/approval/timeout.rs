@@ -99,16 +99,26 @@ fn log_audit_skip(run_id: &str, action: &str, e: &impl std::fmt::Display) {
 /// by the waiting step's approval policy, if any. Best-effort - a missing policy,
 /// missing route, or delivery error never affects the (still-open) gate.
 fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
-    let (sop_name, step) = match engine.get_run(run_id) {
-        Some(r) => (r.sop_name.clone(), r.current_step),
-        None => return,
+    let Some(run) = engine.get_run(run_id) else {
+        return;
     };
+    let (sop_name, step) = (run.sop_name.clone(), run.current_step);
+    let context = crate::sop::engine::step_input_value(run, step);
     let Some(policy_name) = engine.current_step_policy_name(run_id) else {
         return;
     };
     let broker = engine.approval_broker();
     if let Some(route) = broker.escalation_route(engine.approval_config(), &policy_name) {
-        broker.deliver_escalation(&route, run_id, &sop_name, step);
+        broker.deliver_escalation(
+            &route,
+            &super::GateNotice {
+                run_id,
+                sop_name: &sop_name,
+                step,
+                context: &context,
+                gate_prompt: None,
+            },
+        );
     }
 }
 

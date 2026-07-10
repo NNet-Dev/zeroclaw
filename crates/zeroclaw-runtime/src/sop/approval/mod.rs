@@ -20,7 +20,9 @@ pub mod principal;
 pub mod resolve;
 pub mod timeout;
 
-pub use broker::{ApprovalBroker, ApprovalRouteAdapter, BrokerOutcome, NoopRouteAdapter};
+pub use broker::{
+    ApprovalBroker, ApprovalRouteAdapter, BrokerOutcome, GateNotice, NoopRouteAdapter,
+};
 pub use channel_route::ChannelRouteAdapter;
 pub use decision::{ApprovalDecision, ResolveOutcome};
 pub use identity::{ApprovalIdentityResolver, LocalConfigApprovalIdentityResolver};

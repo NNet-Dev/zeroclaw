@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use zeroclaw_api::channel::{Channel, SendMessage};
 
-use super::broker::ApprovalRouteAdapter;
+use super::broker::{ApprovalRouteAdapter, GateNotice};
 
 /// A route adapter that delivers approval notices to configured channels.
 ///
@@ -62,31 +62,120 @@ fn parse_route(route: &str) -> Option<(&str, &str)> {
     Some((channel_key, recipient))
 }
 
-/// Render the approval-request notice body. Identifies the run so an approver can
-/// act on it in place: a plain `approve <run_id>` / `deny <run_id>` reply on the
-/// same channel resolves the gate (the orchestrator's gate intercept), and the
-/// CLI / gateway approve/deny surfaces keep working as before.
-fn render_notice(run_id: &str, sop_name: &str, step: u32) -> String {
+/// Resolve `{{path.to.field}}` placeholders against the notice context: pure
+/// dotted lookups into the JSON, nothing else (no logic, no filters). A string
+/// value substitutes raw; other values substitute as compact JSON; a missing
+/// path substitutes empty. Untrusted values are DATA here — they land in a
+/// notification body, never in an instruction stream.
+fn render_template(template: &str, context: &serde_json::Value) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let path = after[..end].trim();
+        let mut value = context;
+        let mut found = true;
+        for key in path.split('.') {
+            match value.get(key) {
+                Some(v) => value = v,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found {
+            match value {
+                serde_json::Value::String(v) => out.push_str(v),
+                other => out.push_str(&other.to_string()),
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Automatic context summary when the step has no authored `- prompt:`: the
+/// commonly-present fields of a gate context, compactly.
+fn summarize_context(context: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+    if let (Some(repo), Some(number)) = (
+        context.get("repo").and_then(|v| v.as_str()),
+        context.get("number").and_then(|v| v.as_u64()),
+    ) {
+        lines.push(format!("{repo}#{number}"));
+    }
+    if let Some(title) = context.get("title").and_then(|v| v.as_str()) {
+        lines.push(format!("\u{201c}{title}\u{201d}"));
+    }
+    if let Some(author) = context
+        .get("author")
+        .and_then(|a| a.get("login"))
+        .and_then(|v| v.as_str())
+    {
+        lines.push(format!("by {author}"));
+    }
+    if let Some(body) = context.get("body").and_then(|v| v.as_str()) {
+        let trimmed: String = body.chars().take(400).collect();
+        let suffix = if body.chars().count() > 400 {
+            "\u{2026}"
+        } else {
+            ""
+        };
+        lines.push(format!("\n{trimmed}{suffix}"));
+    }
+    lines.join(" ")
+}
+
+/// How to answer, appended to every notice.
+fn reply_instructions(run_id: &str) -> String {
     format!(
-        "SOP approval needed: '{sop_name}' run `{run_id}` is waiting for approval at step {step}. \
-         Reply `approve {run_id}` or `deny {run_id}` here, or use \
+        "Reply `approve {run_id}` or `deny {run_id}` here, or use \
          `zeroclaw sop approve|deny {run_id}`."
     )
+}
+
+/// Render the approval-request notice body: WHAT is being approved (the step's
+/// authored `- prompt:` rendered over the gate context, or an automatic context
+/// summary) plus how to answer. The `approve <run_id>` text reply resolves the
+/// gate via the orchestrator's gate intercept; CLI / gateway keep working.
+fn render_notice(notice: &GateNotice<'_>) -> String {
+    let what = match notice.gate_prompt {
+        // The `- prompt:` bullet is a single line; a literal `\n` in it is the
+        // author's line break.
+        Some(template) => render_template(template, notice.context).replace("\\n", "\n"),
+        None => summarize_context(notice.context),
+    };
+    let (run_id, sop_name, step) = (notice.run_id, notice.sop_name, notice.step);
+    let header = format!("SOP approval needed: '{sop_name}' run `{run_id}` (step {step}).");
+    let instructions = reply_instructions(run_id);
+    if what.trim().is_empty() {
+        format!("{header}\n\n{instructions}")
+    } else {
+        format!("{header}\n\n{what}\n\n{instructions}")
+    }
 }
 
 /// Build the native gate prompt for channels that render one (buttons /
 /// keyboards). The description carries the text-reply form too, so a screenshot
 /// or forward of the prompt is still actionable.
-fn build_gate_prompt(
-    run_id: &str,
-    sop_name: &str,
-    step: u32,
-) -> zeroclaw_api::channel::ChannelGatePrompt {
+fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelGatePrompt {
     use zeroclaw_api::channel::{ChannelGatePrompt, GateChoice, GateChoiceEmphasis};
+    // Discord embeds cap descriptions at 4096 chars; stay comfortably under.
+    let mut description = render_notice(notice);
+    if description.chars().count() > 3500 {
+        description = description.chars().take(3500).collect::<String>() + "\u{2026}";
+    }
     ChannelGatePrompt {
-        title: format!("SOP approval needed: {sop_name}"),
-        description: render_notice(run_id, sop_name, step),
-        reference: run_id.to_string(),
+        title: format!("SOP approval needed: {}", notice.sop_name),
+        description,
+        reference: notice.run_id.to_string(),
         choices: vec![
             GateChoice {
                 id: "approve".to_string(),
@@ -105,25 +194,20 @@ fn build_gate_prompt(
 /// Build the (channel_key, message) delivery pair from a route + run identity, or an
 /// error describing why it can't be built. PURE (no I/O, no spawn) so the parse +
 /// message-shaping is unit-testable without a runtime.
-fn build_delivery(
-    route: &str,
-    run_id: &str,
-    sop_name: &str,
-    step: u32,
-) -> anyhow::Result<(String, SendMessage)> {
+fn build_delivery(route: &str, notice: &GateNotice<'_>) -> anyhow::Result<(String, SendMessage)> {
     let Some((channel_key, recipient)) = parse_route(route) else {
         anyhow::bail!(
             "approval route '{route}' is not 'channel:recipient' (e.g. \
              'discord.ops:123456789') - both halves must be non-empty"
         );
     };
-    let msg = SendMessage::new(render_notice(run_id, sop_name, step), recipient).suppress_voice();
+    let msg = SendMessage::new(render_notice(notice), recipient).suppress_voice();
     Ok((channel_key.to_string(), msg))
 }
 
 impl ApprovalRouteAdapter for ChannelRouteAdapter {
-    fn deliver(&self, route: &str, run_id: &str, sop_name: &str, step: u32) -> anyhow::Result<()> {
-        let (channel_key, msg) = build_delivery(route, run_id, sop_name, step)?;
+    fn deliver(&self, route: &str, notice: &GateNotice<'_>) -> anyhow::Result<()> {
+        let (channel_key, msg) = build_delivery(route, notice)?;
         let Some(channel) = self.channels.get(&channel_key).cloned() else {
             // A misconfigured route (names a channel that isn't configured) is a real
             // operator error worth surfacing: return Err so the broker logs it. It
@@ -138,9 +222,9 @@ impl ApprovalRouteAdapter for ChannelRouteAdapter {
         // Native gate prompt first (buttons / keyboards, answered through the
         // channel's inbound path); channels without one fall back to the text
         // notice, whose `approve <run_id>` reply the orchestrator also resolves.
-        let prompt = build_gate_prompt(run_id, sop_name, step);
+        let prompt = build_gate_prompt(notice);
         let recipient = msg.recipient.clone();
-        let run_id = run_id.to_string();
+        let run_id = notice.run_id.to_string();
         let route = route.to_string();
         self.handle.spawn(async move {
             let prompted = match channel.send_gate_prompt(&recipient, &prompt).await {
@@ -177,6 +261,53 @@ impl ApprovalRouteAdapter for ChannelRouteAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_resolves_dotted_paths_and_drops_missing_ones() {
+        let ctx = serde_json::json!({
+            "repo": "o/r", "number": 7,
+            "author": {"login": "nillth"},
+            "title": "It broke"
+        });
+        assert_eq!(
+            render_template(
+                "Issue {{repo}}#{{number}} by {{author.login}}: {{title}} {{absent.field}}",
+                &ctx
+            ),
+            "Issue o/r#7 by nillth: It broke "
+        );
+        // Unclosed braces pass through untouched rather than panicking.
+        assert_eq!(render_template("broken {{oops", &ctx), "broken {{oops");
+    }
+
+    #[test]
+    fn notice_prefers_the_authored_prompt_and_always_appends_instructions() {
+        let ctx = serde_json::json!({"repo": "o/r", "number": 9, "body": "hello"});
+        let authored = GateNotice {
+            run_id: "run-9",
+            sop_name: "triage",
+            step: 1,
+            context: &ctx,
+            gate_prompt: Some("Review {{repo}}#{{number}} please"),
+        };
+        let text = render_notice(&authored);
+        assert!(text.contains("Review o/r#9 please"));
+        assert!(text.contains("approve run-9"));
+
+        let auto = GateNotice {
+            gate_prompt: None,
+            ..authored
+        };
+        let text = render_notice(&auto);
+        assert!(
+            text.contains("o/r#9"),
+            "auto summary carries repo#number: {text}"
+        );
+        assert!(
+            text.contains("hello"),
+            "auto summary carries the body: {text}"
+        );
+    }
     use async_trait::async_trait;
     use std::sync::Mutex;
     use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
@@ -206,7 +337,17 @@ mod tests {
 
     #[test]
     fn build_delivery_shapes_the_message_and_targets_the_recipient() {
-        let (key, msg) = build_delivery("discord.ops:98765", "run-7", "triage", 3).unwrap();
+        let (key, msg) = build_delivery(
+            "discord.ops:98765",
+            &GateNotice {
+                run_id: "run-7",
+                sop_name: "triage",
+                step: 3,
+                context: &serde_json::Value::Null,
+                gate_prompt: None,
+            },
+        )
+        .unwrap();
         assert_eq!(key, "discord.ops");
         assert_eq!(msg.recipient, "98765");
         assert!(msg.content.contains("run-7"), "identifies the run");
@@ -217,7 +358,19 @@ mod tests {
 
     #[test]
     fn build_delivery_errors_on_a_route_without_a_recipient() {
-        assert!(build_delivery("discord.ops", "r", "s", 1).is_err());
+        assert!(
+            build_delivery(
+                "discord.ops",
+                &GateNotice {
+                    run_id: "r",
+                    sop_name: "s",
+                    step: 1,
+                    context: &serde_json::Value::Null,
+                    gate_prompt: None,
+                }
+            )
+            .is_err()
+        );
     }
 
     // ── a stub Channel that records what it was asked to send ─────
@@ -262,7 +415,16 @@ mod tests {
         let adapter = ChannelRouteAdapter::new(channels, Handle::current());
 
         adapter
-            .deliver("discord.ops:98765", "run-7", "triage", 3)
+            .deliver(
+                "discord.ops:98765",
+                &GateNotice {
+                    run_id: "run-7",
+                    sop_name: "triage",
+                    step: 3,
+                    context: &serde_json::Value::Null,
+                    gate_prompt: None,
+                },
+            )
             .expect("a registered channel delivers");
 
         // deliver() spawns the send; poll until the recording channel observes it.
@@ -285,7 +447,16 @@ mod tests {
     async fn deliver_errors_when_the_route_channel_is_not_configured() {
         let adapter = ChannelRouteAdapter::new(HashMap::new(), Handle::current());
         let err = adapter
-            .deliver("discord.ops:98765", "run-7", "triage", 3)
+            .deliver(
+                "discord.ops:98765",
+                &GateNotice {
+                    run_id: "run-7",
+                    sop_name: "triage",
+                    step: 3,
+                    context: &serde_json::Value::Null,
+                    gate_prompt: None,
+                },
+            )
             .expect_err("an unregistered channel is a real misconfiguration");
         assert!(err.to_string().contains("not a configured channel"));
     }
@@ -295,7 +466,16 @@ mod tests {
         let adapter = ChannelRouteAdapter::new(HashMap::new(), Handle::current());
         assert!(
             adapter
-                .deliver("discord.ops", "run-7", "triage", 3)
+                .deliver(
+                    "discord.ops",
+                    &GateNotice {
+                        run_id: "run-7",
+                        sop_name: "triage",
+                        step: 3,
+                        context: &serde_json::Value::Null,
+                        gate_prompt: None,
+                    },
+                )
                 .is_err(),
             "a route with no ':recipient' cannot be delivered"
         );

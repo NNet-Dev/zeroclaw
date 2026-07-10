@@ -381,6 +381,11 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 current.on_failure = parse_step_failure(val);
             } else if let Some(val) = bullet.strip_prefix("mode:") {
                 current.mode = Some(parse_execution_mode(val));
+            } else if let Some(val) = bullet.strip_prefix("prompt:") {
+                let val = val.trim();
+                if !val.is_empty() {
+                    current.gate_prompt = Some(val.to_string());
+                }
             } else if let Some(val) = bullet.strip_prefix("policy:") {
                 // EPIC G: the approval-broker policy (a key in `[sop.approval].policies`)
                 // that gates this step's approval - required-group membership + quorum.
@@ -431,6 +436,7 @@ struct StepParseState {
     on_failure: StepFailure,
     mode: Option<SopExecutionMode>,
     policy: Option<String>,
+    gate_prompt: Option<String>,
 }
 
 impl StepParseState {
@@ -460,6 +466,7 @@ impl StepParseState {
             on_failure: std::mem::take(&mut self.on_failure),
             mode: self.mode.take(),
             policy: self.policy.take(),
+            gate_prompt: self.gate_prompt.take(),
         });
         *self = Self::default();
     }

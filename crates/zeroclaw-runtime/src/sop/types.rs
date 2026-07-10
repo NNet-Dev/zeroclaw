@@ -280,6 +280,13 @@ pub struct SopStep {
     /// today's behavior (`approval_mode` alone governs, no membership/quorum).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
+    /// Authored gate-notice template for a HITL step (`- prompt:` bullet).
+    /// `{{path.to.field}}` placeholders resolve against the step's piped input
+    /// (the trigger payload at step 1, the previous step's output later) — pure
+    /// lookups, no logic. Rendered into the out-of-band approval notice so the
+    /// approver sees WHAT they are approving; absent = an automatic summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_prompt: Option<String>,
 }
 
 impl Default for SopStep {
@@ -299,6 +306,7 @@ impl Default for SopStep {
             capability: None,
             capability_input: None,
             policy: None,
+            gate_prompt: None,
         }
     }
 }

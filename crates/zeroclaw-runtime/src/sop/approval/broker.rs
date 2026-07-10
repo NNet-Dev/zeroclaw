@@ -28,7 +28,22 @@ use crate::sop::engine::{GateState, SopEngine};
 /// Delivery is best-effort: a route error must never clear or block a gate (the gate
 /// state is the source of truth; the route is only a notice).
 pub trait ApprovalRouteAdapter: Send + Sync {
-    fn deliver(&self, route: &str, run_id: &str, sop_name: &str, step: u32) -> anyhow::Result<()>;
+    fn deliver(&self, route: &str, notice: &GateNotice<'_>) -> anyhow::Result<()>;
+}
+
+/// Everything a route adapter needs to render a MEANINGFUL gate notice — not
+/// just "run X waits at step N" but WHAT is being approved.
+pub struct GateNotice<'a> {
+    pub run_id: &'a str,
+    pub sop_name: &'a str,
+    pub step: u32,
+    /// The parked step's piped input — the object of the approval (the trigger
+    /// payload at an intake gate, the previous step's output later, e.g. the
+    /// llm draft at a review gate).
+    pub context: &'a serde_json::Value,
+    /// The step's authored `- prompt:` template; `{{path.to.field}}`
+    /// placeholders resolve against `context`. `None` = automatic summary.
+    pub gate_prompt: Option<&'a str>,
 }
 
 /// A no-op route adapter: logs the delivery intent but sends nowhere. The default
@@ -37,7 +52,8 @@ pub trait ApprovalRouteAdapter: Send + Sync {
 pub struct NoopRouteAdapter;
 
 impl ApprovalRouteAdapter for NoopRouteAdapter {
-    fn deliver(&self, route: &str, run_id: &str, sop_name: &str, step: u32) -> anyhow::Result<()> {
+    fn deliver(&self, route: &str, notice: &GateNotice<'_>) -> anyhow::Result<()> {
+        let (run_id, sop_name, step) = (notice.run_id, notice.sop_name, notice.step);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -145,8 +161,9 @@ impl ApprovalBroker {
     }
 
     /// Deliver an escalation notice to a route (best-effort).
-    pub fn deliver_escalation(&self, route: &str, run_id: &str, sop_name: &str, step: u32) {
-        if let Err(e) = self.route.deliver(route, run_id, sop_name, step) {
+    pub fn deliver_escalation(&self, route: &str, notice: &GateNotice<'_>) {
+        let run_id = notice.run_id;
+        if let Err(e) = self.route.deliver(route, notice) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -175,8 +192,9 @@ impl ApprovalBroker {
     /// Deliver the initial approval-request notice to a route (best-effort). Fired
     /// when a run parks at a policied gate; a delivery failure never blocks or clears
     /// the gate (the gate is the source of truth, this is only a notice).
-    pub fn deliver_request(&self, route: &str, run_id: &str, sop_name: &str, step: u32) {
-        if let Err(e) = self.route.deliver(route, run_id, sop_name, step) {
+    pub fn deliver_request(&self, route: &str, notice: &GateNotice<'_>) {
+        let run_id = notice.run_id;
+        if let Err(e) = self.route.deliver(route, notice) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
