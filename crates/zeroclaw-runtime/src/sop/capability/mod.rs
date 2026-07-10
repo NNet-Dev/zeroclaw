@@ -1,3 +1,4 @@
+mod bridge;
 mod builtins;
 mod forge_comment;
 mod llm_generate;

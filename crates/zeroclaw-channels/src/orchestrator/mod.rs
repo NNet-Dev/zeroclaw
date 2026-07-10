@@ -6177,6 +6177,159 @@ impl AgentRouter {
     }
 }
 
+/// Resolve a SOP gate answered from a chat channel. Two answer forms converge
+/// here, per the channel-agnostic gate-prompt seam:
+///
+/// - a component click: the channel's OWN interaction producer stamps the
+///   internal `sop.gate:<choice>:<reference>` marker (unforgeable from message
+///   text, same guarantee as the git producer's SOP-event marker);
+/// - a plain `<choice> <reference>` text reply (the fallback prompt tells the
+///   operator to send exactly this) — consumed ONLY when the reference matches
+///   a run actually parked on a human, so ordinary conversation never gets
+///   swallowed.
+///
+/// Returns `true` when the message was consumed as a gate answer.
+async fn dispatch_channel_sop_gate(
+    router: &AgentRouter,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    const MARKER_PREFIX: &str = "sop.gate:";
+    enum Form {
+        Marker,
+        Text,
+    }
+    let (form, choice, reference) = if let Some(rest) = msg
+        .internal_sop_event
+        .as_deref()
+        .and_then(|s| s.strip_prefix(MARKER_PREFIX))
+    {
+        match rest.split_once(':') {
+            Some((c, r)) if !c.is_empty() && !r.is_empty() => {
+                (Form::Marker, c.to_ascii_lowercase(), r.to_string())
+            }
+            _ => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"marker": rest})),
+                    "dropping malformed channel SOP-gate marker"
+                );
+                return true;
+            }
+        }
+    } else if msg.internal_sop_event.is_none() {
+        // Text form: exactly two tokens, and the first must be a known choice.
+        let mut words = msg.content.split_whitespace();
+        match (words.next(), words.next(), words.next()) {
+            (Some(c), Some(r), None)
+                if matches!(c.to_ascii_lowercase().as_str(), "approve" | "deny") =>
+            {
+                (Form::Text, c.to_ascii_lowercase(), r.to_string())
+            }
+            _ => return false,
+        }
+    } else {
+        return false;
+    };
+
+    let Some(engine) = router.sop_engine.as_ref() else {
+        // A marker message exists only to answer a gate — consume it either way.
+        return matches!(form, Form::Marker);
+    };
+
+    // Resolve `reference` against runs actually parked on a human: the full run
+    // id, or an unambiguous suffix (prompts may show a shortened id). For the
+    // TEXT form a non-match means "not a gate answer" — fall through to the
+    // agent; a marker non-match is consumed (stale buttons after the run ended).
+    let resolved_run_id = {
+        let Ok(guard) = engine.lock() else {
+            return matches!(form, Form::Marker);
+        };
+        let mut candidates = guard.active_runs().values().filter(|r| {
+            matches!(
+                r.status,
+                zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval
+                    | zeroclaw_runtime::sop::types::SopRunStatus::PausedCheckpoint
+            )
+        });
+        let matched: Vec<String> = candidates
+            .by_ref()
+            .filter(|r| r.run_id == reference || r.run_id.ends_with(&reference))
+            .map(|r| r.run_id.clone())
+            .collect();
+        match matched.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    };
+    let Some(run_id) = resolved_run_id else {
+        return match form {
+            Form::Marker => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "reference": reference,
+                            "channel": msg.channel.as_str(),
+                        })),
+                    "channel SOP-gate click did not match a parked run (stale or finished)"
+                );
+                true
+            }
+            Form::Text => false,
+        };
+    };
+
+    let channel_key = match msg.channel_alias.as_deref() {
+        Some(alias) => format!("{}.{alias}", msg.channel),
+        None => msg.channel.clone(),
+    };
+    let decision = if choice == "approve" {
+        zeroclaw_runtime::sop::approval::ApprovalDecision::Approve
+    } else {
+        zeroclaw_runtime::sop::approval::ApprovalDecision::Deny {
+            reason: Some(format!("denied by {} via {channel_key}", msg.sender)),
+        }
+    };
+    let principal = zeroclaw_runtime::sop::approval::ApprovalPrincipal::channel(
+        channel_key.clone(),
+        Some(msg.sender.clone()),
+    );
+    let outcome = match engine.lock() {
+        Ok(mut guard) => guard.resolve_via_broker(&run_id, decision, principal),
+        Err(_) => return true,
+    };
+    match outcome {
+        Ok(outcome) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run_id,
+                        "choice": choice,
+                        "sender": msg.sender,
+                        "channel": channel_key,
+                        "outcome": outcome.label(),
+                    })),
+                "channel SOP-gate answer resolved"
+            );
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run_id,
+                        "error": e.to_string(),
+                    })),
+                "channel SOP-gate resolution failed"
+            );
+        }
+    }
+    true
+}
+
 async fn dispatch_channel_sop_event(
     router: &AgentRouter,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -6271,6 +6424,12 @@ async fn run_message_dispatch_loop(
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
             continue;
         };
+        // Gate answers (button-click markers / `approve <ref>` text replies)
+        // resolve a PARKED run and must never start one, so they are consumed
+        // BEFORE SOP-event ingress and before any agent dispatch.
+        if dispatch_channel_sop_gate(&router, &msg).await {
+            continue;
+        }
         if dispatch_channel_sop_event(&router, &msg).await {
             continue;
         }
@@ -24805,6 +24964,70 @@ Done."#;
             dispatch_channel_sop_event(&router, &msg).await,
             "a git-produced internal marker must select SOP ingress"
         );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_marker_is_consumed_even_without_an_engine() {
+        // A `sop.gate:` marker message exists ONLY to answer a gate; it must be
+        // consumed (never fall through to an agent turn) even when no SOP
+        // engine is available to resolve it.
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("gnosis".to_string()),
+            sender: "111222333".to_string(),
+            content: "approve det-1-0001".to_string(),
+            internal_sop_event: Some("sop.gate:approve:det-1-0001".to_string()),
+            ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            dispatch_channel_sop_gate(&router, &msg).await,
+            "a gate-click marker must be consumed, not become an agent turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_falls_through_when_nothing_is_parked() {
+        // A bare "approve <ref>" text message with NO matching parked run is
+        // ordinary conversation — it must NOT be consumed as a gate answer.
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("gnosis".to_string()),
+            sender: "111222333".to_string(),
+            content: "approve det-9999-0001".to_string(),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            !dispatch_channel_sop_gate(&router, &msg).await,
+            "a text reply with no parked-run match must fall through to the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_ordinary_chat_never_matches() {
+        // Ordinary messages — even ones containing the word "approve" — must
+        // never be consumed by the gate intercept.
+        for content in [
+            "please approve my PR when you can",
+            "deny",
+            "approve",
+            "approve run 12 thanks",
+        ] {
+            let msg = ChannelMessage {
+                channel: "discord".to_string(),
+                sender: "111222333".to_string(),
+                content: content.to_string(),
+                internal_sop_event: None,
+                ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+            };
+            let router = router_without_sop_engine();
+            assert!(
+                !dispatch_channel_sop_gate(&router, &msg).await,
+                "ordinary chat must fall through: {content:?}"
+            );
+        }
     }
 }
 

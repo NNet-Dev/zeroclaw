@@ -7473,10 +7473,23 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
     let llm: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::LlmGenerateAdapter>> =
         config
             .resolved_model_provider_for_agent("default")
-            .and_then(|(provider_type, _alias, entry)| {
-                let provider = match zeroclaw::providers::create_model_provider(
+            .and_then(|(provider_type, alias, entry)| {
+                // Alias-aware factory WITH the alias's runtime options: the options
+                // carry zeroclaw_dir (auth-profile store) and per-alias runtime
+                // knobs — without them, OAuth/subscription providers (codex,
+                // opencode) sit unauthenticated and never answer. This mirrors the
+                // delegate tool's provider construction.
+                let options = zeroclaw::providers::provider_runtime_options_for_alias(
+                    config,
                     provider_type,
+                    alias,
+                );
+                let provider = match zeroclaw::providers::create_model_provider_for_alias(
+                    config,
+                    provider_type,
+                    alias,
                     entry.api_key.as_deref(),
+                    &options,
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -7498,7 +7511,6 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                     zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
                         std::sync::Arc::from(provider),
                         model,
-                        tokio::runtime::Handle::current(),
                     ),
                 ) as _)
             });
@@ -7522,7 +7534,7 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
     let forge: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::ForgeCommentAdapter>> =
         has_git.then(|| {
             std::sync::Arc::new(zeroclaw_runtime::sop::capability::ChannelForgeAdapter::new(
-                channels, handle,
+                channels,
             )) as _
         });
     zeroclaw_runtime::sop::SopEngineAdapters {

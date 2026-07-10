@@ -41,6 +41,47 @@ pub enum ChannelApprovalResponse {
     DenyWithEdit { replacement: String },
 }
 
+/// A long-lived, channel-agnostic gate prompt (e.g. a parked SOP approval):
+/// rendered natively per channel (Discord embed + buttons, Telegram inline
+/// keyboard, ...), answered through the channel's normal inbound path — a
+/// component click or a `<choice> <reference>` text reply — NOT a blocking wait.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGatePrompt {
+    /// Short heading, e.g. "SOP approval needed: gitea-triage-pipeline".
+    pub title: String,
+    /// Body: what is waiting and how to answer (includes the text-reply form
+    /// for humans on channels that render it as plain text).
+    pub description: String,
+    /// Correlation key the answer must carry (e.g. the SOP run id). Encoded in
+    /// component custom_ids and expected in text replies.
+    pub reference: String,
+    /// The presented choices, in order.
+    pub choices: Vec<GateChoice>,
+}
+
+/// One selectable choice on a [`ChannelGatePrompt`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateChoice {
+    /// Stable machine id carried back in the answer (e.g. "approve").
+    pub id: String,
+    /// Human label for the button / keyboard entry.
+    pub label: String,
+    /// Visual emphasis hint for channels that support it.
+    pub emphasis: GateChoiceEmphasis,
+}
+
+/// Rendering hint for a [`GateChoice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateChoiceEmphasis {
+    /// The affirmative action (e.g. a green/primary button).
+    Positive,
+    /// The destructive/refusing action (e.g. a red button).
+    Negative,
+    /// No particular emphasis.
+    Neutral,
+}
+
 /// Conversation history scope for an inbound channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelConversationScope {
@@ -531,6 +572,28 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         Ok(None)
+    }
+
+    /// Present a long-lived, out-of-band gate prompt (e.g. a parked SOP
+    /// approval) on this channel, rendered natively — an embed with one button
+    /// per choice on Discord, an inline keyboard on Telegram, and so on.
+    ///
+    /// UNLIKE [`Channel::request_approval`] this does NOT wait for the answer:
+    /// the prompt outlives the call (and daemon restarts). The choice comes
+    /// back through the channel's normal INBOUND path — a component click
+    /// (stamped with an internal `sop.gate:` marker by the channel's own
+    /// interaction producer, never derivable from message text) or a plain
+    /// `<choice> <reference>` text reply — which the orchestrator resolves
+    /// against the parked gate.
+    ///
+    /// Default `Ok(false)` = "no native prompt on this channel"; the caller
+    /// then falls back to a plain text notice carrying the reply instructions.
+    async fn send_gate_prompt(
+        &self,
+        _recipient: &str,
+        _prompt: &ChannelGatePrompt,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     /// The name of the back-channel that produced the most recent

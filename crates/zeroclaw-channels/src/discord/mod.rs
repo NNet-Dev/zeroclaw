@@ -10,7 +10,8 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelGatePrompt, ChannelMessage,
+    GateChoiceEmphasis, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
@@ -2872,12 +2873,79 @@ impl Channel for DiscordChannel {
                                             &interaction_channel,
                                             parent_id.as_deref(),
                                         ) {
+                                            // Shared-token deployments run several
+                                            // aliases on ONE bot application, so
+                                            // every alias receives every click. For
+                                            // a SOP-gate button, "not my channel"
+                                            // means "not my interaction": pass
+                                            // SILENTLY (no reject ack) so the alias
+                                            // that owns the channel answers instead
+                                            // of racing this alias's rejection.
+                                            // Every other denial (or kind) keeps
+                                            // the loud fail-closed reject.
+                                            let is_foreign_sop_gate = matches!(
+                                                denial,
+                                                InteractionDenial::ChannelNotAllowed
+                                            ) && custom_id::CustomId::parse(&custom_id_raw)
+                                                .is_some_and(|cid| {
+                                                    cid.kind == approval::SOP_GATE_KIND
+                                                });
+                                            if is_foreign_sop_gate {
+                                                return;
+                                            }
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": format!("{denial:?}")})), "rejecting unauthorized component interaction");
                                             let msg = i18n::get_required_cli_string(
                                                 "channel-discord-interaction-unauthorized",
                                             );
                                             if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Stateless SOP-gate button (no
+                                        // registered intent by design): the
+                                        // custom_id carries `<choice>:<reference>`
+                                        // so a parked gate survives restarts.
+                                        // Runs ONLY after the fail-closed gates
+                                        // above. The click becomes an inbound
+                                        // message with the internal `sop.gate:`
+                                        // marker; the orchestrator resolves it
+                                        // against the parked run.
+                                        if let Some(cid) = custom_id::CustomId::parse(&custom_id_raw)
+                                            && cid.kind == approval::SOP_GATE_KIND
+                                        {
+                                            let ack_key = match cid.arg.split_once(':') {
+                                                Some((choice, reference))
+                                                    if !choice.is_empty() && !reference.is_empty() =>
+                                                {
+                                                    let channel_msg = ChannelMessage {
+                                                        id: format!("discord_sopgate_{interaction_id}"),
+                                                        sender: user_id.clone(),
+                                                        reply_target: interaction_channel.clone(),
+                                                        content: format!("{choice} {reference}"),
+                                                        channel: "discord".to_string(),
+                                                        channel_alias: Some(alias.clone()),
+                                                        timestamp: std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .unwrap_or_default()
+                                                            .as_secs(),
+                                                        internal_sop_event: Some(format!(
+                                                            "sop.gate:{choice}:{reference}"
+                                                        )),
+                                                        ..Default::default()
+                                                    };
+                                                    if tx.send(channel_msg).await.is_ok() {
+                                                        "channel-discord-approval-recorded"
+                                                    } else {
+                                                        "channel-discord-component-expired"
+                                                    }
+                                                }
+                                                _ => "channel-discord-component-expired",
+                                            };
+                                            let msg = i18n::get_required_cli_string(ack_key);
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord sop-gate ack failed");
                                             }
                                             return;
                                         }
@@ -4073,6 +4141,59 @@ impl Channel for DiscordChannel {
                 }
             };
         Ok(Some(response))
+    }
+
+    async fn send_gate_prompt(
+        &self,
+        recipient: &str,
+        prompt: &ChannelGatePrompt,
+    ) -> anyhow::Result<bool> {
+        // Buttons are only actionable when the INTERACTION_CREATE pipe is live
+        // (gated on `slash_commands`, like the buttoned tool approval). Without
+        // it, report "no native prompt" so the caller falls back to the text
+        // notice — whose `<choice> <reference>` reply the orchestrator parses.
+        if !self.slash_commands {
+            return Ok(false);
+        }
+        // STATELESS by design (unlike the oneshot-backed tool approval): the
+        // custom_id itself carries the (choice, reference) binding, so the
+        // prompt outlives this call AND daemon restarts — a parked SOP gate can
+        // be answered hours later or after a reboot. Forgery is bounded by
+        // Discord only dispatching interactions for components that exist on a
+        // message this bot posted, plus the fail-closed interaction gate.
+        let channel_id = recipient.split(':').next().unwrap_or(recipient);
+        let buttons: Vec<components::DiscordComponent> = prompt
+            .choices
+            .iter()
+            .map(|choice| {
+                let style = match choice.emphasis {
+                    GateChoiceEmphasis::Positive => components::ButtonStyle::Success,
+                    GateChoiceEmphasis::Negative => components::ButtonStyle::Danger,
+                    GateChoiceEmphasis::Neutral => components::ButtonStyle::Secondary,
+                };
+                components::button(
+                    style,
+                    &choice.label,
+                    custom_id::CustomId::new(
+                        approval::SOP_GATE_KIND,
+                        format!("{}:{}", choice.id, prompt.reference),
+                    ),
+                )
+            })
+            .collect();
+        let outgoing = DiscordOutgoing {
+            content: None,
+            embeds: vec![DiscordEmbed {
+                title: Some(prompt.title.clone()),
+                description: Some(prompt.description.clone()),
+                ..Default::default()
+            }],
+            components: vec![components::action_row(buttons)],
+            flags: Default::default(),
+        };
+        rest::send_discord_outgoing(&self.http_client(), &self.bot_token, channel_id, &outgoing)
+            .await?;
+        Ok(true)
     }
 }
 

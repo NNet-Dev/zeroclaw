@@ -40,6 +40,17 @@ use super::custom_id::CustomId;
 /// per-button decision is bound server-side.
 pub(crate) const APPROVAL_KIND: &str = "apv";
 
+/// `custom_id` kind for STATELESS SOP-gate buttons (`ChannelGatePrompt`
+/// deliveries). Unlike [`APPROVAL_KIND`] there is no server-side registration:
+/// the arg carries `<choice_id>:<reference>` directly, so the buttons survive
+/// daemon restarts and can answer a gate parked hours earlier. A click becomes
+/// an inbound message stamped with the internal `sop.gate:` marker (set only by
+/// the interaction producer, never derivable from message text), which the
+/// orchestrator resolves against the parked gate. Decision-in-wire is safe here
+/// because a SOP gate's choices are operator-privilege-equivalent
+/// (approve/deny), unlike the tool-approval escalation ladder above.
+pub(crate) const SOP_GATE_KIND: &str = "sopgate";
+
 /// The four operator choices, as a fixed server-side enum. A click resolves to
 /// exactly one of these because the *emitter* registered it — never because the
 /// wire said so. This is the "no privilege escalation via custom_id" guarantee:

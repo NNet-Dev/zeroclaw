@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tokio::runtime::Handle;
+
 use zeroclaw_api::channel::{Channel, SendMessage};
 
 use super::types::{CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability};
@@ -76,14 +76,19 @@ impl SopCapability for ForgeCommentCapability {
             reversible: false,
             supports_retry: false,
             required_permissions: vec!["forge.write"],
+            // No `required` here: the effective fields may sit at the top level OR
+            // nested under `input` (a step with static `capability_input` receives
+            // the piped payload under that key), which a flat schema cannot
+            // express. `execute` enforces the real contract with field-precise
+            // errors either way.
             input_schema: Some(json!({
                 "type": "object",
-                "required": ["repo", "number", "body"],
                 "properties": {
                     "repo": { "type": "string", "description": "owner/repo" },
                     "number": { "type": "integer", "description": "issue or PR number" },
                     "body": { "type": "string", "description": "comment markdown" },
-                    "channel": { "type": "string", "description": "optional channel-map key (git.<alias>); default = the single configured git channel" }
+                    "channel": { "type": "string", "description": "optional channel-map key (git.<alias>); default = the single configured git channel" },
+                    "input": { "description": "the piped payload carrying repo/number/body when capability_input is configured" }
                 }
             })),
             output_schema: Some(json!({
@@ -136,8 +141,12 @@ impl SopCapability for ForgeCommentCapability {
                 ));
             }
         };
-        let channel = src
+        // `channel` is authored in the static capability_input, so it lives at the
+        // TOP level of the merged input (unlike repo/number/body, which usually
+        // arrive in the nested piped payload). Accept both, top level first.
+        let channel = input
             .get("channel")
+            .or_else(|| src.get("channel"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|c| !c.is_empty());
@@ -162,18 +171,19 @@ impl SopCapability for ForgeCommentCapability {
 ///
 /// Unlike the fire-and-forget approval route adapter, this WAITS for the send
 /// result (bounded by [`POST_TIMEOUT`]): the comment IS the step's work product,
-/// so the SOP must observe success/failure. The sync->async bridge spawns the send
-/// onto the captured [`Handle`] and blocks on a std channel, which is safe both on
-/// a multi-thread runtime worker and on a plain thread (never calls
-/// `Handle::current()` / `block_on` directly).
+/// so the SOP must observe success/failure. The sync->async bridge runs the send
+/// on a DEDICATED thread with its own small runtime (see [`run_bridged`]) rather
+/// than spawning onto the host runtime: the capability executes while blocking a
+/// host thread, and on a current-thread host context a task spawned back onto
+/// that same runtime cannot be polled until the caller unblocks — a guaranteed
+/// timeout (observed in the field before this design).
 pub struct ChannelForgeAdapter {
     channels: HashMap<String, Arc<dyn Channel>>,
-    handle: Handle,
 }
 
 impl ChannelForgeAdapter {
-    pub fn new(channels: HashMap<String, Arc<dyn Channel>>, handle: Handle) -> Self {
-        Self { channels, handle }
+    pub fn new(channels: HashMap<String, Arc<dyn Channel>>) -> Self {
+        Self { channels }
     }
 
     /// Resolve which channel to post through: an explicit `git.<alias>` key, or the
@@ -193,7 +203,20 @@ impl ChannelForgeAdapter {
             .filter(|k| *k == "git" || k.starts_with("git."))
             .collect();
         git_keys.sort();
-        match git_keys.as_slice() {
+        // The channel map registers a singleton under BOTH its bare type key and
+        // its dotted alias; those are the same instance, not an ambiguity. Only
+        // genuinely distinct channels require the explicit 'channel' field.
+        let mut distinct: Vec<&String> = Vec::new();
+        for key in git_keys {
+            let arc = &self.channels[key];
+            if !distinct
+                .iter()
+                .any(|k| Arc::ptr_eq(&self.channels[*k], arc))
+            {
+                distinct.push(key);
+            }
+        }
+        match distinct.as_slice() {
             [] => Err("no git channel is configured (nothing to post through)".to_string()),
             [only] => Ok(Arc::clone(&self.channels[*only])),
             many => Err(format!(
@@ -217,20 +240,11 @@ impl ForgeCommentAdapter for ChannelForgeAdapter {
     ) -> Result<(), String> {
         let target = self.resolve(channel)?;
         let msg = SendMessage::new(body.to_string(), format!("{repo}#{number}")).suppress_voice();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.handle.spawn(async move {
-            let result = target.send(&msg).await.map_err(|e| e.to_string());
-            // Receiver gone = caller timed out; nothing left to report to.
-            let _ = tx.send(result);
-        });
-        match rx.recv_timeout(POST_TIMEOUT) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(format!(
-                "timed out after {}s waiting for the forge write",
-                POST_TIMEOUT.as_secs()
-            )),
-        }
+        super::bridge::run_bridged(
+            async move { target.send(&msg).await.map_err(|e| e.to_string()) },
+            POST_TIMEOUT,
+            "forge write",
+        )
     }
 }
 

@@ -63,14 +63,43 @@ fn parse_route(route: &str) -> Option<(&str, &str)> {
 }
 
 /// Render the approval-request notice body. Identifies the run so an approver can
-/// act on it through their normal approval surface; the return path (approve/deny)
-/// is the existing HTTP/WS/tool -> broker -> chokepoint flow, not this adapter.
+/// act on it in place: a plain `approve <run_id>` / `deny <run_id>` reply on the
+/// same channel resolves the gate (the orchestrator's gate intercept), and the
+/// CLI / gateway approve/deny surfaces keep working as before.
 fn render_notice(run_id: &str, sop_name: &str, step: u32) -> String {
     format!(
         "SOP approval needed: '{sop_name}' run `{run_id}` is waiting for approval at step {step}. \
-         Approve or deny it through your approval surface (e.g. `zeroclaw sop approve {run_id}` / \
-         `zeroclaw sop deny {run_id}`, or the gateway approve/deny route)."
+         Reply `approve {run_id}` or `deny {run_id}` here, or use \
+         `zeroclaw sop approve|deny {run_id}`."
     )
+}
+
+/// Build the native gate prompt for channels that render one (buttons /
+/// keyboards). The description carries the text-reply form too, so a screenshot
+/// or forward of the prompt is still actionable.
+fn build_gate_prompt(
+    run_id: &str,
+    sop_name: &str,
+    step: u32,
+) -> zeroclaw_api::channel::ChannelGatePrompt {
+    use zeroclaw_api::channel::{ChannelGatePrompt, GateChoice, GateChoiceEmphasis};
+    ChannelGatePrompt {
+        title: format!("SOP approval needed: {sop_name}"),
+        description: render_notice(run_id, sop_name, step),
+        reference: run_id.to_string(),
+        choices: vec![
+            GateChoice {
+                id: "approve".to_string(),
+                label: "Approve".to_string(),
+                emphasis: GateChoiceEmphasis::Positive,
+            },
+            GateChoice {
+                id: "deny".to_string(),
+                label: "Deny".to_string(),
+                emphasis: GateChoiceEmphasis::Negative,
+            },
+        ],
+    }
 }
 
 /// Build the (channel_key, message) delivery pair from a route + run identity, or an
@@ -106,10 +135,30 @@ impl ApprovalRouteAdapter for ChannelRouteAdapter {
         };
         // Fire-and-forget: hand the async send to the runtime and return. The gate is
         // never blocked on channel I/O; a send failure is logged in the task.
+        // Native gate prompt first (buttons / keyboards, answered through the
+        // channel's inbound path); channels without one fall back to the text
+        // notice, whose `approve <run_id>` reply the orchestrator also resolves.
+        let prompt = build_gate_prompt(run_id, sop_name, step);
+        let recipient = msg.recipient.clone();
         let run_id = run_id.to_string();
         let route = route.to_string();
         self.handle.spawn(async move {
-            if let Err(e) = channel.send(&msg).await {
+            let prompted = match channel.send_gate_prompt(&recipient, &prompt).await {
+                Ok(prompted) => prompted,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "route": route, "run_id": run_id, "error": e.to_string()
+                            })),
+                        "approval route gate prompt failed; falling back to text notice"
+                    );
+                    false
+                }
+            };
+            if !prompted && let Err(e) = channel.send(&msg).await {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

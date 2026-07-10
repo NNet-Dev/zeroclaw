@@ -1920,6 +1920,12 @@ impl SopEngine {
             llm_calls_saved: 0,
         };
 
+        // Step 1's input is the trigger payload — the same mapping
+        // `step_input_value` applies on every other path (resume, retry). The
+        // start path used to hardcode `Null`, so a deterministic pipeline's
+        // first step never saw the event that triggered it.
+        let first_input = step_input_value(&run, 1);
+
         let claim = self.claim_admission(&run_id, &sop)?;
         self.active_runs.insert(run_id.clone(), run);
         ::zeroclaw_log::record!(
@@ -1931,7 +1937,7 @@ impl SopEngine {
             )
         );
 
-        match self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null) {
+        match self.dispatch_deterministic_step(&run_id, &sop, 1, first_input) {
             Ok(action) => Ok(action),
             Err(e) => {
                 self.active_runs.remove(&run_id);
@@ -7424,6 +7430,36 @@ type = "manual"
             events.iter().any(|ev| ev.kind == "gate_resolved"),
             "checkpoint resolution must append a gate_resolved ledger row: {events:?}"
         );
+    }
+
+    #[test]
+    fn deterministic_start_pipes_the_trigger_payload_into_step_one() {
+        // Regression: `start_deterministic_run` hardcoded step 1's input to Null,
+        // so a channel-triggered pipeline's first step never saw the event that
+        // triggered it (a triage step received `null` instead of the issue). The
+        // start path must apply the same step-1 = trigger-payload mapping as
+        // `step_input_value` on the resume/retry paths.
+        // `deterministic_sop` has an Execute-kind step 1, whose start action
+        // carries the input (a capability step 1 would execute inline instead).
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-payload")]);
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:issues.opened".into()),
+            payload: Some(r#"{"repo":"o/r","number":12}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        let first = engine.start_run("det-payload", event).unwrap();
+        match &first {
+            SopRunAction::DeterministicStep { step, input, .. } => {
+                assert_eq!(step.number, 1);
+                assert_eq!(
+                    input,
+                    &serde_json::json!({"repo": "o/r", "number": 12}),
+                    "step 1 must receive the parsed trigger payload, not Null"
+                );
+            }
+            other => panic!("expected the step-1 DeterministicStep, got {other:?}"),
+        }
     }
 
     #[test]

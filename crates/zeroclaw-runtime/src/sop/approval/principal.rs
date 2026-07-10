@@ -22,6 +22,10 @@ pub enum ApprovalSource {
     Http,
     /// The timeout tick (escalate/cancel). Not an approval, a transition.
     System,
+    /// A chat-channel gate answer (a SOP-gate button click or a
+    /// `<choice> <reference>` text reply), attributed to the channel user who
+    /// answered. Constructed only by the orchestrator's channel-gate intercept.
+    Channel,
 }
 
 /// WHO resolved a gate and from WHERE. Recorded into the append-only ledger.
@@ -70,6 +74,16 @@ impl ApprovalPrincipal {
             source: ApprovalSource::Http,
             identity: subject,
             channel: Some("http".to_string()),
+        }
+    }
+
+    /// A chat-channel gate answer. `channel_key` is the answering channel
+    /// (`discord.gnosis`), `user` the platform user id that clicked/replied.
+    pub fn channel(channel_key: String, user: Option<String>) -> Self {
+        Self {
+            source: ApprovalSource::Channel,
+            identity: user,
+            channel: Some(channel_key),
         }
     }
 
@@ -135,6 +149,7 @@ impl ApprovalPrincipal {
             ApprovalSource::Ws => "ws",
             ApprovalSource::Http => "http",
             ApprovalSource::System => "system",
+            ApprovalSource::Channel => "channel",
         }
     }
 }

@@ -24,7 +24,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
-use tokio::runtime::Handle;
 use zeroclaw_api::model_provider::ModelProvider;
 
 use super::types::{CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability};
@@ -162,22 +161,16 @@ impl SopCapability for LlmGenerateCapability {
 }
 
 /// [`LlmGenerateAdapter`] over a configured [`ModelProvider`]: one
-/// `chat_with_system` call, bridged sync->async by spawning onto the captured
-/// [`Handle`] and blocking on a std channel (same pattern as the forge adapter;
-/// safe on a runtime worker and on a plain thread alike).
+/// `chat_with_system` call, run on a dedicated bridge thread (see
+/// [`super::bridge::run_bridged`] for why the host runtime must not be used).
 pub struct ProviderLlmAdapter {
     provider: Arc<dyn ModelProvider>,
     model: String,
-    handle: Handle,
 }
 
 impl ProviderLlmAdapter {
-    pub fn new(provider: Arc<dyn ModelProvider>, model: String, handle: Handle) -> Self {
-        Self {
-            provider,
-            model,
-            handle,
-        }
+    pub fn new(provider: Arc<dyn ModelProvider>, model: String) -> Self {
+        Self { provider, model }
     }
 }
 
@@ -187,23 +180,16 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
         let model = self.model.clone();
         let system = system.map(str::to_string);
         let prompt = prompt.to_string();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.handle.spawn(async move {
-            let result = provider
-                .chat_with_system(system.as_deref(), &prompt, &model, None)
-                .await
-                .map_err(|e| e.to_string());
-            // Receiver gone = caller timed out; nothing left to report to.
-            let _ = tx.send(result);
-        });
-        match rx.recv_timeout(GENERATE_TIMEOUT) {
-            Ok(Ok(text)) => Ok(text),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(format!(
-                "timed out after {}s waiting for the model",
-                GENERATE_TIMEOUT.as_secs()
-            )),
-        }
+        super::bridge::run_bridged(
+            async move {
+                provider
+                    .chat_with_system(system.as_deref(), &prompt, &model, None)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            GENERATE_TIMEOUT,
+            "model call",
+        )
     }
 }
 
