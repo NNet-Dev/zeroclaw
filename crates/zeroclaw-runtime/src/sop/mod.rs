@@ -43,6 +43,21 @@ use types::{SopManifest, SopMeta};
 use zeroclaw_config::schema::SopConfig;
 use zeroclaw_memory::traits::Memory;
 
+/// Injected side-effect adapters for [`build_sop_engine`]. Each is optional and
+/// fail-closed when absent: the route falls back to the log-only no-op adapter,
+/// and the `forge.comment` / `llm.generate` capabilities report a clear failure
+/// instead of acting. The daemon injects real implementations; CLI / standalone
+/// callers pass `SopEngineAdapters::default()`.
+#[derive(Default)]
+pub struct SopEngineAdapters {
+    /// Delivers approval request / escalation notices to a channel.
+    pub route: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
+    /// Posts a SOP step's comment to a git forge (`forge.comment`).
+    pub forge: Option<Arc<dyn capability::ForgeCommentAdapter>>,
+    /// Runs one bounded model call as a pipeline step (`llm.generate`).
+    pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
+}
+
 /// Build a single shared SopEngine + SopAuditLogger pair.
 ///
 /// This is the sole construction site for SOP state within a daemon.
@@ -53,8 +68,13 @@ pub fn build_sop_engine(
     config: SopConfig,
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
-    route_adapter: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
+    adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    let SopEngineAdapters {
+        route: route_adapter,
+        forge: forge_adapter,
+        llm: llm_adapter,
+    } = adapters;
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
     // startup, so fall back to in-memory with a loud log. `workspace_dir` here is the
@@ -78,10 +98,19 @@ pub fn build_sop_engine(
     let route: Arc<dyn approval::ApprovalRouteAdapter> =
         route_adapter.unwrap_or_else(|| Arc::new(approval::NoopRouteAdapter));
     let approval_broker = Arc::new(approval::ApprovalBroker::with_route(route));
+    // Deterministic capability registry: builtins + the injected-adapter
+    // capabilities (`forge.comment` write-back, `llm.generate` bounded model
+    // call). The daemon injects real adapters; CLI/standalone callers pass
+    // `SopEngineAdapters::default()`, leaving both fail-closed exactly like
+    // `shell.exec`/`notify.channel`.
+    let mut capabilities = capability::SopCapabilityRegistry::with_builtins();
+    capabilities.register(capability::ForgeCommentCapability::new(forge_adapter));
+    capabilities.register(capability::LlmGenerateCapability::new(llm_adapter));
     let mut engine = SopEngine::new(config)
         .with_store(store)
         .with_metrics(SopMetricsCollector::shared())
-        .with_approval_broker(approval_broker);
+        .with_approval_broker(approval_broker)
+        .with_capabilities(Arc::new(capabilities));
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));

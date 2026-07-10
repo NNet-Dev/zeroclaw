@@ -126,6 +126,45 @@ approve/deny route, or the `sop_approve` agent tool). Routes fire only in the da
 (where channels are configured); leave them unset (or empty) to notify only the
 originating surface, which is the default.
 
+### Deterministic checkpoints: approval and resume
+
+A deterministic run paused at a `kind: checkpoint` step is resolved by the SAME
+approve/deny surfaces as an approval gate (`zeroclaw sop pending` lists both,
+distinguished by `kind`). On approve, the engine resumes the run and drives any
+following `kind: capability` steps headlessly to the next pause or completion -
+so a `checkpoint -> capability` tail (e.g. posting an approved draft) executes
+without a live agent turn. On deny, the run is cancelled. Both resolutions are
+recorded in the approval ledger. A checkpoint step may carry `- policy:` to select
+a `request_route`/`escalation_route` for its out-of-band notice; checkpoint
+resolution itself is not membership/quorum-gated (it is an in-band pause, not a
+policied approval gate).
+
+### Injected-adapter capabilities
+
+Two `kind: capability` steps perform real side effects through adapters the daemon
+injects at engine build; without a daemon (CLI validation, tests) they fail closed
+with a clear message, like `shell.exec`:
+
+- **`llm.generate`** - one bounded model call as a pipeline step (no tools, no
+  agent loop), on the default agent's resolved model provider. Authored fields in
+  `with:` - `instruction` (required), `system`, `output_key` (default `text`),
+  `echo` (payload fields copied into the output for downstream piping). The piped
+  event payload is delivered inside an explicit untrusted-content frame and is
+  never read as configuration.
+- **`forge.comment`** - posts a comment to a git-forge issue/PR through the git
+  channel's outbound path (provider-agnostic: GitHub / Gitea / Forgejo). Input
+  fields: `repo` (`owner/repo`), `number`, `body`, and optional `channel`
+  (`git.<alias>`; defaults to the single configured git channel).
+
+Together with a checkpoint they form a headless review pipeline:
+
+```md
+1. **Draft** - kind: capability / capability: llm.generate
+   - with: { instruction = "...", output_key = "body", echo = ["repo", "number"] }
+2. **Approve** - kind: checkpoint / policy: triage
+3. **Post** - kind: capability / capability: forge.comment
+```
+
 ### Step Contract Enforcement
 
 Step contracts are optional. When present, `input` and `output` accept a compact

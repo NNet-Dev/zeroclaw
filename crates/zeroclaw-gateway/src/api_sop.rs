@@ -119,7 +119,9 @@ fn outcome_response(outcome: &ResolveOutcome) -> (StatusCode, &'static str) {
     }
 }
 
-/// GET /admin/sop/pending - list the runs currently `WaitingApproval`.
+/// GET /admin/sop/pending - list the runs parked on a human: `WaitingApproval`
+/// gates AND deterministic `PausedCheckpoint` runs (both are resolved by the same
+/// approve/deny chokepoint), distinguished by the `kind` field.
 pub async fn handle_sop_pending(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -132,7 +134,12 @@ pub async fn handle_sop_pending(
     let pending: Vec<serde_json::Value> = guard
         .active_runs()
         .values()
-        .filter(|r| r.status == SopRunStatus::WaitingApproval)
+        .filter(|r| {
+            matches!(
+                r.status,
+                SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+            )
+        })
         .map(|r| {
             serde_json::json!({
                 "run_id": r.run_id,
@@ -140,6 +147,11 @@ pub async fn handle_sop_pending(
                 "step": r.current_step,
                 "total_steps": r.total_steps,
                 "waiting_since": r.waiting_since,
+                "kind": if r.status == SopRunStatus::PausedCheckpoint {
+                    "checkpoint"
+                } else {
+                    "approval"
+                },
             })
         })
         .collect();

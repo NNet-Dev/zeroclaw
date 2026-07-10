@@ -148,7 +148,108 @@ impl SopEngine {
         principal: super::approval::ApprovalPrincipal,
     ) -> Result<super::approval::BrokerOutcome> {
         let broker = Arc::clone(&self.approval_broker);
-        broker.resolve(self, run_id, decision, principal)
+        let outcome = broker.resolve(self, run_id, decision.clone(), principal.clone())?;
+        // Deterministic-checkpoint bridge: the broker owns only `WaitingApproval`
+        // gates and reports NotWaiting for a run paused at a checkpoint. Resolve
+        // the checkpoint HERE, at the same chokepoint, so every surface that
+        // routes through it (gateway HTTP/WS, loopback CLI, the `sop_approve`
+        // agent tool) gets identical audited behavior — including driving the
+        // resumed deterministic segment headlessly, since capability steps need
+        // no live agent turn. Checkpoints remain unpoliced (no membership/quorum;
+        // an in-band pause, matching the historical `approve_step` semantics) but
+        // ARE ledger-audited like any other gate resolution.
+        let not_waiting = matches!(
+            outcome,
+            super::approval::BrokerOutcome::NotWaiting
+                | super::approval::BrokerOutcome::Resolved(
+                    super::approval::ResolveOutcome::NotWaiting
+                )
+        );
+        if !not_waiting {
+            return Ok(outcome);
+        }
+        let is_checkpoint = self
+            .active_runs
+            .get(run_id)
+            .is_some_and(|r| r.status == SopRunStatus::PausedCheckpoint);
+        if !is_checkpoint {
+            return Ok(outcome);
+        }
+        self.resolve_checkpoint(run_id, decision, principal)
+    }
+
+    /// Resolve a run paused at a deterministic checkpoint from an out-of-band (or
+    /// in-band tool) surface: audit first (fail-closed), then approve-and-drive or
+    /// deny-and-cancel.
+    ///
+    /// Approve resumes through [`Self::approve_step`] (the checkpoint owner) and
+    /// then drives consecutive capability steps via
+    /// [`Self::drive_headless_deterministic`] until the run parks again, hits a
+    /// step that needs a live agent, or reaches a terminal state — so a
+    /// `checkpoint -> capability(...)` tail (e.g. an approved `forge.comment`
+    /// write-back) executes without any live agent turn. Deny cancels the run,
+    /// mirroring the approval-gate deny path.
+    fn resolve_checkpoint(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<super::approval::BrokerOutcome> {
+        use super::approval::{ApprovalDecision, GateEventKind, GateLedgerEntry, ResolveOutcome};
+
+        let step = self
+            .active_runs
+            .get(run_id)
+            .map(|r| r.current_step)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+
+        // Pre-flight the approve path BEFORE the ledger append (mirror
+        // `resolve_gate`): a resume that cannot possibly succeed must fail closed
+        // with the run untouched and NO false `gate_resolved` audit row.
+        if matches!(decision, ApprovalDecision::Approve) {
+            if self.is_park_persist_pending(run_id) {
+                bail!(
+                    "Run {run_id} cannot resume: its parked checkpoint snapshot is not yet \
+                     durably persisted (retrying)"
+                );
+            }
+            self.can_advance_deterministic_step(run_id)?;
+        }
+
+        // Audit FIRST, fail-closed: the checkpoint cannot clear or cancel without
+        // its durable ledger row (same rule as the approval-gate chokepoint).
+        self.record_gate_event(GateLedgerEntry {
+            run_id: run_id.to_string(),
+            step,
+            kind: GateEventKind::Resolved,
+            decision: Some(decision.clone()),
+            principal: principal.clone(),
+            ts: now_iso8601(),
+        })
+        .map_err(|e| {
+            anyhow::Error::msg(format!(
+                "failed to persist checkpoint resolution ledger event (fail-closed): {e}"
+            ))
+        })?;
+
+        match decision {
+            ApprovalDecision::Approve => {
+                let first = self.approve_step(run_id)?;
+                self.record_approval_metric(run_id, principal.is_system());
+                let final_action = self.drive_headless_deterministic(run_id, first)?;
+                Ok(super::approval::BrokerOutcome::Resolved(
+                    ResolveOutcome::Resumed(Box::new(final_action)),
+                ))
+            }
+            ApprovalDecision::Deny { reason } => {
+                let why =
+                    reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
+                self.finish_run(run_id, SopRunStatus::Cancelled, Some(why));
+                Ok(super::approval::BrokerOutcome::Resolved(
+                    ResolveOutcome::Denied,
+                ))
+            }
+        }
     }
     /// Reconstruct in-flight runs from the store at startup (durable backends).
     /// No-op for the in-memory default. Does not overwrite already-present runs.
@@ -2311,6 +2412,12 @@ impl SopEngine {
                 // the run waits at the checkpoint - but only AFTER the parked
                 // snapshot is durably persisted (else keep the claim).
                 self.persist_parked_snapshot_then_release_claim(run_id);
+                // EPIC G route delivery, checkpoint flavor: a checkpoint step that
+                // names a `policy` with a `request_route` notifies the approver
+                // out-of-band on park (e.g. a Discord ops channel), exactly like a
+                // `WaitApproval` gate. Best-effort; the parked state is already
+                // durable and a delivery failure never affects it.
+                self.notify_park_request(run_id);
 
                 Ok(SopRunAction::CheckpointWait {
                     run_id: run_id.to_string(),
@@ -7224,6 +7331,141 @@ type = "manual"
         assert!(
             matches!(fresh, SopRunAction::DeterministicStep { .. }),
             "a fresh run must admit - no phantom exec slot held by the parked run: {fresh:?}"
+        );
+    }
+
+    /// `capability(noop) -> checkpoint -> capability(noop)`: the shape the
+    /// checkpoint bridge exists for (an approved write-back tail, e.g.
+    /// `forge.comment`, executing headlessly after an out-of-band approval).
+    fn capability_checkpoint_sop(name: &str) -> Sop {
+        let cap_step = |number: u32| SopStep {
+            number,
+            title: format!("Capability {number}"),
+            kind: SopStepKind::Capability,
+            capability: Some("noop".into()),
+            ..SopStep::default()
+        };
+        Sop {
+            name: name.into(),
+            description: "cap -> checkpoint -> cap".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                cap_step(1),
+                SopStep {
+                    number: 2,
+                    title: "Checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                cap_step(3),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_via_broker_approves_checkpoint_and_drives_capability_tail() {
+        // The checkpoint bridge (B3): an out-of-band approve of a PausedCheckpoint
+        // through the chokepoint must (a) write the audit ledger row, (b) resume via
+        // approve_step, and (c) DRIVE the post-checkpoint capability steps
+        // headlessly to completion - no live agent turn involved.
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-tail")]);
+        let first = engine.start_run("cp-tail", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to the checkpoint");
+        assert!(
+            matches!(parked, SopRunAction::CheckpointWait { .. }),
+            "run must park at the step-2 checkpoint: {parked:?}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+        assert!(
+            matches!(*final_action, SopRunAction::Completed { .. }),
+            "the capability tail must run to completion headlessly: {final_action:?}"
+        );
+        let run = engine
+            .last_finished_run("cp-tail")
+            .expect("run reached the finished list");
+        assert_eq!(run.status, SopRunStatus::Completed);
+        assert_eq!(
+            run.step_results.len(),
+            3,
+            "all three steps (cap, checkpoint, cap) recorded results"
+        );
+        // The resolution is ledger-audited like any approval gate.
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "checkpoint resolution must append a gate_resolved ledger row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_via_broker_denies_checkpoint_and_cancels() {
+        // Deny of a parked checkpoint through the chokepoint cancels the run (the
+        // approval-gate deny semantics), records the reason, and audits the
+        // resolution. Previously a checkpoint could not be denied out-of-band at
+        // all (the surfaces returned not_waiting).
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-deny")]);
+        let first = engine.start_run("cp-deny", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to the checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Deny {
+                    reason: Some("not appropriate".into()),
+                },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint deny resolves");
+        assert!(
+            matches!(
+                outcome,
+                super::super::approval::BrokerOutcome::Resolved(
+                    super::super::approval::ResolveOutcome::Denied
+                )
+            ),
+            "expected Resolved(Denied), got {outcome:?}"
+        );
+        let run = engine
+            .last_finished_run("cp-deny")
+            .expect("denied run reached the finished list");
+        assert_eq!(run.status, SopRunStatus::Cancelled);
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "checkpoint deny must append a gate_resolved ledger row: {events:?}"
         );
     }
 
