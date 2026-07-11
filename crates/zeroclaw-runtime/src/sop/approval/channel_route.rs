@@ -63,13 +63,14 @@ fn parse_route(route: &str) -> Option<(&str, &str)> {
 }
 
 /// The configured approval routes (`request_route` + `escalation_route`) whose channel
-/// key is NOT among `channel_keys` - i.e. a route this send-only adapter cannot deliver
-/// because its channel map omits that channel (e.g. an AMQP SOP-dispatch channel that
-/// needs runtime SOP handles the adapter is built without). The daemon logs these at
-/// STARTUP so the drift between "configured route" and "deliverable channel" surfaces
-/// at boot, not silently on the first parked gate. Malformed routes are NOT flagged
-/// here - they fail loudly at delivery with a precise parse error. Returns
-/// `(policy_name, route_kind, route, channel_key)` for each unresolvable route.
+/// key is NOT among `channel_keys` - the channels the route adapter can actually deliver
+/// to (present in its map AND `supports_outbound_send`). A route names an undeliverable
+/// channel when it is absent from the map (e.g. an AMQP SOP-dispatch channel that needs
+/// runtime SOP handles the adapter lacks) OR present but inbound-only (its `send` is a
+/// no-op). The daemon logs these at STARTUP so the drift between "configured route" and
+/// "deliverable channel" surfaces at boot, not silently on the first parked gate.
+/// Malformed routes are NOT flagged here - they fail loudly at delivery with a precise
+/// parse error. Returns `(policy_name, route_kind, route, channel_key)` per route.
 pub fn unresolvable_approval_routes(
     approval: &zeroclaw_config::schema::SopApprovalConfig,
     channel_keys: &std::collections::HashSet<String>,
@@ -141,6 +142,16 @@ impl ApprovalRouteAdapter for ChannelRouteAdapter {
                  (route '{route}')"
             );
         };
+        // An inbound-only channel's `send` is a no-op that returns `Ok`, so spawning it
+        // would report success without delivering anything. Refuse and surface it (the
+        // broker logs the Err) rather than silently dropping the notice.
+        if !channel.supports_outbound_send() {
+            anyhow::bail!(
+                "approval route channel '{channel_key}' does not support outbound \
+                 delivery (it is inbound-only); its approval notice cannot be sent \
+                 (route '{route}')"
+            );
+        }
         // Fire-and-forget: hand the async send to the runtime and return. The gate is
         // never blocked on channel I/O; a send failure is logged in the task.
         let run_id = run_id.to_string();
@@ -239,6 +250,16 @@ mod tests {
         assert_eq!(*kind, "request_route");
         assert_eq!(route, "amqp.sopq:runs");
         assert_eq!(channel_key, "amqp.sopq");
+
+        // With NO channels at all, every WELL-FORMED route is unresolvable (both of
+        // prod's routes; p2's malformed route is still skipped). The daemon runs this
+        // before its empty-channel-map early return so the drift is surfaced at boot.
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(
+            unresolvable_approval_routes(&approval, &empty).len(),
+            2,
+            "with no deliverable channels, every well-formed configured route is flagged"
+        );
     }
 
     #[test]
@@ -288,6 +309,53 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    /// An inbound-only channel whose `send` no-ops and returns `Ok` (like AMQP): it must
+    /// be refused as a route target, not mistaken for a successful delivery.
+    struct InboundOnlyChannel;
+    impl Attributable for InboundOnlyChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::Discord)
+        }
+        fn alias(&self) -> &str {
+            "inbound"
+        }
+    }
+    #[async_trait]
+    impl Channel for InboundOnlyChannel {
+        fn name(&self) -> &str {
+            "inbound-only"
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn supports_outbound_send(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_errors_for_an_inbound_only_channel() {
+        // A present but inbound-only channel (no-op send) must be REFUSED at deliver -
+        // returning Err so the broker logs a delivery failure - rather than spawning a
+        // send that silently succeeds without delivering the notice.
+        let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        channels.insert("amqp.q".to_string(), Arc::new(InboundOnlyChannel));
+        let adapter = ChannelRouteAdapter::new(channels, Handle::current());
+        let err = adapter
+            .deliver("amqp.q:runs", "run-1", "triage", 1)
+            .expect_err("an inbound-only channel cannot deliver");
+        assert!(
+            err.to_string().contains("does not support outbound"),
+            "the refusal must name the outbound-delivery gap, got: {err}"
+        );
     }
 
     #[tokio::test]

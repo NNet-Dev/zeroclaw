@@ -417,6 +417,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether `send` actually delivers a message OUTBOUND on this channel. Default
+    /// `true`. An INBOUND-ONLY transport (e.g. an AMQP trigger source whose `send` is a
+    /// deliberate no-op that returns `Ok`) overrides this to `false`, so a surface that
+    /// must genuinely deliver - such as the SOP approval route adapter - can refuse to
+    /// route to it (and report the misconfiguration) instead of silently succeeding
+    /// without sending anything.
+    fn supports_outbound_send(&self) -> bool {
+        true
+    }
+
     /// Self-loop guard for multi-agent runs.
     ///
     /// Returns the bot's own handle/identity on this channel

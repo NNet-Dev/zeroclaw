@@ -400,10 +400,16 @@ impl SopEngine {
     /// would turn into a lost park while newer triggers had already admitted into
     /// the "freed" slot). The slot is held until a later persist succeeds,
     /// trading a little concurrency for no lost park.
-    fn persist_parked_snapshot_then_release_claim(&mut self, run_id: &str) {
+    /// Returns `true` when the parked snapshot was durably persisted (and the exec
+    /// claim released). `false` means the write failed and the claim was KEPT
+    /// (fail-closed), with the run tracked for a maintenance-tick retry - the caller
+    /// must NOT treat the park as durable (e.g. must not deliver an out-of-band notice
+    /// for it yet; `retry_pending_park_persists` issues that once the retry succeeds).
+    fn persist_parked_snapshot_then_release_claim(&mut self, run_id: &str) -> bool {
         if self.persist_active_checked(run_id) {
             self.claims_pending_persist.remove(run_id);
             self.release_claim_on_park(run_id);
+            true
         } else {
             // Track this run so `heartbeat_active_claims` keeps renewing its KEPT
             // claim despite the park status (see `claims_pending_persist`'s doc):
@@ -418,6 +424,7 @@ impl SopEngine {
                     .with_attrs(::serde_json::json!({"run_id": run_id})),
                 "SOP engine: parked snapshot not persisted; KEEPING the exec claim (fail closed) so the park is not lost"
             );
+            false
         }
     }
 
@@ -450,6 +457,10 @@ impl SopEngine {
                 if !holds_exec_claim(status) {
                     self.release_claim_on_park(&run_id);
                 }
+                // The park is now durable: deliver the deferred EPIC G approval-request
+                // notice that was withheld when the initial persist failed. A no-op for
+                // a park with no policy `request_route` (e.g. a deterministic checkpoint).
+                self.notify_park_request(&run_id);
             }
         }
     }
@@ -1484,14 +1495,20 @@ impl SopEngine {
         // the parked snapshot is durably persisted (else keep the claim, fail
         // closed).
         if parked_for_approval {
-            self.persist_parked_snapshot_then_release_claim(run_id);
+            let persisted = self.persist_parked_snapshot_then_release_claim(run_id);
             // EPIC G route delivery: if the parked step's policy names a
             // `request_route`, deliver the approval request out-of-band (e.g. to a
             // Discord ops channel) so an approver can act without watching the
-            // originating surface. Best-effort - the gate is already parked and
-            // durable; a delivery failure never affects it, and the approval still
-            // comes back through the normal HTTP/WS/tool -> broker path.
-            self.notify_park_request(run_id);
+            // originating surface. Best-effort - a delivery failure never affects the
+            // gate, and the approval still comes back through the normal HTTP/WS/tool
+            // -> broker path. Deliver ONLY once the parked snapshot is durable: on a
+            // failed persist the claim is kept (fail-closed) and the park retried, so a
+            // notice now could point at a gate whose snapshot is not yet durable and
+            // could be lost across a crash. `retry_pending_park_persists` re-issues the
+            // notice when the deferred park finally persists.
+            if persisted {
+                self.notify_park_request(run_id);
+            }
         } else {
             self.persist_active(run_id);
         }
@@ -5483,6 +5500,54 @@ mod tests {
         assert_eq!(delivered_run, &run_id, "carries the parked run id");
         assert_eq!(sop_name, "s1", "carries the SOP name");
         assert_eq!(*step, 1, "carries the parked step number");
+    }
+
+    #[test]
+    fn park_withholds_the_request_route_until_the_snapshot_is_durable() {
+        // A route notice must NOT fire for a gate whose parked snapshot is not yet
+        // durable: when save_run fails at park, the exec claim is kept (fail-closed) and
+        // the request-route delivery is withheld (retry_pending_park_persists re-issues
+        // it once a retry persists the park).
+        use zeroclaw_config::schema::ApprovalPolicyConfig;
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let mut config = SopConfig::default();
+        config.approval.policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 0,
+                request_route: Some("discord.ops:1".to_string()),
+                escalation_route: None,
+            },
+        );
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.steps[0].policy = Some("prod".to_string());
+        let store = std::sync::Arc::new(FailingSaveStore {
+            inner: InMemoryRunStore::new(),
+        });
+        let mut engine = engine_with_config_sops(config, vec![sop])
+            .with_approval_broker(std::sync::Arc::new(
+                crate::sop::approval::ApprovalBroker::with_route(adapter),
+            ))
+            .with_store(store);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "the supervised policied step parks for approval"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no request-route delivery may fire while the parked snapshot is not durable"
+        );
+        assert!(
+            engine.is_park_persist_pending(&run_id),
+            "the run is tracked for a park-persist retry (claim kept, fail-closed)"
+        );
     }
 
     #[test]

@@ -7742,19 +7742,25 @@ fn build_sop_route_adapter(
     config: &Config,
 ) -> Option<std::sync::Arc<dyn zeroclaw_runtime::sop::approval::ApprovalRouteAdapter>> {
     let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
-    if channels.is_empty() {
-        return None;
-    }
     // Startup validation: this send-only adapter's channel map omits channels that
     // need runtime SOP handles (e.g. AMQP SOP-dispatch channels). Surface at BOOT any
     // configured approval route whose channel is absent here, so a `request_route` /
     // `escalation_route` that would silently fail to deliver at gate time is caught up
-    // front rather than on the first parked gate.
-    let channel_keys: std::collections::HashSet<String> = channels.keys().cloned().collect();
+    // front rather than on the first parked gate. This runs BEFORE the empty-map return:
+    // when there are no deliverable channels at all, EVERY configured route is
+    // undeliverable and must still be surfaced.
+    // A route target must be a channel that can actually deliver OUTBOUND; an
+    // inbound-only channel (e.g. AMQP, whose `send` is a no-op) in the map cannot send
+    // an approval notice, so it is not a resolvable route target.
+    let deliverable_keys: std::collections::HashSet<String> = channels
+        .iter()
+        .filter(|(_, ch)| ch.supports_outbound_send())
+        .map(|(key, _)| key.clone())
+        .collect();
     for (policy, kind, route, channel_key) in
         zeroclaw_runtime::sop::approval::unresolvable_approval_routes(
             &config.sop.approval,
-            &channel_keys,
+            &deliverable_keys,
         )
     {
         ::zeroclaw_log::record!(
@@ -7771,6 +7777,9 @@ fn build_sop_route_adapter(
              its approval notices will not be sent (the channel may require runtime SOP \
              handles this send-only adapter lacks)"
         );
+    }
+    if channels.is_empty() {
+        return None;
     }
     Some(std::sync::Arc::new(
         zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(

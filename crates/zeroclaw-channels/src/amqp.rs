@@ -440,6 +440,13 @@ impl Channel for AmqpChannel {
         Ok(())
     }
 
+    fn supports_outbound_send(&self) -> bool {
+        // `send` above is a deliberate no-op: AMQP is inbound-only here. A surface
+        // that must actually deliver (e.g. the SOP approval route adapter) must not
+        // route to it and mistake the no-op `Ok` for a successful send.
+        false
+    }
+
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let (_conn, mut consumer) = self.establish_consumer().await?;
 
