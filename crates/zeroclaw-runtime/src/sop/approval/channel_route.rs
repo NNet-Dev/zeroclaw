@@ -197,7 +197,7 @@ fn render_notice(notice: &GateNotice<'_>) -> String {
 /// without simply omit them, and approve/deny stay universally answerable.
 fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelGatePrompt {
     use zeroclaw_api::channel::{
-        ChannelGatePrompt, GateChoice, GateChoiceEmphasis, GateChoiceInput,
+        ChannelGatePrompt, GateChoice, GateChoiceEmphasis, GateChoiceInput, GateChoiceKind,
     };
     // Discord embeds cap descriptions at 4096 chars; stay comfortably under.
     let mut description = render_notice(notice);
@@ -205,7 +205,7 @@ fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelG
         description = description.chars().take(3500).collect::<String>() + "\u{2026}";
     }
     let mut choices = vec![GateChoice {
-        id: "approve".to_string(),
+        id: GateChoiceKind::Approve.id().to_string(),
         label: "Approve".to_string(),
         emphasis: GateChoiceEmphasis::Positive,
         input: None,
@@ -225,7 +225,7 @@ fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelG
         let oversize = prefill.as_ref().is_some_and(|p| p.chars().count() > 4000);
         if !oversize {
             choices.push(GateChoice {
-                id: "edit".to_string(),
+                id: GateChoiceKind::Edit.id().to_string(),
                 label: "Edit".to_string(),
                 emphasis: GateChoiceEmphasis::Neutral,
                 input: Some(GateChoiceInput {
@@ -237,7 +237,7 @@ fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelG
     }
     if notice.can_revise {
         choices.push(GateChoice {
-            id: "revise".to_string(),
+            id: GateChoiceKind::Revise.id().to_string(),
             label: "Revise".to_string(),
             emphasis: GateChoiceEmphasis::Neutral,
             input: Some(GateChoiceInput {
@@ -247,7 +247,7 @@ fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelG
         });
     }
     choices.push(GateChoice {
-        id: "deny".to_string(),
+        id: GateChoiceKind::Deny.id().to_string(),
         label: "Deny".to_string(),
         emphasis: GateChoiceEmphasis::Negative,
         input: None,

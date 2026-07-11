@@ -110,10 +110,61 @@ pub struct ChannelGatePrompt {
     pub resolved_description: Option<String>,
 }
 
+/// The fixed vocabulary of gate-answer tokens, and the single source of truth
+/// for their wire spelling. A gate answer crosses two stringly-typed transports
+/// — a Discord `custom_id` and a `<choice> <reference>` text reply — so the
+/// token must be a string on the wire; this enum keeps producer (the route
+/// adapter that mints [`GateChoice::id`]) and consumer (the orchestrator that
+/// maps an answer to an approval decision) matching on ONE definition instead of
+/// re-typing the literal at each site, so adding a choice is a compile error at
+/// every place that must handle it rather than a silent drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateChoiceKind {
+    /// Approve the gate as presented.
+    Approve,
+    /// Deny the gate (cancels / fails the run per the step's policy).
+    Deny,
+    /// Approve with an operator amendment to the declared editable field.
+    Edit,
+    /// Ask for a re-draft with guidance (checkpoint with an llm predecessor).
+    Revise,
+}
+
+impl GateChoiceKind {
+    /// The wire token — the string carried in a `custom_id` and a text reply.
+    pub fn id(self) -> &'static str {
+        match self {
+            GateChoiceKind::Approve => "approve",
+            GateChoiceKind::Deny => "deny",
+            GateChoiceKind::Edit => "edit",
+            GateChoiceKind::Revise => "revise",
+        }
+    }
+
+    /// Parse a wire token back to its kind (case-insensitive). `None` for any
+    /// unknown token, so an unrecognized answer is dropped, never coerced.
+    pub fn from_id(token: &str) -> Option<Self> {
+        match token.to_ascii_lowercase().as_str() {
+            "approve" => Some(GateChoiceKind::Approve),
+            "deny" => Some(GateChoiceKind::Deny),
+            "edit" => Some(GateChoiceKind::Edit),
+            "revise" => Some(GateChoiceKind::Revise),
+            _ => None,
+        }
+    }
+
+    /// True when answering this choice collects free text (the amended draft or
+    /// the re-draft guidance) — the channels that can, render a form for it.
+    pub fn collects_text(self) -> bool {
+        matches!(self, GateChoiceKind::Edit | GateChoiceKind::Revise)
+    }
+}
+
 /// One selectable choice on a [`ChannelGatePrompt`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateChoice {
-    /// Stable machine id carried back in the answer (e.g. "approve").
+    /// Stable machine id carried back in the answer (e.g. "approve"). Mint it
+    /// from [`GateChoiceKind::id`] so it stays in lockstep with the parser.
     pub id: String,
     /// Human label for the button / keyboard entry.
     pub label: String,
@@ -824,6 +875,30 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_choice_kind_ids_round_trip_and_reject_unknown() {
+        for kind in [
+            GateChoiceKind::Approve,
+            GateChoiceKind::Deny,
+            GateChoiceKind::Edit,
+            GateChoiceKind::Revise,
+        ] {
+            assert_eq!(GateChoiceKind::from_id(kind.id()), Some(kind));
+        }
+        // Case-insensitive parse; unknown tokens are None (dropped, never coerced).
+        assert_eq!(
+            GateChoiceKind::from_id("APPROVE"),
+            Some(GateChoiceKind::Approve)
+        );
+        assert_eq!(GateChoiceKind::from_id("escalate"), None);
+        assert_eq!(GateChoiceKind::from_id(""), None);
+        // Only the text-collecting choices report collects_text.
+        assert!(GateChoiceKind::Edit.collects_text());
+        assert!(GateChoiceKind::Revise.collects_text());
+        assert!(!GateChoiceKind::Approve.collects_text());
+        assert!(!GateChoiceKind::Deny.collects_text());
+    }
 
     #[test]
     fn channel_sop_topic_build_parse_roundtrip() {

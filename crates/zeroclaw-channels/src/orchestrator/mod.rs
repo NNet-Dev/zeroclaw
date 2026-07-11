@@ -6551,12 +6551,10 @@ async fn dispatch_channel_sop_gate(
         .and_then(|s| s.strip_prefix(MARKER_PREFIX))
     {
         match rest.split_once(':') {
+            // Any known gate-choice token is a valid marker; unknown tokens are
+            // dropped, never coerced (the enum is the single vocabulary).
             Some((c, r))
-                if !r.is_empty()
-                    && matches!(
-                        c.to_ascii_lowercase().as_str(),
-                        "approve" | "deny" | "edit" | "revise"
-                    ) =>
+                if !r.is_empty() && zeroclaw_api::channel::GateChoiceKind::from_id(c).is_some() =>
             {
                 (Form::Marker, c.to_ascii_lowercase(), r.to_string())
             }
@@ -6571,13 +6569,14 @@ async fn dispatch_channel_sop_gate(
             }
         }
     } else if msg.internal_sop_event.is_none() {
-        // Text form: exactly two tokens, and the first must be a known choice.
-        // Edit/Revise stay marker-only (they carry a text payload a two-token
-        // reply cannot); approve/deny remain universally answerable.
+        // Text form: exactly two tokens, and the first must be a text-free
+        // choice. Edit/Revise stay marker-only (they carry a text payload a
+        // two-token reply cannot); approve/deny remain universally answerable.
         let mut words = msg.content.split_whitespace();
         match (words.next(), words.next(), words.next()) {
             (Some(c), Some(r), None)
-                if matches!(c.to_ascii_lowercase().as_str(), "approve" | "deny") =>
+                if zeroclaw_api::channel::GateChoiceKind::from_id(c)
+                    .is_some_and(|k| !k.collects_text()) =>
             {
                 (Form::Text, c.to_ascii_lowercase(), r.to_string())
             }
@@ -6683,13 +6682,21 @@ async fn dispatch_channel_sop_gate(
         Some(alias) => format!("{}.{alias}", msg.channel),
         None => msg.channel.clone(),
     };
-    let decision = match choice.as_str() {
-        "approve" => zeroclaw_runtime::sop::approval::ApprovalDecision::Approve,
+    use zeroclaw_api::channel::GateChoiceKind;
+    use zeroclaw_runtime::sop::approval::ApprovalDecision;
+    // `choice` already passed `GateChoiceKind::from_id` at parse time; this
+    // match is exhaustive over the enum, so a new choice is a compile error
+    // here (not a silent fall-through to Deny).
+    let decision = match GateChoiceKind::from_id(&choice) {
+        Some(GateChoiceKind::Approve) => ApprovalDecision::Approve,
+        Some(GateChoiceKind::Deny) | None => ApprovalDecision::Deny {
+            reason: Some(format!("denied by {} via {channel_key}", msg.sender)),
+        },
         // Edit / Revise carry their text in the marker message's content (the
         // connector puts the modal's typed field there). Empty text cannot
         // amend or steer anything — consume without resolving (the connector's
         // required-field modal makes this unreachable in practice).
-        "edit" | "revise" => {
+        Some(kind @ (GateChoiceKind::Edit | GateChoiceKind::Revise)) => {
             let text = msg.content.trim().to_string();
             if text.is_empty() {
                 ::zeroclaw_log::record!(
@@ -6703,20 +6710,14 @@ async fn dispatch_channel_sop_gate(
                 );
                 return true;
             }
-            if choice == "edit" {
-                zeroclaw_runtime::sop::approval::ApprovalDecision::Amend { text }
+            if kind == GateChoiceKind::Edit {
+                ApprovalDecision::Amend { text }
             } else {
-                zeroclaw_runtime::sop::approval::ApprovalDecision::Revise { guidance: text }
+                ApprovalDecision::Revise { guidance: text }
             }
         }
-        _ => zeroclaw_runtime::sop::approval::ApprovalDecision::Deny {
-            reason: Some(format!("denied by {} via {channel_key}", msg.sender)),
-        },
     };
-    let is_edit = matches!(
-        decision,
-        zeroclaw_runtime::sop::approval::ApprovalDecision::Amend { .. }
-    );
+    let is_edit = matches!(decision, ApprovalDecision::Amend { .. });
     let principal = zeroclaw_runtime::sop::approval::ApprovalPrincipal::channel(
         channel_key.clone(),
         Some(msg.sender.clone()),

@@ -3044,9 +3044,9 @@ impl Channel for DiscordChannel {
                                                 Some(i) => (i.label, i.prefill),
                                                 None => ("Text".to_string(), None),
                                             };
-                                            let title = match choice {
-                                                "edit" => "Edit the draft",
-                                                "revise" => "Ask for a re-draft",
+                                            let title = match zeroclaw_api::channel::GateChoiceKind::from_id(choice) {
+                                                Some(zeroclaw_api::channel::GateChoiceKind::Edit) => "Edit the draft",
+                                                Some(zeroclaw_api::channel::GateChoiceKind::Revise) => "Ask for a re-draft",
                                                 _ => "Provide text",
                                             };
                                             let modal = components::DiscordModal {

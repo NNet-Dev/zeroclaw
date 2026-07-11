@@ -135,8 +135,8 @@ pub fn resolve_gate(
         );
         // Roll back the exec claim re-acquired in step 2c: the run stays parked at
         // WaitingApproval, so it must NOT keep occupying an exec slot (which would
-        // wrongly defer later triggers). Deny took no claim, so this only matters for
-        // Approve.
+        // wrongly hold back subsequent triggers). Deny took no claim, so this only
+        // matters for Approve.
         if matches!(decision, ApprovalDecision::Approve) {
             engine.release_claim_on_park(run_id);
         }

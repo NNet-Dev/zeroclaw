@@ -3,12 +3,32 @@
 //! Posts a comment to a git-forge issue/PR as the work product of a SOP step —
 //! the write-back primitive a triage SOP uses after a human approval gate clears.
 //!
+//! ## Why a deterministic capability and not an agent tool or MCP server
+//!
+//! This is a first-party forge-WRITE authority, so the placement is deliberate:
+//!
+//! - **Not an agent tool.** An agent tool is invoked by a live model turn under
+//!   the agent's tool-approval policy — the model decides when to write. Here the
+//!   write must be a fixed, replayable pipeline step that fires ONLY after a
+//!   human clears the checkpoint gate; the authorizing decision is the SOP
+//!   approval (ledger-audited via the broker chokepoint), never model judgement.
+//!   A deterministic capability is the only shape that runs headlessly after an
+//!   out-of-band approval with no agent loop in the path.
+//! - **Not an MCP server.** MCP would put the forge credential and the write
+//!   behind a separate process/transport with its own trust surface; instead
+//!   this reuses the already-configured git [`Channel`]'s outbound path (the
+//!   same credential and provider dialect the channel already holds), so the
+//!   write authority is exactly the channel the operator configured — nothing
+//!   wider.
+//!
 //! Like `shell.exec` / `notify.channel`, this is **fail-closed** until a real
 //! [`ForgeCommentAdapter`] is injected at engine-build time (the daemon supplies
 //! [`ChannelForgeAdapter`] over its channel map; CLI / offline paths leave it
 //! `None`, so the capability reports a clear failure instead of a silent no-op).
-//! Because it runs on the deterministic executor it can execute headlessly after
-//! an out-of-band approval, without a live agent turn.
+//! It also fails closed on a missing or ambiguous target channel (see
+//! [`ChannelForgeAdapter::post_comment`]), so it can never post to the wrong
+//! forge. Because it runs on the deterministic executor it can execute
+//! headlessly after an out-of-band approval, without a live agent turn.
 //!
 //! Layering mirrors `approval::channel_route`: this module needs only
 //! [`zeroclaw_api::channel::Channel`], never `zeroclaw-channels` — the daemon

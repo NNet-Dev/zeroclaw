@@ -26,7 +26,11 @@ const SWEEP_AFTER: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// One sent gate prompt: where its message lives, how to authenticate the
 /// finalize PATCH, and any input-bearing choices (for modal pre-fill).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written to REDACT `bot_token`: the record holds a bearer
+/// secret, so a future `record!(… {rec:?})` must never spill it (a derived
+/// `Debug` would). The token is only ever read into an `Authorization` header.
+#[derive(Clone)]
 pub(crate) struct GatePromptRecord {
     pub(crate) channel_id: String,
     pub(crate) message_id: String,
@@ -42,6 +46,19 @@ pub(crate) struct GatePromptRecord {
     /// their modals. Best-effort: lost on restart, after which the modal opens
     /// blank (the draft is still readable in the embed).
     pub(crate) inputs: Vec<GatePromptInput>,
+}
+
+impl std::fmt::Debug for GatePromptRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatePromptRecord")
+            .field("channel_id", &self.channel_id)
+            .field("message_id", &self.message_id)
+            .field("title", &self.title)
+            .field("bot_token", &"<redacted>")
+            .field("resolved_description", &self.resolved_description)
+            .field("inputs", &self.inputs)
+            .finish()
+    }
 }
 
 /// The text-collection spec of one input-bearing choice on a sent prompt.
