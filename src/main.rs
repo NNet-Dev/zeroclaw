@@ -7745,6 +7745,33 @@ fn build_sop_route_adapter(
     if channels.is_empty() {
         return None;
     }
+    // Startup validation: this send-only adapter's channel map omits channels that
+    // need runtime SOP handles (e.g. AMQP SOP-dispatch channels). Surface at BOOT any
+    // configured approval route whose channel is absent here, so a `request_route` /
+    // `escalation_route` that would silently fail to deliver at gate time is caught up
+    // front rather than on the first parked gate.
+    let channel_keys: std::collections::HashSet<String> = channels.keys().cloned().collect();
+    for (policy, kind, route, channel_key) in
+        zeroclaw_runtime::sop::approval::unresolvable_approval_routes(
+            &config.sop.approval,
+            &channel_keys,
+        )
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "policy": policy,
+                    "route_kind": kind,
+                    "route": route,
+                    "channel": channel_key,
+                })),
+            "SOP approval route names a channel the route adapter cannot deliver to; \
+             its approval notices will not be sent (the channel may require runtime SOP \
+             handles this send-only adapter lacks)"
+        );
+    }
     Some(std::sync::Arc::new(
         zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
             channels,

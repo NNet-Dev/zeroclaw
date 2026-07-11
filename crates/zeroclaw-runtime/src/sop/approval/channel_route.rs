@@ -62,6 +62,43 @@ fn parse_route(route: &str) -> Option<(&str, &str)> {
     Some((channel_key, recipient))
 }
 
+/// The configured approval routes (`request_route` + `escalation_route`) whose channel
+/// key is NOT among `channel_keys` - i.e. a route this send-only adapter cannot deliver
+/// because its channel map omits that channel (e.g. an AMQP SOP-dispatch channel that
+/// needs runtime SOP handles the adapter is built without). The daemon logs these at
+/// STARTUP so the drift between "configured route" and "deliverable channel" surfaces
+/// at boot, not silently on the first parked gate. Malformed routes are NOT flagged
+/// here - they fail loudly at delivery with a precise parse error. Returns
+/// `(policy_name, route_kind, route, channel_key)` for each unresolvable route.
+pub fn unresolvable_approval_routes(
+    approval: &zeroclaw_config::schema::SopApprovalConfig,
+    channel_keys: &std::collections::HashSet<String>,
+) -> Vec<(String, &'static str, String, String)> {
+    let mut unresolvable = Vec::new();
+    for (policy_name, policy) in &approval.policies {
+        for (kind, route) in [
+            ("request_route", policy.request_route.as_deref()),
+            ("escalation_route", policy.escalation_route.as_deref()),
+        ] {
+            let Some(route) = route.filter(|r| !r.is_empty()) else {
+                continue;
+            };
+            let Some((channel_key, _)) = parse_route(route) else {
+                continue;
+            };
+            if !channel_keys.contains(channel_key) {
+                unresolvable.push((
+                    policy_name.clone(),
+                    kind,
+                    route.to_string(),
+                    channel_key.to_string(),
+                ));
+            }
+        }
+    }
+    unresolvable
+}
+
 /// Render the approval-request notice body. Identifies the run so an approver can
 /// act on it through their normal approval surface; the return path (approve/deny)
 /// is the existing HTTP/WS/tool -> broker -> chokepoint flow, not this adapter.
@@ -153,6 +190,55 @@ mod tests {
         assert_eq!(parse_route("discord.ops"), None, "no recipient");
         assert_eq!(parse_route("discord.ops:"), None, "empty recipient");
         assert_eq!(parse_route(":12345"), None, "empty channel key");
+    }
+
+    #[test]
+    fn unresolvable_routes_flags_only_well_formed_absent_channels() {
+        // Startup validation for the channel-map drift: a route naming a channel the
+        // send-only adapter lacks is surfaced; a route naming a present channel is not;
+        // a malformed route is left for the delivery-time parse error, not flagged here.
+        use std::collections::{HashMap, HashSet};
+        use zeroclaw_config::schema::{ApprovalPolicyConfig, SopApprovalConfig};
+
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                // request_route names a channel the adapter cannot construct (an AMQP
+                // SOP-dispatch channel); escalation_route names a present channel.
+                request_route: Some("amqp.sopq:runs".into()),
+                escalation_route: Some("discord.ops:123".into()),
+            },
+        );
+        // A malformed route (no recipient) must NOT be flagged here.
+        policies.insert(
+            "p2".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                request_route: Some("discord.ops".into()),
+                escalation_route: None,
+            },
+        );
+        let approval = SopApprovalConfig {
+            groups: HashMap::new(),
+            policies,
+        };
+        let keys: HashSet<String> = ["discord.ops".to_string()].into_iter().collect();
+
+        let un = unresolvable_approval_routes(&approval, &keys);
+        assert_eq!(
+            un.len(),
+            1,
+            "only the well-formed route whose channel is absent is flagged, got {un:?}"
+        );
+        let (policy_name, kind, route, channel_key) = &un[0];
+        assert_eq!(policy_name, "prod");
+        assert_eq!(*kind, "request_route");
+        assert_eq!(route, "amqp.sopq:runs");
+        assert_eq!(channel_key, "amqp.sopq");
     }
 
     #[test]
