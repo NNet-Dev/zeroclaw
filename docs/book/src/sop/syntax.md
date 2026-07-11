@@ -65,6 +65,28 @@ max_pending_approvals = 8
 type = "manual"
 ```
 
+Approval broker groups and policies live in the main ZeroClaw config, not in
+per-SOP `SOP.toml` files. A step can reference a configured policy by name with
+`- policy: prod` in `SOP.md`:
+
+```toml
+[sop.approval.groups.release]
+members = ["http:<paired-token-subject>", "agent:release-bot"]
+
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+escalation_route = "oncall"
+```
+
+`[sop.approval.groups.*]` members are approval identities, not account names.
+Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
+`agent:<alias>`) to grant approval rights on one transport only, or bare
+(`alice`) to grant any source carrying that identity. HTTP and WebSocket
+approval surfaces use the paired-token subject; the current CLI approval path
+(`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
+membership yet.
+
 ## 3. `SOP.md` Step Format
 
 Steps are parsed from the `## Steps` section.
@@ -78,6 +100,7 @@ Steps are parsed from the `## Steps` section.
 2. **Deploy** — Run deployment command.
    - tools: shell
    - requires_confirmation: true
+   - policy: prod
    - input: {"type":"object","required":["version"],"properties":{"version":{"type":"string"}}}
    - output: {"type":"object","required":["digest"],"properties":{"digest":{"type":"string"}}}
    - next: 3
