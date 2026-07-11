@@ -96,7 +96,7 @@ pub async fn dispatch_sop_event(
     audit: &SopAuditLogger,
     event: SopEvent,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, None).await
+    dispatch_sop_event_filtered(engine, audit, event, None, None).await
 }
 
 /// Dispatch an incoming event to one named SOP, after normal trigger matching.
@@ -109,7 +109,7 @@ pub async fn dispatch_sop_event_to(
     event: SopEvent,
     target_sop: &str,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop)).await
+    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop), None).await
 }
 
 async fn dispatch_sop_event_filtered(
@@ -117,6 +117,14 @@ async fn dispatch_sop_event_filtered(
     audit: &SopAuditLogger,
     event: SopEvent,
     target_sop: Option<&str>,
+    // A2 per-message idempotency: `(delivery key, is_redelivery)` for at-least-once
+    // transports (AMQP). The key is a per-message identity scoped to its channel; the
+    // flag is the broker's `redelivered` bit. A run is recorded under the key when it
+    // STARTS, but coalescing only fires for a CONFIRMED redelivery - a FRESH delivery
+    // never coalesces (so a distinct delivery that reuses a message-id is never ACKed
+    // away, only redeliveries of the same message are). `None` = no dedup (at-most-once
+    // sources: cron ticks, webhooks, the manual/API path).
+    dedup: Option<(&str, bool)>,
 ) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
@@ -236,6 +244,41 @@ async fn dispatch_sop_event_filtered(
         };
 
         for sop_name in &matched_names {
+            // A2 per-message idempotency. On a CONFIRMED broker redelivery, if this SOP
+            // already started for this delivery key, COALESCE into the existing run
+            // instead of starting it again. A FRESH delivery never coalesces; instead, if
+            // its key is already in the window a distinct delivery is REUSING a message-id,
+            // so mark that key ambiguous (before admission, so it holds even if this
+            // delivery then defers) - after which neither it nor a later redelivery
+            // coalesces. The safe direction is always a duplicate run, never ACKing a
+            // distinct trigger away.
+            match dedup {
+                Some((key, true)) => {
+                    if let Some(existing_run_id) = eng.dispatch_dedup_lookup(sop_name, key) {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "existing_run_id": existing_run_id
+                            })),
+                            &format!(
+                                "SOP dispatch: coalesced redelivered '{sop_name}' into run \
+                                 {existing_run_id} (per-message idempotency)"
+                            )
+                        );
+                        results.push(DispatchResult::Coalesced {
+                            sop_name: sop_name.clone(),
+                            existing_run_id,
+                        });
+                        continue;
+                    }
+                }
+                Some((key, false)) => eng.note_fresh_dispatch_key(sop_name, key),
+                None => {}
+            }
             // A2: consult the SOP's admission policy first. Only `Admit` proceeds to
             // the authoritative CAS start; the other outcomes are surfaced (logged +
             // carried on a DispatchResult) so a non-admitted trigger is never lost.
@@ -329,6 +372,12 @@ async fn dispatch_sop_event_filtered(
                             action_label(&action)
                         )
                     );
+                    // A2 per-message idempotency: remember this SOP started for this
+                    // delivery key (regardless of the redelivery flag) so a later broker
+                    // redelivery of THIS message coalesces instead of duplicating.
+                    if let Some((key, _)) = dedup {
+                        eng.record_dispatch_dedup(sop_name, key, &run_id);
+                    }
                     results.push(DispatchResult::Started {
                         run_id,
                         sop_name: sop_name.clone(),
@@ -542,6 +591,15 @@ pub async fn dispatch_untrusted_fan_in(
     source: SopTriggerSource,
     topic: Option<&str>,
     payload: Option<&str>,
+    // A2 per-message idempotency: `(key, is_redelivery)`. The key is a TRUE per-message
+    // identity supplied by the transport and replayed UNCHANGED on a redelivery (the AMQP
+    // `message_id`, channel-scoped - NOT a content hash, which would ACK away distinct
+    // messages with identical content). `is_redelivery` is the broker's `redelivered`
+    // bit: only a CONFIRMED redelivery coalesces (a fresh delivery reusing a key is never
+    // lost), so a redelivery of the same message - including one requeued because a
+    // SIBLING SOP deferred - coalesces instead of starting the SOP again. `None` for
+    // transports without a stable per-message id or without redelivery (a no-op).
+    dedup: Option<(String, bool)>,
 ) -> Vec<DispatchResult> {
     let max_bytes = match engine.lock() {
         Ok(eng) => eng.config().untrusted_payload_max_bytes,
@@ -594,7 +652,14 @@ pub async fn dispatch_untrusted_fan_in(
         payload,
         timestamp: now_iso8601(),
     };
-    let results = dispatch_sop_event(engine, audit, event).await;
+    let results = dispatch_sop_event_filtered(
+        engine,
+        audit,
+        event,
+        None,
+        dedup.as_ref().map(|(k, r)| (k.as_str(), *r)),
+    )
+    .await;
     process_headless_results(&results);
     results
 }
@@ -1134,6 +1199,7 @@ mod tests {
             SopTriggerSource::Channel,
             Some("telegram"),
             Some(&long_payload),
+            None,
         )
         .await;
 
@@ -1171,12 +1237,315 @@ mod tests {
             SopTriggerSource::Channel,
             Some("telegram"),
             None,
+            None,
         )
         .await;
 
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0], DispatchResult::NoMatch));
         assert!(engine.lock().unwrap().active_runs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn amqp_redelivery_does_not_duplicate_a_started_sop() {
+        // A2 per-message idempotency: an AMQP delivery that started a SOP can be
+        // REDELIVERED by the broker - notably because a SIBLING SOP on the same delivery
+        // deferred, so `results_need_redelivery` requeued the WHOLE delivery. The
+        // redelivery carries the SAME `message_id` (the broker replays it unchanged), so
+        // it must COALESCE into the existing run, not start a second run. `test_sop` is
+        // Parallel with max_concurrent 2, so WITHOUT the dedup the redelivery would start
+        // a duplicate run.
+        let engine = test_engine(vec![test_sop(
+            "amqp-sop",
+            vec![SopTrigger::Amqp {
+                routing_key: "orders.new".into(),
+                condition: None,
+            }],
+        )]);
+        let audit = test_audit();
+        let key = "amqp:msg-abc123";
+
+        // Fresh delivery (not a redelivery) starts the run.
+        let first = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("orders.new"),
+            Some("{\"id\":1}"),
+            Some((key.to_string(), false)),
+        )
+        .await;
+        let run1 = match first.first() {
+            Some(DispatchResult::Started { run_id, .. }) => run_id.clone(),
+            other => panic!("first delivery should start the SOP, got {other:?}"),
+        };
+
+        // Broker REDELIVERS the SAME message (same message_id, redelivered = true).
+        let second = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("orders.new"),
+            Some("{\"id\":1}"),
+            Some((key.to_string(), true)),
+        )
+        .await;
+        assert!(
+            matches!(
+                second.first(),
+                Some(DispatchResult::Coalesced { existing_run_id, .. }) if *existing_run_id == run1
+            ),
+            "redelivery must coalesce into the existing run, not duplicate it, got {second:?}"
+        );
+        assert_eq!(
+            engine.lock().unwrap().active_runs().len(),
+            1,
+            "exactly one run must exist for the redelivered message"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_distinct_message_ids_do_not_coalesce() {
+        // The dedup key is a TRUE per-message id, not a content hash: two GENUINELY
+        // DISTINCT messages that happen to carry identical routing key + body must BOTH
+        // start (different message_id => different key). A content hash would wrongly
+        // coalesce - and ACK away - the second, losing a legitimate SOP trigger.
+        let engine = test_engine(vec![test_sop(
+            "amqp-sop",
+            vec![SopTrigger::Amqp {
+                routing_key: "orders.new".into(),
+                condition: None,
+            }],
+        )]);
+        let audit = test_audit();
+
+        let a = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("orders.new"),
+            Some("{\"id\":1}"),
+            Some(("amqp:msg-a".to_string(), false)),
+        )
+        .await;
+        let b = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("orders.new"),
+            Some("{\"id\":1}"), // identical body, DIFFERENT message id
+            Some(("amqp:msg-b".to_string(), false)),
+        )
+        .await;
+        assert!(matches!(a.first(), Some(DispatchResult::Started { .. })));
+        assert!(
+            matches!(b.first(), Some(DispatchResult::Started { .. })),
+            "a distinct message id with identical content must start, not coalesce, got {b:?}"
+        );
+        assert_eq!(
+            engine.lock().unwrap().active_runs().len(),
+            2,
+            "two distinct messages must produce two runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_delivery_without_a_message_id_is_not_deduplicated() {
+        // A delivery with no message_id passes `None`: it is NOT deduplicated (we never
+        // ACK a message away on a guess). Two such deliveries both start.
+        let engine = test_engine(vec![test_sop(
+            "amqp-sop",
+            vec![SopTrigger::Amqp {
+                routing_key: "orders.new".into(),
+                condition: None,
+            }],
+        )]);
+        let audit = test_audit();
+
+        for _ in 0..2 {
+            let r = dispatch_untrusted_fan_in(
+                &engine,
+                &audit,
+                SopTriggerSource::Amqp,
+                Some("orders.new"),
+                Some("{\"id\":1}"),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(r.first(), Some(DispatchResult::Started { .. })),
+                "a delivery without a message id must not be deduplicated, got {r:?}"
+            );
+        }
+        assert_eq!(engine.lock().unwrap().active_runs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn amqp_reused_message_id_after_defer_and_redelivery_never_coalesces() {
+        // The narrow loss case: a DISTINCT delivery B reuses message-id "reused" (an AMQP
+        // contract violation). B defers (slot full), then the broker redelivers it. B's
+        // redelivery must NOT coalesce into A's run (which would ACK B away): the reused
+        // key is marked ambiguous on B's fresh arrival, so its redelivery dispatches
+        // (a duplicate at worst) rather than being lost.
+        let mut sop = test_sop(
+            "s",
+            vec![SopTrigger::Amqp {
+                routing_key: "orders.new".into(),
+                condition: None,
+            }],
+        );
+        sop.max_concurrent = 1; // a second concurrent delivery defers
+        let engine = test_engine(vec![sop]);
+        let audit = test_audit();
+        let key = "amqp:reused";
+
+        // Delivery A (fresh) starts run A, filling the single slot.
+        let a = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("orders.new"),
+            Some("{\"n\":1}"),
+            Some((key.to_string(), false)),
+        )
+        .await;
+        assert!(
+            matches!(a.first(), Some(DispatchResult::Started { .. })),
+            "A starts: {a:?}"
+        );
+
+        // Distinct delivery B (fresh) REUSES the message-id; the slot is full so it defers.
+        let b = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("orders.new"),
+            Some("{\"n\":2}"),
+            Some((key.to_string(), false)),
+        )
+        .await;
+        assert!(
+            matches!(b.first(), Some(DispatchResult::Deferred { .. })),
+            "B (reused id) defers on the full slot: {b:?}"
+        );
+
+        // B is broker-redelivered. It must NOT coalesce into A's run (never ACK B away).
+        let b2 = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("orders.new"),
+            Some("{\"n\":2}"),
+            Some((key.to_string(), true)),
+        )
+        .await;
+        assert!(
+            !matches!(b2.first(), Some(DispatchResult::Coalesced { .. })),
+            "a reused message-id must never coalesce a distinct delivery away, got {b2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_sibling_defer_redelivery_coalesces_the_started_not_the_deferred() {
+        // The EXACT scenario the fix targets: one AMQP delivery matches TWO SOPs. SOP A
+        // admits and STARTS; sibling SOP B is at capacity and DEFERS, so
+        // `results_need_redelivery` requeues the WHOLE delivery. On the broker's
+        // redelivery (same message_id), SOP A must COALESCE (not start again) while only
+        // the deferred sibling B is retried - proving the requeue no longer duplicates A.
+        let mut sop_a = test_sop(
+            "sop-a",
+            vec![SopTrigger::Amqp {
+                routing_key: "orders.new".into(),
+                condition: None,
+            }],
+        );
+        sop_a.max_concurrent = 4;
+        let mut sop_b = test_sop(
+            "sop-b",
+            vec![SopTrigger::Amqp {
+                routing_key: "orders.new".into(),
+                condition: None,
+            }],
+        );
+        sop_b.max_concurrent = 1;
+        let engine = test_engine(vec![sop_a, sop_b]);
+        let audit = test_audit();
+
+        // Fill SOP B's single exec slot so the delivery makes B defer.
+        engine
+            .lock()
+            .unwrap()
+            .start_run(
+                "sop-b",
+                SopEvent {
+                    source: SopTriggerSource::Amqp,
+                    topic: Some("orders.new".into()),
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+
+        let key = "amqp:m1";
+        let first = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("orders.new"),
+            Some("{}"),
+            Some((key.to_string(), false)),
+        )
+        .await;
+        assert!(
+            first.iter().any(
+                |r| matches!(r, DispatchResult::Started { sop_name, .. } if sop_name == "sop-a")
+            ),
+            "SOP A admits and starts: {first:?}"
+        );
+        assert!(
+            first.iter().any(
+                |r| matches!(r, DispatchResult::Deferred { sop_name, .. } if sop_name == "sop-b")
+            ),
+            "sibling SOP B is at capacity and defers: {first:?}"
+        );
+        assert!(
+            results_need_redelivery(&first),
+            "a deferred sibling requeues the whole delivery"
+        );
+
+        // Broker REDELIVERS the SAME message (same message_id, redelivered = true).
+        let second = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("orders.new"),
+            Some("{}"),
+            Some((key.to_string(), true)),
+        )
+        .await;
+        assert!(
+            second.iter().any(
+                |r| matches!(r, DispatchResult::Coalesced { sop_name, .. } if sop_name == "sop-a")
+            ),
+            "on redelivery SOP A coalesces (does not restart): {second:?}"
+        );
+        assert!(
+            second.iter().any(
+                |r| matches!(r, DispatchResult::Deferred { sop_name, .. } if sop_name == "sop-b")
+            ),
+            "the deferred sibling B is retried on redelivery: {second:?}"
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .active_runs()
+                .values()
+                .filter(|r| r.sop_name == "sop-a")
+                .count(),
+            1,
+            "SOP A ran exactly once despite the redelivery"
+        );
     }
 
     #[tokio::test]
