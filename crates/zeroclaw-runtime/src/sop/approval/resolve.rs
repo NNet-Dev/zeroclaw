@@ -225,6 +225,9 @@ mod tests {
         fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
             self.inner.load_active_runs()
         }
+        fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_terminal_runs(limit)
+        }
         fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError> {
             self.inner.load_run(run_id)
         }
@@ -326,6 +329,7 @@ mod tests {
             deterministic: false,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            agent: None,
         }
     }
 

@@ -15,13 +15,11 @@ use lapin::{
     types::FieldTable,
 };
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::AmqpDispatch;
+use zeroclaw_config::schema::SopDispatch;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::{
-    dispatch_sop_event, process_headless_results, results_need_redelivery,
-};
-use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
-use zeroclaw_runtime::sop::types::{SopEvent, SopTriggerSource};
+use zeroclaw_runtime::sop::dispatch::{dispatch_untrusted_fan_in, results_need_redelivery};
+use zeroclaw_runtime::sop::engine::SopEngine;
+use zeroclaw_runtime::sop::types::SopTriggerSource;
 
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -44,7 +42,7 @@ pub struct AmqpChannel {
     content_template: String,
     thread_id_field: String,
     durable_ack: bool,
-    dispatch: AmqpDispatch,
+    dispatch: SopDispatch,
     engine: Option<Arc<Mutex<SopEngine>>>,
     audit: Option<Arc<SopAuditLogger>>,
     alias: String,
@@ -64,7 +62,7 @@ pub struct AmqpChannelConfig {
     pub content_template: String,
     pub thread_id_field: String,
     pub durable_ack: bool,
-    pub dispatch: AmqpDispatch,
+    pub dispatch: SopDispatch,
     pub engine: Option<Arc<Mutex<SopEngine>>>,
     pub audit: Option<Arc<SopAuditLogger>>,
     pub alias: String,
@@ -90,7 +88,7 @@ impl AmqpChannel {
     pub fn new(cfg: AmqpChannelConfig) -> anyhow::Result<Self> {
         let routes_sop = matches!(
             cfg.dispatch,
-            AmqpDispatch::Sop | AmqpDispatch::SopAndAgentLoop
+            SopDispatch::Sop | SopDispatch::SopAndAgentLoop
         );
         if routes_sop && (cfg.engine.is_none() || cfg.audit.is_none()) {
             anyhow::bail!(
@@ -162,11 +160,11 @@ impl AmqpChannel {
     ) -> DeliveryOutcome {
         let routes_sop = matches!(
             self.dispatch,
-            AmqpDispatch::Sop | AmqpDispatch::SopAndAgentLoop
+            SopDispatch::Sop | SopDispatch::SopAndAgentLoop
         );
         let routes_agent = matches!(
             self.dispatch,
-            AmqpDispatch::AgentLoop | AmqpDispatch::SopAndAgentLoop
+            SopDispatch::AgentLoop | SopDispatch::SopAndAgentLoop
         );
 
         if routes_agent {
@@ -198,14 +196,14 @@ impl AmqpChannel {
         }
 
         if routes_sop && let (Some(engine), Some(audit)) = (&self.engine, &self.audit) {
-            let event = SopEvent {
-                source: SopTriggerSource::Amqp,
-                topic: Some(routing_key.to_string()),
-                payload: Some(String::from_utf8_lossy(data).to_string()),
-                timestamp: now_iso8601(),
-            };
-            let results = dispatch_sop_event(engine, audit, event).await;
-            process_headless_results(&results);
+            let results = dispatch_untrusted_fan_in(
+                engine,
+                audit,
+                SopTriggerSource::Amqp,
+                Some(routing_key),
+                Some(&String::from_utf8_lossy(data)),
+            )
+            .await;
             if results_need_redelivery(&results) {
                 if routes_agent {
                     // Combined `sop_and_agent_loop`: the agent loop ALREADY accepted
@@ -564,7 +562,7 @@ mod tests {
     fn try_channel_with(
         content_template: &str,
         thread_id_field: &str,
-        dispatch: AmqpDispatch,
+        dispatch: SopDispatch,
         engine: Option<Arc<Mutex<SopEngine>>>,
         audit: Option<Arc<SopAuditLogger>>,
     ) -> anyhow::Result<AmqpChannel> {
@@ -592,7 +590,7 @@ mod tests {
         try_channel_with(
             content_template,
             thread_id_field,
-            AmqpDispatch::AgentLoop,
+            SopDispatch::AgentLoop,
             None,
             None,
         )
@@ -752,7 +750,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
 
     #[test]
     fn new_rejects_sop_dispatch_without_handles() {
-        for dispatch in [AmqpDispatch::Sop, AmqpDispatch::SopAndAgentLoop] {
+        for dispatch in [SopDispatch::Sop, SopDispatch::SopAndAgentLoop] {
             let result = try_channel_with("", "", dispatch, None, None);
             let Err(err) = result else {
                 panic!("SOP dispatch without engine/audit must fail closed");
@@ -766,7 +764,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
 
     #[test]
     fn new_accepts_agent_loop_without_handles() {
-        assert!(try_channel_with("", "", AmqpDispatch::AgentLoop, None, None).is_ok());
+        assert!(try_channel_with("", "", SopDispatch::AgentLoop, None, None).is_ok());
     }
 
     #[tokio::test]
@@ -775,7 +773,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         let ch = try_channel_with(
             "{name}",
             "name",
-            AmqpDispatch::SopAndAgentLoop,
+            SopDispatch::SopAndAgentLoop,
             Some(engine),
             Some(audit),
         )
@@ -802,7 +800,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         let ch = try_channel_with(
             "{name}",
             "name",
-            AmqpDispatch::SopAndAgentLoop,
+            SopDispatch::SopAndAgentLoop,
             Some(engine),
             Some(audit),
         )

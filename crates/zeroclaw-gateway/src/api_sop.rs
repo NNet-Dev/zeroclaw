@@ -211,6 +211,22 @@ fn resolve(
                 )
             })?
     };
+    // A resumed action still needs an executor on this headless surface: an
+    // approval-gate resume yields an ExecuteStep no agent turn will drive.
+    // (Deterministic checkpoints drive their capability tail inside
+    // resolve_via_broker already; the driver no-ops on their terminal actions.)
+    if let zeroclaw_runtime::sop::approval::BrokerOutcome::Resolved(ResolveOutcome::Resumed(
+        action,
+    )) = &outcome
+    {
+        let config = state.config.read().clone();
+        zeroclaw_runtime::sop::spawn_headless_run_driver(
+            config,
+            std::sync::Arc::clone(engine),
+            state.sop_audit.clone(),
+            action.as_ref().clone(),
+        );
+    }
     let (code, label) = broker_outcome_response(&outcome);
     Ok((
         code,
@@ -337,6 +353,7 @@ pub(crate) mod tests {
             deterministic: false,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            agent: None,
         };
         let mut engine = SopEngine::new(SopConfig {
             approval,

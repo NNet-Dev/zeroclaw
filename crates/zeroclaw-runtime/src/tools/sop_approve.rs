@@ -6,7 +6,7 @@ use serde_json::json;
 use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, BrokerOutcome, ResolveOutcome};
 use crate::sop::types::SopRunAction;
 use crate::sop::{SopAuditLogger, SopEngine};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Approve a pending SOP step that is waiting for operator approval.
 pub struct SopApproveTool {
@@ -124,13 +124,13 @@ impl Tool for SopApproveTool {
                 };
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Ok(BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "This SOP gate requires an out-of-band approver \
                      (approval_mode = out_of_band_required). Use `zeroclaw sop approve <run_id>` \
@@ -140,25 +140,25 @@ impl Tool for SopApproveTool {
             }),
             Ok(BrokerOutcome::Resolved(ResolveOutcome::AlreadyResolved)) => Ok(ToolResult {
                 success: true,
-                output: format!("Run {run_id} was already resolved."),
+                output: format!("Run {run_id} was already resolved.").into(),
                 error: None,
             }),
             Ok(BrokerOutcome::Resolved(ResolveOutcome::Denied)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Run {run_id} was denied.")),
             }),
             // Unreachable from this tool (it only sends Approve), but a stable
             // report beats a panic if the outcome set grows another producer.
             Ok(BrokerOutcome::Resolved(ResolveOutcome::Revised)) => Ok(ToolResult {
                 success: true,
-                output: format!("Run {run_id} re-drafted; the gate was re-presented."),
+                output: format!("Run {run_id} re-drafted; the gate was re-presented.").into(),
                 error: None,
             }),
             Ok(BrokerOutcome::Resolved(ResolveOutcome::NotWaiting))
             | Ok(BrokerOutcome::NotWaiting) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Approval failed: run {run_id} is not waiting for approval."
                 )),
@@ -170,12 +170,13 @@ impl Tool for SopApproveTool {
                 output: format!(
                     "Approval recorded ({have} of {need}). Awaiting {} more distinct approver(s).",
                     need.saturating_sub(have)
-                ),
+                )
+                .into(),
                 error: None,
             }),
             Ok(BrokerOutcome::NotAuthorized { required_group }) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!(
                     "Not authorized: approving this step requires membership in the \
                      '{required_group}' group."
@@ -185,7 +186,7 @@ impl Tool for SopApproveTool {
             // the gate is left waiting rather than cleared.
             Ok(BrokerOutcome::PolicyMissing { name }) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!(
                     "Approval failed: step names approval policy '{name}', which is not \
                      defined in [sop.approval].policies; the gate is left waiting."
@@ -193,7 +194,7 @@ impl Tool for SopApproveTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Approval failed: {e}")),
             }),
         }
@@ -231,6 +232,7 @@ mod tests {
             deterministic: false,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            agent: None,
         }
     }
 
