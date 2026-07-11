@@ -88,6 +88,8 @@
   - [AMQP](./channels/amqp.md)
   - [Filesystem](./channels/filesystem.md)
   - [Git (GitHub / Gitea / Forgejo)](./channels/git.md)
+    - [Creating a GitHub App](./channels/git-github-app.md)
+    - [Creating a Gitea / Forgejo token (Codeberg)](./channels/git-gitea-forgejo.md)
   - [ACP (Agent Client Protocol)](./channels/acp.md)
 - [Tools & Extensibility](./tools/overview.md)
   - [MCP (Model Context Protocol)](./tools/mcp.md)
