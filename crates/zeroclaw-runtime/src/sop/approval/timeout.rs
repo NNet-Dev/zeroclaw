@@ -47,11 +47,26 @@ pub fn apply_timeout_action(
                 log_audit_skip(run_id, "cancel", &e);
                 return None;
             }
-            Some(engine.finish_run(
+            match engine.finish_run(
                 run_id,
                 SopRunStatus::Cancelled,
                 Some("approval timeout (fail-closed cancel)".to_string()),
-            ))
+            ) {
+                Ok(action) => Some(action),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
+                        "SOP timeout: terminal persistence failed; gate left for retry"
+                    );
+                    None
+                }
+            }
         }
         // LEGACY, opt-in only: the single path that self-approves on timeout,
         // attributed to the system principal and routed through the chokepoint.

@@ -144,7 +144,7 @@ pub fn resolve_gate(
         }
         ApprovalDecision::Deny { reason } => {
             let why = reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
-            engine.finish_run(run_id, SopRunStatus::Cancelled, Some(why));
+            engine.finish_run(run_id, SopRunStatus::Cancelled, Some(why))?;
             ResolveOutcome::Denied
         }
     };
