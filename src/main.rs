@@ -3037,6 +3037,65 @@ fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
     zeroclaw_tls::CaKeyProtection::from_env()
 }
 
+/// Resolve the WSS mTLS policy without conflating the auto-CA and BYO-CA modes.
+///
+/// The WSS plane is always mTLS. `enabled` controls only whether the configured
+/// CA replaces the daemon-generated CA; certificate pins apply in either mode.
+#[cfg(feature = "agent-runtime")]
+fn resolve_wss_client_auth(
+    client_auth: Option<&zeroclaw_config::schema::WssClientAuthConfig>,
+) -> Result<(Option<String>, Vec<String>)> {
+    if let Some(config) = client_auth
+        && !config.ca_cert_path.is_empty()
+        && !config.enabled
+    {
+        anyhow::bail!(
+            "[wss.client_auth].ca_cert_path is set but [wss.client_auth].enabled is false. \
+             Set enabled = true to use your CA, or clear ca_cert_path to auto-generate one."
+        );
+    }
+
+    let pinned = client_auth
+        .map(|config| config.pinned_certs.clone())
+        .unwrap_or_default();
+    let byo_ca = client_auth
+        .filter(|config| config.enabled && !config.ca_cert_path.is_empty())
+        .map(|config| config.ca_cert_path.clone());
+    Ok((byo_ca, pinned))
+}
+
+#[cfg(all(test, feature = "agent-runtime"))]
+mod wss_client_auth_tests {
+    use super::*;
+
+    #[test]
+    fn auto_ca_honors_configured_client_certificate_pins() {
+        let auth = zeroclaw_config::schema::WssClientAuthConfig {
+            pinned_certs: vec!["a".repeat(64)],
+            ..Default::default()
+        };
+
+        let (byo_ca, pinned) = resolve_wss_client_auth(Some(&auth)).expect("valid auto-CA policy");
+        assert!(byo_ca.is_none(), "the daemon CA remains selected");
+        assert_eq!(
+            pinned, auth.pinned_certs,
+            "pins must reach the mTLS acceptor"
+        );
+    }
+
+    #[test]
+    fn disabled_byo_ca_is_rejected_before_listener_startup() {
+        let auth = zeroclaw_config::schema::WssClientAuthConfig {
+            ca_cert_path: "/etc/zeroclaw/client-ca.pem".into(),
+            ..Default::default()
+        };
+
+        let err =
+            resolve_wss_client_auth(Some(&auth)).expect_err("disabled BYO CA must fail closed");
+        assert!(err.to_string().contains("enabled is false"));
+    }
+}
+
 #[cfg(feature = "agent-runtime")]
 fn issue_wss_client_cert(
     config: &Config,
@@ -4716,35 +4775,14 @@ async fn main() -> Result<()> {
                             return Ok(());
                         }
                         // The remote WSS plane is ALWAYS mutually authenticated; there
-                        // is no server-only / plaintext fallback.
-                        //
-                        // Guard against an under-configured bring-your-own intent: a CA
-                        // path set while the section is disabled would otherwise be
-                        // silently discarded and replaced by an auto-generated CA. Fail
-                        // closed with a clear message instead.
-                        if let Some(c) = wss_cfg.client_auth.as_ref()
-                            && !c.ca_cert_path.is_empty() && !c.enabled
-                        {
-                            anyhow::bail!(
-                                "[wss.client_auth].ca_cert_path is set but \
-                                 [wss.client_auth].enabled is false. Set enabled = true to use \
-                                 your CA, or clear ca_cert_path to auto-generate one."
-                            );
-                        }
-                        // Only an enabled [wss.client_auth] contributes the CA and the
-                        // pins; both are gated on the same condition so they cannot
-                        // diverge (e.g. pins applied against an auto-generated CA).
-                        let active_client_auth =
-                            wss_cfg.client_auth.as_ref().filter(|c| c.enabled);
-                        let pinned = active_client_auth
-                            .map(|c| c.pinned_certs.clone())
-                            .unwrap_or_default();
+                        // is no server-only / plaintext fallback. In auto-CA mode the
+                        // same generated CA verifies client certificates, and any
+                        // configured pin allowlist remains enforced.
+                        let (byo_ca, pinned) =
+                            resolve_wss_client_auth(wss_cfg.client_auth.as_ref())?;
                         // Bring-your-own mTLS when an operator CA is configured;
                         // otherwise auto-generate a per-daemon CA + server certificate
                         // under the data dir (secure by default, zero config).
-                        let byo_ca = active_client_auth
-                            .filter(|c| !c.ca_cert_path.is_empty())
-                            .map(|c| c.ca_cert_path.clone());
                         let (cert_path, key_path, ca_cert_path) = match byo_ca {
                             Some(ca_cert_path) => {
                                 if wss_cfg.cert_path.is_empty() || wss_cfg.key_path.is_empty() {

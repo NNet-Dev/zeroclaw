@@ -177,6 +177,23 @@ struct AdmissionOverlay {
 /// Resolve the admission policy: file `[admission]` as the base, CLI overlay on
 /// top. Scalars (mode, relay_token) take the CLI value when present; the allow /
 /// deny lists are the UNION of file + CLI. Deny always wins at admission time.
+fn normalize_admission_fingerprint(value: &str) -> Result<String> {
+    let normalized: String = value.trim().chars().filter(|c| *c != ':').collect();
+    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "invalid relay admission fingerprint '{value}': expected 64 hexadecimal characters, optionally colon-delimited"
+        );
+    }
+    Ok(normalized.to_ascii_lowercase())
+}
+
+fn normalize_admission_fingerprints(entries: &[String]) -> Result<HashSet<String>> {
+    entries
+        .iter()
+        .map(|entry| normalize_admission_fingerprint(entry))
+        .collect()
+}
+
 fn resolve_admission(file: &AdmissionFile, overlay: &AdmissionOverlay) -> Result<AdmissionPolicy> {
     let mode_str = overlay.mode.clone().or_else(|| file.mode.clone());
     let registration_mode = match mode_str.as_deref() {
@@ -184,10 +201,10 @@ fn resolve_admission(file: &AdmissionFile, overlay: &AdmissionOverlay) -> Result
         Some("allowlist") => Admission::Allowlist,
         Some(other) => anyhow::bail!("invalid admission mode '{other}' (open|allowlist)"),
     };
-    let mut allow: HashSet<String> = file.allow.iter().cloned().collect();
-    allow.extend(overlay.allow.iter().cloned());
-    let mut deny: HashSet<String> = file.deny.iter().cloned().collect();
-    deny.extend(overlay.deny.iter().cloned());
+    let mut allow = normalize_admission_fingerprints(&file.allow)?;
+    allow.extend(normalize_admission_fingerprints(&overlay.allow)?);
+    let mut deny = normalize_admission_fingerprints(&file.deny)?;
+    deny.extend(normalize_admission_fingerprints(&overlay.deny)?);
     let relay_token = overlay
         .relay_token
         .clone()
@@ -558,13 +575,22 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 mod tests {
     use super::*;
 
-    fn overlay(mode: Option<&str>, allow: &[&str], token: Option<&str>) -> AdmissionOverlay {
+    fn overlay(
+        mode: Option<&str>,
+        allow: &[&str],
+        deny: &[&str],
+        token: Option<&str>,
+    ) -> AdmissionOverlay {
         AdmissionOverlay {
             mode: mode.map(str::to_string),
             allow: allow.iter().map(|s| s.to_string()).collect(),
-            deny: vec![],
+            deny: deny.iter().map(|s| s.to_string()).collect(),
             relay_token: token.map(str::to_string),
         }
+    }
+
+    fn fingerprint(hex: char) -> String {
+        hex.to_string().repeat(64)
     }
 
     #[test]
@@ -583,42 +609,79 @@ mod tests {
     fn cli_overrides_file_scalars_and_unions_lists() {
         let file = AdmissionFile {
             mode: Some("open".into()),
-            allow: vec!["from_file".into()],
-            deny: vec!["bad_file".into()],
+            allow: vec![fingerprint('a')],
+            deny: vec![fingerprint('b')],
             relay_token: Some("file_tok".into()),
             ..Default::default()
         };
         // CLI flips the mode + token and adds an allow entry.
+        let cli_allow = fingerprint('c');
         let pol = resolve_admission(
             &file,
-            &overlay(Some("allowlist"), &["from_cli"], Some("cli_tok")),
+            &overlay(Some("allowlist"), &[&cli_allow], &[], Some("cli_tok")),
         )
         .unwrap();
         assert_eq!(pol.registration_mode, Admission::Allowlist); // CLI wins
         assert_eq!(pol.relay_token.as_deref(), Some("cli_tok")); // CLI wins
-        assert!(pol.allow.contains("from_file") && pol.allow.contains("from_cli")); // union
-        assert!(pol.deny.contains("bad_file"));
+        assert!(pol.allow.contains(&fingerprint('a')) && pol.allow.contains(&fingerprint('c'))); // union
+        assert!(pol.deny.contains(&fingerprint('b')));
     }
 
     #[test]
     fn file_only_admission_resolves() {
         let file = AdmissionFile {
             mode: Some("allowlist".into()),
-            allow: vec!["only_file".into()],
+            allow: vec![fingerprint('d')],
             ..Default::default()
         };
-        let pol = resolve_admission(&file, &overlay(None, &[], None)).unwrap();
+        let pol = resolve_admission(&file, &overlay(None, &[], &[], None)).unwrap();
         assert_eq!(pol.registration_mode, Admission::Allowlist);
-        assert!(pol.allow.contains("only_file"));
+        assert!(pol.allow.contains(&fingerprint('d')));
         assert!(pol.relay_token.is_none());
     }
 
     #[test]
     fn missing_mode_defaults_to_open_and_bad_mode_errors() {
         let empty = AdmissionFile::default();
-        let pol = resolve_admission(&empty, &overlay(None, &[], None)).unwrap();
+        let pol = resolve_admission(&empty, &overlay(None, &[], &[], None)).unwrap();
         assert_eq!(pol.registration_mode, Admission::Open);
-        assert!(resolve_admission(&empty, &overlay(Some("nonsense"), &[], None)).is_err());
+        assert!(resolve_admission(&empty, &overlay(Some("nonsense"), &[], &[], None)).is_err());
+    }
+
+    #[test]
+    fn admission_fingerprints_are_normalized_before_policy_evaluation() {
+        let allow = fingerprint('a');
+        let deny = fingerprint('b');
+        let colon_delimited_upper = |value: &str| {
+            value
+                .as_bytes()
+                .chunks(2)
+                .map(|chunk| std::str::from_utf8(chunk).unwrap().to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(":")
+        };
+        let file = AdmissionFile {
+            mode: Some("allowlist".into()),
+            allow: vec![colon_delimited_upper(&allow)],
+            deny: vec![colon_delimited_upper(&deny)],
+            ..Default::default()
+        };
+
+        let policy = resolve_admission(&file, &overlay(None, &[], &[], None)).unwrap();
+        assert!(policy.allow.contains(&allow));
+        assert!(policy.deny.contains(&deny));
+    }
+
+    #[test]
+    fn malformed_admission_fingerprint_fails_closed() {
+        let file = AdmissionFile {
+            deny: vec!["not-a-sha256-fingerprint".into()],
+            ..Default::default()
+        };
+
+        let err = resolve_admission(&file, &overlay(None, &[], &[], None))
+            .expect_err("malformed deny entries must reject the policy");
+        assert!(err.to_string().contains("64 hexadecimal"));
     }
 
     #[test]

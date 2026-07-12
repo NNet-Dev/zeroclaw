@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_rustls::TlsConnector;
 // The runtime depends on tokio-rustls (not rustls directly); use its re-export.
 use tokio_rustls::rustls;
@@ -56,6 +56,9 @@ const DEAD_AFTER: Duration = Duration::from_secs(60);
 /// During a node-id rotation, keep the OLD id's link alive this long after the
 /// NEW id registers, so clients mid-session on the old id are not cut off.
 const ROTATION_GRACE: Duration = Duration::from_secs(600);
+/// A candidate rotation link must register promptly before it may replace the
+/// currently published route. The existing route remains live on timeout.
+const ROTATION_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the supervisor polls for an on-demand rotation trigger / checks the
 /// scheduled-rotation deadline.
 const ROTATE_POLL: Duration = Duration::from_secs(15);
@@ -252,12 +255,13 @@ pub fn request_node_id_rotation(data_dir: &std::path::Path) -> Result<()> {
 /// keeps one live link and, on a scheduled cadence or an on-demand trigger, mints
 /// a fresh id, registers it ALONGSIDE the old one for a grace window (the relay
 /// binds both ids to the same pubkey, so A10 is preserved and clients mid-session
-/// on the old id keep working), persists the new id atomically (so it reaches
-/// clients in-band on their next renewal), then retires the old link. With
+/// on the old id keep working), waits for the new link to register, persists the
+/// new id atomically (so it reaches clients in-band on their next renewal), then
+/// retires the old link. With
 /// rotation off (or an operator-pinned id) it is just a single link.
 pub async fn run_relay_bridge(cfg: RelayBridgeConfig, cancel: CancellationToken) -> Result<()> {
     if !cfg.rotation_allowed {
-        return serve_link(cfg, cancel).await;
+        return serve_link(cfg, cancel, None).await;
     }
 
     let mut current_id = cfg.node_id.clone();
@@ -265,7 +269,7 @@ pub async fn run_relay_bridge(cfg: RelayBridgeConfig, cancel: CancellationToken)
     let mut link = {
         let c = cfg.clone();
         let lc = link_cancel.clone();
-        zeroclaw_spawn::spawn!(async move { serve_link(c, lc).await })
+        zeroclaw_spawn::spawn!(async move { serve_link(c, lc, None).await })
     };
 
     loop {
@@ -278,22 +282,54 @@ pub async fn run_relay_bridge(cfg: RelayBridgeConfig, cancel: CancellationToken)
 
         // Bring the new id up alongside the old (grace-window overlap).
         let new_cancel = cancel.child_token();
+        let (registered_tx, registered_rx) = oneshot::channel();
         let new_link = {
             let mut c = cfg.clone();
             c.node_id = new_id.clone();
             let lc = new_cancel.clone();
-            zeroclaw_spawn::spawn!(async move { serve_link(c, lc).await })
+            zeroclaw_spawn::spawn!(async move { serve_link(c, lc, Some(registered_tx)).await })
         };
-        // Persist immediately so `relay_profile` (the in-band push) and a restart
-        // both use the new id from now on.
+
+        match wait_for_new_link_registration(registered_rx, &cancel).await {
+            RotationRegistration::Registered => {}
+            RotationRegistration::Cancelled => {
+                new_cancel.cancel();
+                let _ = new_link.await;
+                link_cancel.cancel();
+                let _ = link.await;
+                return Ok(());
+            }
+            RotationRegistration::Unavailable => {
+                new_cancel.cancel();
+                let _ = new_link.await;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "old": current_id, "new": new_id })),
+                    "relay node-id rotation: new link never registered; keeping the old route"
+                );
+                continue;
+            }
+        }
+
+        // Publish only a registered route. If persistence fails, abandon the new
+        // link before the grace window so clients retain the known-good old id.
         if let Err(e) = persist_node_id(&cfg.data_dir, &new_id) {
+            new_cancel.cancel();
+            let _ = new_link.await;
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
-                "relay node-id rotation: failed to persist the new id"
+                    .with_attrs(::serde_json::json!({
+                        "old": current_id,
+                        "new": new_id,
+                        "error": format!("{e:#}"),
+                    })),
+                "relay node-id rotation: failed to persist the new id; keeping the old route"
             );
+            continue;
         }
         ::zeroclaw_log::record!(
             INFO,
@@ -320,6 +356,28 @@ pub async fn run_relay_bridge(cfg: RelayBridgeConfig, cancel: CancellationToken)
             let _ = link.await;
             return Ok(());
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RotationRegistration {
+    Registered,
+    Cancelled,
+    Unavailable,
+}
+
+/// Wait until a candidate link receives the relay's authenticated `Registered`
+/// reply. The old route must remain authoritative until then.
+async fn wait_for_new_link_registration(
+    registered: oneshot::Receiver<()>,
+    cancel: &CancellationToken,
+) -> RotationRegistration {
+    tokio::select! {
+        _ = cancel.cancelled() => RotationRegistration::Cancelled,
+        result = tokio::time::timeout(ROTATION_READY_TIMEOUT, registered) => match result {
+            Ok(Ok(())) => RotationRegistration::Registered,
+            Ok(Err(_)) | Err(_) => RotationRegistration::Unavailable,
+        },
     }
 }
 
@@ -351,14 +409,18 @@ async fn wait_for_rotation(cfg: &RelayBridgeConfig, cancel: &CancellationToken) 
 }
 
 /// One relay link for `cfg.node_id`: reconnect with capped backoff until `cancel`.
-async fn serve_link(cfg: RelayBridgeConfig, cancel: CancellationToken) -> Result<()> {
+async fn serve_link(
+    cfg: RelayBridgeConfig,
+    cancel: CancellationToken,
+    mut registered: Option<oneshot::Sender<()>>,
+) -> Result<()> {
     let mut backoff = BACKOFF_INITIAL;
     loop {
         if cancel.is_cancelled() {
             return Ok(());
         }
         let started = Instant::now();
-        match serve_once(&cfg, &cancel).await {
+        match serve_once(&cfg, &cancel, &mut registered).await {
             Ok(()) => return Ok(()), // clean cancellation
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -388,7 +450,11 @@ async fn serve_link(cfg: RelayBridgeConfig, cancel: CancellationToken) -> Result
     }
 }
 
-async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Result<()> {
+async fn serve_once(
+    cfg: &RelayBridgeConfig,
+    cancel: &CancellationToken,
+    registered: &mut Option<oneshot::Sender<()>>,
+) -> Result<()> {
     let keypair = Ed25519KeyPair::from_pkcs8(&cfg.signing_key_pkcs8)
         .map_err(|e| anyhow::Error::msg(format!("loading relay signing key: {e}")))?;
     let pubkey = keypair.public_key().as_ref().to_vec();
@@ -462,7 +528,11 @@ async fn serve_once(cfg: &RelayBridgeConfig, cancel: &CancellationToken) -> Resu
     }))
     .await?;
     match next_control(&mut ws).await {
-        Some(Control::Registered { .. }) => {}
+        Some(Control::Registered { .. }) => {
+            if let Some(ready) = registered.take() {
+                let _ = ready.send(());
+            }
+        }
         Some(Control::Error { code, msg }) => {
             anyhow::bail!("relay rejected registration: {code}: {msg}")
         }
@@ -966,5 +1036,33 @@ mod node_id_tests {
         // The supervisor consumes it by removing it.
         std::fs::remove_file(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn rotation_keeps_the_published_id_when_new_registration_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_id = mint_node_id().unwrap();
+        persist_node_id(dir.path(), &old_id).unwrap();
+        let cancel = CancellationToken::new();
+        let (sender, receiver) = oneshot::channel();
+        drop(sender); // A refused registration closes the readiness channel.
+
+        assert_eq!(
+            wait_for_new_link_registration(receiver, &cancel).await,
+            RotationRegistration::Unavailable
+        );
+        assert_eq!(ensure_node_id(dir.path(), "").unwrap(), old_id);
+    }
+
+    #[tokio::test]
+    async fn rotation_publishes_only_after_new_registration_is_confirmed() {
+        let cancel = CancellationToken::new();
+        let (sender, receiver) = oneshot::channel();
+        sender.send(()).unwrap();
+
+        assert_eq!(
+            wait_for_new_link_registration(receiver, &cancel).await,
+            RotationRegistration::Registered
+        );
     }
 }
