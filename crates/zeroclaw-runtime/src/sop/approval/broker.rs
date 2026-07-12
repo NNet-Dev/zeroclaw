@@ -412,6 +412,7 @@ mod tests {
             deterministic: false,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            agent: None,
         }
     }
 
@@ -668,6 +669,12 @@ mod tests {
             &self,
         ) -> Result<Vec<crate::sop::store::PersistedRun>, crate::sop::store::StoreError> {
             self.inner.load_active_runs()
+        }
+        fn load_terminal_runs(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<crate::sop::store::PersistedRun>, crate::sop::store::StoreError> {
+            self.inner.load_terminal_runs(limit)
         }
         fn load_run(
             &self,
