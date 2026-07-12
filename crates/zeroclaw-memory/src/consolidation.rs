@@ -223,7 +223,6 @@ pub async fn consolidate_turn(
                         }),
                         pinned: survivor.pinned,
                         tenant_id: survivor.tenant_id.clone(),
-                        ..StoreOptions::default()
                     };
                     memory
                         .store_with_options(
@@ -363,7 +362,6 @@ async fn store_typed_facts(
                                 kind: survivor.kind.clone().or_else(|| fact_kind.clone()),
                                 pinned: survivor.pinned,
                                 tenant_id: survivor.tenant_id.clone(),
-                                ..StoreOptions::default()
                             },
                         )
                         .await?;
