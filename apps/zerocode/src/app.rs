@@ -22,6 +22,7 @@ use crate::keymap::{GlobalAction, ModalAction};
 use crate::logs;
 use crate::mouse;
 use crate::quickstart_pane;
+use crate::sop_pane;
 use crate::theme;
 use crate::widgets::{CtxBar, HelpContext, HelpEntry, HelpNode};
 
@@ -55,7 +56,11 @@ enum QuickstartChatDrain {
 const TICK: Duration = Duration::from_millis(200);
 
 /// Mode bar entries. Shared between drawing and click detection.
-const MODES: [Mode; 7] = [
+/// SOP authoring is not exposed from any build: the web dashboard ships as the
+/// first experimental release while the TUI pane cooks longer. `Mode::Sop` is
+/// deliberately absent here so the pane is unreachable from navigation
+/// regardless of feature selection.
+const MODES: &[Mode] = &[
     Mode::Dashboard,
     Mode::Config,
     Mode::Acp,
@@ -76,6 +81,8 @@ enum Mode {
     Chat,
     Logs,
     Quickstart,
+    #[allow(dead_code)]
+    Sop,
 }
 
 impl Mode {
@@ -88,6 +95,7 @@ impl Mode {
             Mode::Chat => "zc-pane-chat",
             Mode::Logs => "zc-pane-logs",
             Mode::Quickstart => "zc-pane-quickstart",
+            Mode::Sop => "zc-pane-sop",
         }
     }
 
@@ -109,6 +117,7 @@ async fn switch_mode(
     quickstart: &mut quickstart_pane::QuickstartPane,
     acp_pane: &mut acp::Acp,
     chat_pane: &mut chat::Chat,
+    sop_pane: &mut sop_pane::SopPane,
 ) {
     if *mode == Mode::Quickstart && next != Mode::Quickstart {
         quickstart.dismiss_beacon().await;
@@ -117,6 +126,7 @@ async fn switch_mode(
         match next {
             Mode::Acp => acp_pane.refresh_if_inactive().await,
             Mode::Chat => chat_pane.refresh_if_inactive().await,
+            Mode::Sop => sop_pane.refresh().await,
             _ => {}
         }
     }
@@ -251,6 +261,7 @@ pub async fn run(
                 let mut quickstart =
                     quickstart_pane::QuickstartPane::new(rpc.clone(), Arc::clone(&reconnect_state));
                 quickstart.init().await?;
+                let sop_pane = sop_pane::SopPane::new(rpc.clone());
                 if let Some(alias) = pending_start_chat {
                     chat_pane.focus_agent(&alias).await;
                     mode = Mode::Chat;
@@ -263,6 +274,7 @@ pub async fn run(
                     chat_pane,
                     logs_pane,
                     quickstart,
+                    sop_pane,
                 ))
             }
             .await
@@ -277,6 +289,7 @@ pub async fn run(
         mut chat_pane,
         mut logs_pane,
         mut quickstart,
+        mut sop_pane,
     ) = build_panes!(
         (None::<String>, None::<String>),
         (None::<String>, None::<String>)
@@ -387,6 +400,7 @@ pub async fn run(
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
                 Mode::Quickstart => quickstart.draw(frame, chunks[1]),
+                Mode::Sop => sop_pane.render(frame, chunks[1]),
             }
 
             let status_idx = if has_info {
@@ -454,6 +468,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.help_context(),
                     Mode::Logs => logs_pane.help_context(),
                     Mode::Quickstart => quickstart.help_context(),
+                    Mode::Sop => sop_pane.help_context(),
                 };
                 node.children.push(pane_node);
                 draw_help_modal(frame, frame.area(), &node);
@@ -517,25 +532,52 @@ pub async fn run(
                     let prev_sig = rpc.tui_sig().map(String::from);
                     // The connect prefers the direct path and falls back to the
                     // relay, so a reconnect lands on whichever leg is reachable.
-                    if let Ok((new_client, leg)) = target
+                    if let Ok((new_client, _leg)) = target
                         .connect(prev_id.as_deref(), prev_sig.as_deref())
                         .await
                     {
                         // Adopt the recovered client and rebuild every pane
-                        // against it. History is not bulk-reloaded; panes
-                        // refetch lazily and the daemon rehydrates the session
-                        // from its durable row on the next prompt.
-                        active_leg = leg;
-                        if adopt_client!(new_client) {
-                            reconnect_last_attempt = None;
-                            reprobe_last_attempt = None;
-                            ephemeral_respawn_done = false;
-                            needs_intervention = false;
+                        // against it (a kept-alive pane would still hold the
+                        // dead client's notification receiver). History is
+                        // not bulk-reloaded — panes refetch lazily and the
+                        // daemon rehydrates the session from its durable row
+                        // on the next prompt.
+                        rpc = Arc::new(new_client);
+                        // Carry the live sessions across the rebuild so the
+                        // recovered panes reattach to the daemon-retained
+                        // sessions instead of starting fresh. The agent alias
+                        // rides along so a multi-agent reconnect reattaches to
+                        // the right agent rather than dropping the session.
+                        let resume_chat = (
+                            chat_pane.current_session_id().map(String::from),
+                            chat_pane.current_agent_alias().map(String::from),
+                        );
+                        let resume_acp = (
+                            acp_pane.current_session_id().map(String::from),
+                            acp_pane.current_agent_alias().map(String::from),
+                        );
+                        match build_panes!(resume_chat, resume_acp) {
+                            Ok(panes) => {
+                                dashboard_pane = panes.0;
+                                config_app = panes.1;
+                                doctor_pane = panes.2;
+                                acp_pane = panes.3;
+                                chat_pane = panes.4;
+                                logs_pane = panes.5;
+                                quickstart = panes.6;
+                                sop_pane = panes.7;
+                                reconnect_last_attempt = None;
+                                ephemeral_respawn_done = false;
+                                needs_intervention = false;
+                                continue;
+                            }
+                            Err(_) => {
+                                // Daemon flapped again mid-init. Stay in the
+                                // disconnected loop and retry on the next
+                                // throttle window rather than tearing down.
+                                continue;
+                            }
                         }
-                        // On a mid-init flap the rebuild fails; we stay in the
-                        // disconnected loop and retry on the next throttle
-                        // window rather than tearing down the TUI.
-                        continue;
                     } else if owns_ephemeral && ephemeral_respawn_done {
                         // The one permitted respawn did not come back — flag
                         // for the user. We keep polling above, so a manual
@@ -614,6 +656,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.wants_text_input(),
                     Mode::Logs => logs_pane.wants_text_input(),
                     Mode::Quickstart => quickstart.wants_text_input(),
+                    Mode::Sop => false,
                 };
                 let global = GlobalAction::from_chord(&key);
 
@@ -710,6 +753,7 @@ pub async fn run(
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
+                        &mut sop_pane,
                     )
                     .await;
                     continue;
@@ -737,6 +781,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.handle_key(key, term).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
                     Mode::Quickstart => quickstart.handle_key(key).await,
+                    Mode::Sop => sop_pane.handle_key(key).await,
                 };
                 if quit {
                     break;
@@ -749,6 +794,7 @@ pub async fn run(
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
+                        &mut sop_pane,
                     )
                     .await;
                 }
@@ -787,6 +833,7 @@ pub async fn run(
                             &mut quickstart,
                             &mut acp_pane,
                             &mut chat_pane,
+                            &mut sop_pane,
                         )
                         .await;
                         continue;
@@ -816,6 +863,7 @@ pub async fn run(
                                             &mut quickstart,
                                             &mut acp_pane,
                                             &mut chat_pane,
+                                            &mut sop_pane,
                                         )
                                         .await;
                                     }
@@ -840,6 +888,9 @@ pub async fn run(
                         Mode::Quickstart => {
                             quickstart.handle_mouse(mouse, content_area).await;
                         }
+                        Mode::Sop => {
+                            sop_pane.handle_mouse(mouse).await;
+                        }
                     }
                     consume_pending_quickstart_chat(
                         &conn_state,
@@ -859,6 +910,7 @@ pub async fn run(
                     Mode::Quickstart => quickstart.handle_paste(&text),
                     Mode::Dashboard => dashboard_pane.handle_paste(&text),
                     Mode::Logs => logs_pane.handle_paste(&text),
+                    Mode::Sop => {}
                 }
                 consume_pending_quickstart_chat(
                     &conn_state,

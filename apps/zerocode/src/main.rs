@@ -40,6 +40,7 @@ mod keymap;
 mod logs;
 mod mouse;
 mod quickstart_pane;
+mod sop_pane;
 mod theme;
 mod todo_tracker;
 mod turn_status;
@@ -612,7 +613,7 @@ fn confirm_relay_cert(relay_addr: &str, fingerprint: &str) -> anyhow::Result<Rel
 /// (`--relay-ca`/`--relay-pin`/`--relay-tofu`/`--relay-insecure`, or a remembered
 /// pin) it is used as-is. Otherwise, rather than failing the connect with a bare
 /// `UnknownIssuer`, fetch the relay leaf, show its fingerprint, and offer to trust
-/// + remember it (interactive only); a non-interactive run gets an actionable
+/// and remember it (interactive only); a non-interactive run gets an actionable
 /// error pointing at the explicit flags.
 async fn resolve_relay_trust(
     existing_pin: Option<String>,
