@@ -873,14 +873,20 @@ pub fn create_memory_for_migration(
 
 /// Wrap an agent memory handle in the [`RetrievalPipeline`] decorator.
 ///
-/// The production decorator currently makes one direct backend-recall call.
-/// `[memory] retrieval_stages` and `fts_early_return_score` remain dormant
-/// until `Memory` exposes distinct FTS and vector operations; activating the
-/// current hybrid backend under those names would make the configuration lie.
-fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, _config: &MemoryConfig) -> Arc<dyn Memory> {
+/// The decorator makes one hybrid backend-recall call per query. Its only
+/// add-on is an optional in-process hot cache, enabled when `[memory]
+/// retrieval_stages` names `"cache"`. The default carries no `"cache"`, so
+/// activating the decorator does not change default per-agent recall. The
+/// reserved `"fts"` / `"vector"` names and `fts_early_return_score` are inert
+/// until `Memory` exposes distinct FTS and vector operations.
+fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) -> Arc<dyn Memory> {
+    let cache_enabled = config.retrieval_stages.iter().any(|stage| stage == "cache");
     Arc::new(retrieval::RetrievalPipeline::new(
         memory,
-        RetrievalConfig::default(),
+        RetrievalConfig {
+            cache_enabled,
+            ..RetrievalConfig::default()
+        },
     ))
 }
 
@@ -1985,10 +1991,46 @@ mod tests {
         assert_eq!(fresh.len(), 3, "the decorator must preserve direct recall");
     }
 
-    /// Configuring a nominal stage does not activate it through the production
-    /// decorator while `Memory` still exposes only a hybrid backend recall.
+    /// The reserved `"fts"` / `"vector"` stage names do not enable caching, so
+    /// recall stays coherent across handles exactly like the default.
     #[tokio::test]
-    async fn factory_leaves_staged_retrieval_config_dormant() {
+    async fn factory_reserved_stages_do_not_cache() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = agent_config(&tmp);
+        config.memory.retrieval_stages = vec!["fts".to_string(), "vector".to_string()];
+
+        let handle_a = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle_b = create_memory_for_agent(&config, "ops", None).await.unwrap();
+
+        handle_a
+            .store("k1", "first fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_a
+                .recall("fact", 10, None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        handle_b
+            .store("k2", "second fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let after = handle_a.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "reserved stages must not cache; a sibling write stays visible"
+        );
+    }
+
+    /// Opting the hot cache in via `retrieval_stages = ["cache"]` keeps a
+    /// handle coherent with its own writes (a mutation invalidates the cache).
+    #[tokio::test]
+    async fn factory_optin_cache_reflects_own_writes() {
         let tmp = TempDir::new().unwrap();
         let mut config = agent_config(&tmp);
         config.memory.retrieval_stages = vec!["cache".to_string()];
@@ -1998,7 +2040,24 @@ mod tests {
             .store("k1", "first fact", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let hits = handle.recall("fact", 10, None, None, None).await.unwrap();
-        assert_eq!(hits.len(), 1, "the direct decorator must preserve recall");
+        assert_eq!(
+            handle
+                .recall("fact", 10, None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        handle
+            .store("k2", "second fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let after = handle.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "a handle must see its own writes even with the cache on"
+        );
     }
 }
