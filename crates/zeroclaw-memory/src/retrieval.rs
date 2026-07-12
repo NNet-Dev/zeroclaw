@@ -1,17 +1,13 @@
-//! Multi-stage retrieval pipeline.
+//! Staged retrieval support and its production decorator.
 //!
-//! Wraps a `Memory` trait object with staged retrieval:
-//! - **Stage 1 (Hot cache):** In-memory LRU of recent recall results.
-//! - **Stage 2 (FTS):** FTS5 keyword search with optional early-return.
-//! - **Stage 3 (Vector):** Vector similarity search + hybrid merge.
+//! [`RetrievalPipeline::recall`] remains a standalone staged experiment with
+//! an in-memory cache plus nominal FTS/vector stages. `Memory` currently
+//! exposes only one hybrid backend-recall operation, so the production
+//! `Memory` implementation delegates directly to its scoped backend instead
+//! of falsely presenting that operation as distinct FTS and vector stages.
 //!
-//! Configurable via `[memory]` settings: `retrieval_stages`, `fts_early_return_score`.
-//!
-//! `RetrievalPipeline` implements `Memory` itself, so it composes as an
-//! outermost decorator around any backend (or wrapper stack): reads route
-//! through the staged pipeline, and every mutating operation delegates to
-//! the inner backend and then invalidates the hot cache so a subsequent
-//! recall never serves rows the mutation changed.
+//! `[memory] retrieval_stages` and `fts_early_return_score` remain dormant
+//! until the backend contract can expose those operations honestly.
 
 use super::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
@@ -59,22 +55,11 @@ impl RetrievalCacheKey {
     }
 }
 
-/// Stage names that consult the backend and can produce rows out of it.
+/// Stage names understood by the dormant standalone pipeline.
 ///
-/// [`RetrievalPipeline::recall`] treats exactly these names as backend
-/// stages (its match arm reads this list), and the factory guard in
-/// `lib.rs` uses [`has_backend_stage`] to decide whether wrapping is
-/// safe -- one vocabulary, one owner, no drift.
+/// The production `Memory` decorator does not activate these names until the
+/// trait exposes distinct backend operations for them.
 pub(crate) const BACKEND_STAGES: [&str; 2] = ["fts", "vector"];
-
-/// True when `stages` names at least one stage that can produce rows out
-/// of the backend. A stage list without one would turn every pipeline
-/// recall into an empty result, so callers keep direct recall instead.
-pub(crate) fn has_backend_stage(stages: &[String]) -> bool {
-    stages
-        .iter()
-        .any(|stage| BACKEND_STAGES.contains(&stage.as_str()))
-}
 
 /// Multi-stage retrieval pipeline configuration.
 #[derive(Debug, Clone)]
@@ -293,7 +278,13 @@ impl Memory for RetrievalPipeline {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        RetrievalPipeline::recall(self, query, limit, session_id, None, since, until).await
+        // `Memory` has one backend-recall operation today. The configured
+        // cache/FTS/vector stages remain dormant until that contract exposes
+        // genuinely distinct operations; do not label a hybrid recall as FTS
+        // and then return before a vector stage can run.
+        self.memory
+            .recall(query, limit, session_id, since, until)
+            .await
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -454,16 +445,9 @@ impl Memory for RetrievalPipeline {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        RetrievalPipeline::recall(
-            self,
-            query,
-            limit,
-            session_id,
-            Some(namespace),
-            since,
-            until,
-        )
-        .await
+        self.memory
+            .recall_namespaced(namespace, query, limit, session_id, since, until)
+            .await
     }
 
     async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
@@ -1102,9 +1086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fts_early_return_stage_returns_backend_results_unmodified() {
-        // Top score above the 0.85 early-return threshold: the fts stage
-        // short-circuits, and the result must still be exactly the backend's.
+    async fn memory_decorator_preserves_backend_results_without_activating_stages() {
         let above = Arc::new(StatefulMemory::new(vec![
             entry("hot", "high scoring row", 0.95, MemoryCategory::Core, None),
             entry("warm", "second row", 0.60, MemoryCategory::Core, None),
@@ -1112,16 +1094,17 @@ mod tests {
         let direct = above.recall("query", 5, None, None, None).await.unwrap();
         let pipeline =
             RetrievalPipeline::new(above.clone() as Arc<dyn Memory>, RetrievalConfig::default());
-        let staged = Memory::recall(&pipeline, "query", 5, None, None, None)
+        let decorated = Memory::recall(&pipeline, "query", 5, None, None, None)
             .await
             .unwrap();
-        assert_eq!(as_bytes(&staged), as_bytes(&direct));
-        // One direct call + one staged call; the early return consulted the
-        // backend exactly once and populated the cache.
+        assert_eq!(as_bytes(&decorated), as_bytes(&direct));
         assert_eq!(above.recalls(), 2);
-        assert_eq!(pipeline.cache_size(), 1);
+        assert_eq!(
+            pipeline.cache_size(),
+            0,
+            "the decorator must not enable cache"
+        );
 
-        // Top score below the threshold: no early return, same identity.
         let below = Arc::new(StatefulMemory::new(vec![
             entry(
                 "mid",
@@ -1135,12 +1118,16 @@ mod tests {
         let direct = below.recall("query", 5, None, None, None).await.unwrap();
         let pipeline =
             RetrievalPipeline::new(below.clone() as Arc<dyn Memory>, RetrievalConfig::default());
-        let staged = Memory::recall(&pipeline, "query", 5, None, None, None)
+        let decorated = Memory::recall(&pipeline, "query", 5, None, None, None)
             .await
             .unwrap();
-        assert_eq!(as_bytes(&staged), as_bytes(&direct));
+        assert_eq!(as_bytes(&decorated), as_bytes(&direct));
         assert_eq!(below.recalls(), 2);
-        assert_eq!(pipeline.cache_size(), 1);
+        assert_eq!(
+            pipeline.cache_size(),
+            0,
+            "the decorator must not enable cache"
+        );
     }
 
     #[tokio::test]

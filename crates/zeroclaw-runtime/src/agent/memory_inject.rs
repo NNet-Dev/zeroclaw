@@ -312,7 +312,7 @@ mod tests {
 
     /// Recall returns the fixture list for the requested session scope;
     /// `fail` simulates a backend error. `recalls` counts backend recalls
-    /// so pipeline-composition tests can observe cache hits.
+    /// so decorator-composition tests can observe forwarding.
     struct FixtureMemory {
         by_session: HashMap<Option<String>, Vec<MemoryEntry>>,
         fail: bool,
@@ -778,13 +778,12 @@ mod tests {
         assert_eq!(observer.recalls.lock().as_slice(), &[(3, true)]);
     }
 
-    /// Injection-path smoke for the staged retrieval pipeline: when the
-    /// turn's memory handle is pipeline-wrapped (as `create_memory_for_agent`
-    /// now builds it), the renderer's recall observably routes through the
-    /// pipeline -- a repeated render is served from the pipeline's hot cache
-    /// (one backend recall), and the rendered block is identical.
+    /// Injection-path smoke for the retrieval decorator: when the turn's
+    /// memory handle is pipeline-wrapped (as `create_memory_for_agent` now
+    /// builds it), each renderer recall reaches the scoped backend and the
+    /// rendered block remains unchanged.
     #[tokio::test]
-    async fn recall_routes_through_retrieval_pipeline_and_reuses_cache() {
+    async fn recall_routes_through_retrieval_pipeline_decorator() {
         let fixture = std::sync::Arc::new(FixtureMemory::with(vec![entry(
             "fact",
             "server is prod-3",
@@ -817,11 +816,14 @@ mod tests {
         .await;
 
         assert!(first.contains("- fact: server is prod-3"));
-        assert_eq!(first, second, "cached recall must render identically");
+        assert_eq!(
+            first, second,
+            "direct backend recall must render identically"
+        );
         assert_eq!(
             fixture.recalls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "second render must be served from the pipeline hot cache"
+            2,
+            "each render must reach the backend through the decorator"
         );
         assert_eq!(
             observer.recalls.lock().as_slice(),

@@ -871,36 +871,16 @@ pub fn create_memory_for_migration(
     )
 }
 
-/// Wrap an agent memory handle in the staged [`RetrievalPipeline`] so every
-/// recall on it routes through the configured `[memory] retrieval_stages`
-/// (hot cache, FTS early-return, vector) and every mutation invalidates the
-/// pipeline's hot cache.
+/// Wrap an agent memory handle in the [`RetrievalPipeline`] decorator.
 ///
-/// The pipeline can only produce rows out of a backend stage
-/// ([`retrieval::BACKEND_STAGES`]); a stage list without one would turn
-/// every recall into an empty result. Such a config keeps direct recall
-/// (with a warning) rather than silently losing memory.
-fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) -> Arc<dyn Memory> {
-    if !retrieval::has_backend_stage(&config.retrieval_stages) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_category(::zeroclaw_log::EventCategory::Memory)
-                .with_attrs(::serde_json::json!({
-                    "retrieval_stages": config.retrieval_stages,
-                })),
-            "memory: [memory] retrieval_stages lists no backend stage (\"fts\" or \
-             \"vector\"); staged retrieval disabled, recall goes direct to the backend"
-        );
-        return memory;
-    }
+/// The production decorator currently makes one direct backend-recall call.
+/// `[memory] retrieval_stages` and `fts_early_return_score` remain dormant
+/// until `Memory` exposes distinct FTS and vector operations; activating the
+/// current hybrid backend under those names would make the configuration lie.
+fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, _config: &MemoryConfig) -> Arc<dyn Memory> {
     Arc::new(retrieval::RetrievalPipeline::new(
         memory,
-        RetrievalConfig {
-            stages: config.retrieval_stages.clone(),
-            fts_early_return_score: config.fts_early_return_score,
-            ..RetrievalConfig::default()
-        },
+        RetrievalConfig::default(),
     ))
 }
 
@@ -913,10 +893,9 @@ fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) ->
 /// the resolved `read_memory_from` allowlist). `NoneMemory` agents
 /// pass through unwrapped.
 ///
-/// The scoped handle is then wrapped in the staged [`RetrievalPipeline`]
-/// (outermost), so per-turn injection recall and the memory tools route
-/// through `[memory] retrieval_stages`. `NoneMemory` agents skip the
-/// pipeline: there is nothing to stage or cache.
+/// The scoped handle is then wrapped in the [`RetrievalPipeline`] decorator
+/// (outermost), so per-turn injection recall and memory tools share one
+/// `Memory` contract. `NoneMemory` agents skip the decorator.
 ///
 /// Cross-backend allowlist entries are rejected at config load, so by
 /// the time we get here every entry on
@@ -1969,12 +1948,10 @@ mod tests {
         }
     }
 
-    /// The agent factory wraps the scoped handle in the retrieval pipeline:
-    /// a repeated identical recall is served from handle-local hot cache
-    /// (a sibling handle's write is not seen until this handle mutates or
-    /// the TTL lapses), and any mutation through the handle invalidates it.
+    /// The agent factory wraps the scoped handle in the retrieval decorator
+    /// without introducing a handle-local cache over the shared store.
     #[tokio::test]
-    async fn create_memory_for_agent_routes_recall_through_pipeline() {
+    async fn create_memory_for_agent_keeps_cross_handle_reads_coherent() {
         let tmp = TempDir::new().unwrap();
         let config = agent_config(&tmp);
 
@@ -1988,42 +1965,30 @@ mod tests {
         let first = handle_a.recall("fact", 10, None, None, None).await.unwrap();
         assert_eq!(first.len(), 1, "seed row must be recallable");
 
-        // A sibling handle writes; handle_a's cached recall must stay
-        // byte-identical to its first result (pipeline cache is live).
         handle_b
             .store("k2", "second fact", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let cached = handle_a.recall("fact", 10, None, None, None).await.unwrap();
+        let fresh_after_sibling_write =
+            handle_a.recall("fact", 10, None, None, None).await.unwrap();
         assert_eq!(
-            serde_json::to_string(&cached).unwrap(),
-            serde_json::to_string(&first).unwrap(),
-            "identical recall on an unmutated handle is served from the pipeline cache"
-        );
-        assert_eq!(
-            handle_b
-                .recall("fact", 10, None, None, None)
-                .await
-                .unwrap()
-                .len(),
+            fresh_after_sibling_write.len(),
             2,
-            "the writing handle sees its own row immediately"
+            "a sibling write must be visible through an existing handle"
         );
 
-        // A mutation through handle_a invalidates its cache: the next
-        // recall reflects the full store again.
         handle_a
             .store("k3", "third fact", MemoryCategory::Core, None)
             .await
             .unwrap();
         let fresh = handle_a.recall("fact", 10, None, None, None).await.unwrap();
-        assert_eq!(fresh.len(), 3, "post-mutation recall must be uncached");
+        assert_eq!(fresh.len(), 3, "the decorator must preserve direct recall");
     }
 
-    /// A stage list without a backend stage would make every recall empty;
-    /// the factory refuses to wrap and recall stays direct.
+    /// Configuring a nominal stage does not activate it through the production
+    /// decorator while `Memory` still exposes only a hybrid backend recall.
     #[tokio::test]
-    async fn factory_skips_pipeline_without_backend_stage() {
+    async fn factory_leaves_staged_retrieval_config_dormant() {
         let tmp = TempDir::new().unwrap();
         let mut config = agent_config(&tmp);
         config.memory.retrieval_stages = vec!["cache".to_string()];
@@ -2034,10 +1999,6 @@ mod tests {
             .await
             .unwrap();
         let hits = handle.recall("fact", 10, None, None, None).await.unwrap();
-        assert_eq!(
-            hits.len(),
-            1,
-            "recall must keep working without the pipeline"
-        );
+        assert_eq!(hits.len(), 1, "the direct decorator must preserve recall");
     }
 }
