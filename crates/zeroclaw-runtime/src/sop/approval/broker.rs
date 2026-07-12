@@ -230,6 +230,72 @@ impl ApprovalBroker {
         }
     }
 
+    /// Authorize a deterministic checkpoint through the same named policy model as
+    /// approval gates. `None` means the caller may resolve the checkpoint now;
+    /// `Some(outcome)` is a terminal broker answer and the checkpoint must stay
+    /// parked. Quorum votes record only the approver identity; the final decision
+    /// that satisfies quorum supplies any checkpoint-specific payload such as
+    /// amend text or revise guidance.
+    pub(crate) fn authorize_checkpoint(
+        &self,
+        engine: &mut SopEngine,
+        run_id: &str,
+        step: u32,
+        decision: &ApprovalDecision,
+        principal: &ApprovalPrincipal,
+    ) -> anyhow::Result<Option<BrokerOutcome>> {
+        let policy = match self.step_policy(engine, run_id) {
+            StepPolicy::MissingNamed(name) => {
+                return Ok(Some(BrokerOutcome::PolicyMissing { name }));
+            }
+            StepPolicy::Unpoliced => None,
+            StepPolicy::Named(p) => Some(p),
+        };
+
+        if let Some(group) = policy
+            .as_ref()
+            .and_then(|p| p.required_group.as_deref())
+            .filter(|g| !g.is_empty())
+            && !self
+                .resolver
+                .is_member(engine.approval_config(), principal, group)
+        {
+            return Ok(Some(BrokerOutcome::NotAuthorized {
+                required_group: group.to_string(),
+            }));
+        }
+
+        if super::resolve::is_rejected_by_approval_mode(engine.config().approval_mode, principal) {
+            return Ok(Some(BrokerOutcome::Resolved(
+                ResolveOutcome::RejectedSelfApproval,
+            )));
+        }
+
+        if matches!(decision, ApprovalDecision::Deny { .. }) {
+            return Ok(None);
+        }
+
+        let need = policy
+            .as_ref()
+            .map(|p| (p.quorum.max(1)) as usize)
+            .unwrap_or(1);
+        if need <= 1 {
+            return Ok(None);
+        }
+        if engine.is_park_persist_pending(run_id) {
+            anyhow::bail!(
+                "cannot record checkpoint approval vote for run {run_id}: its parked snapshot is not yet durably persisted (retrying)"
+            );
+        }
+        engine.record_gate_vote(run_id, step, principal)?;
+        let have = engine.distinct_gate_voters(run_id, step);
+        if have >= need {
+            Ok(None)
+        } else {
+            Ok(Some(BrokerOutcome::PendingQuorum { have, need }))
+        }
+    }
+
     /// Resolve a gate through the broker: enforce membership + quorum, then call the
     /// chokepoint. `engine` is the authoritative gate owner; the broker only decides
     /// whether (and when) to reach `resolve_gate`.
@@ -444,6 +510,81 @@ mod tests {
         (e, id)
     }
 
+    /// A deterministic `capability(noop) -> checkpoint(policy) -> capability(noop)`
+    /// SOP. The post-checkpoint tail stands in for a public mutation such as
+    /// `forge.comment`: it must not run until the checkpoint policy authorizes it.
+    fn checkpoint_policy_sop(policy: &str) -> Sop {
+        let cap_step = |number: u32| SopStep {
+            number,
+            title: format!("Capability {number}"),
+            kind: SopStepKind::Capability,
+            capability: Some("noop".into()),
+            ..SopStep::default()
+        };
+        Sop {
+            name: "triage".into(),
+            description: "cap -> checkpoint -> cap".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                cap_step(1),
+                SopStep {
+                    number: 2,
+                    title: "Review".into(),
+                    kind: SopStepKind::Checkpoint,
+                    policy: Some(policy.into()),
+                    ..SopStep::default()
+                },
+                cap_step(3),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn run_id_from_action(action: &SopRunAction) -> &str {
+        match action {
+            SopRunAction::ExecuteStep { run_id, .. }
+            | SopRunAction::WaitApproval { run_id, .. }
+            | SopRunAction::DeterministicStep { run_id, .. }
+            | SopRunAction::CheckpointWait { run_id, .. }
+            | SopRunAction::Pending { run_id, .. }
+            | SopRunAction::Completed { run_id, .. }
+            | SopRunAction::Failed { run_id, .. } => run_id,
+        }
+    }
+
+    fn checkpoint_engine_with_broker(cfg: SopApprovalConfig) -> (SopEngine, String) {
+        let broker = Arc::new(ApprovalBroker::disabled());
+        let sop_config = SopConfig {
+            approval: cfg,
+            ..SopConfig::default()
+        };
+        let mut e = SopEngine::new(sop_config).with_approval_broker(broker);
+        e.set_sops_for_test(vec![checkpoint_policy_sop("prod")]);
+        let first = e.start_run("triage", manual()).unwrap();
+        let id = run_id_from_action(&first).to_string();
+        let parked = e
+            .drive_headless_deterministic(&id, first)
+            .expect("drive to checkpoint");
+        assert!(
+            matches!(parked, SopRunAction::CheckpointWait { .. }),
+            "expected checkpoint wait, got {parked:?}"
+        );
+        assert_eq!(
+            e.get_run(&id).map(|r| r.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+        (e, id)
+    }
+
     #[test]
     fn non_member_is_not_authorized_and_gate_stays_open() {
         let (mut e, id) = engine_with_broker(approval_cfg(&["alice"], 1));
@@ -458,6 +599,70 @@ mod tests {
         assert!(
             matches!(e.gate_state(&id), GateState::Waiting { .. }),
             "an unauthorized attempt must leave the gate waiting"
+        );
+    }
+
+    #[test]
+    fn checkpoint_non_member_is_not_authorized_and_stays_paused() {
+        let (mut e, id) = checkpoint_engine_with_broker(approval_cfg(&["alice"], 1));
+        let out = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("mallory".into())),
+            )
+            .unwrap();
+        assert!(matches!(out, BrokerOutcome::NotAuthorized { .. }));
+        assert_eq!(
+            e.get_run(&id).map(|r| r.status),
+            Some(SopRunStatus::PausedCheckpoint),
+            "an unauthorized checkpoint decision must leave the run parked"
+        );
+        let events = e.run_events(&id).unwrap_or_default();
+        assert!(
+            events.iter().all(|ev| ev.kind != "gate_resolved"),
+            "an unauthorized checkpoint decision must not append a resolved row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_quorum_blocks_tail_until_second_distinct_member() {
+        let (mut e, id) = checkpoint_engine_with_broker(approval_cfg(&["alice", "bob"], 2));
+
+        let first = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+        assert_eq!(
+            e.get_run(&id).map(|r| r.status),
+            Some(SopRunStatus::PausedCheckpoint),
+            "one approval must not resume the checkpoint tail"
+        );
+
+        let second = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("bob".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            second,
+            BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
+        ));
+        let finished = e.last_finished_run("triage").expect("tail completed");
+        assert_eq!(finished.status, SopRunStatus::Completed);
+        assert_eq!(
+            finished.step_results.len(),
+            3,
+            "the post-checkpoint tail runs only after quorum"
         );
     }
 

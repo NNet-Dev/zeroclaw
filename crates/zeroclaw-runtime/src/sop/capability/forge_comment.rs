@@ -190,9 +190,11 @@ impl SopCapability for ForgeCommentCapability {
 /// (GitHub / Gitea / Forgejo alike) and reuses chunking + auth as-is.
 ///
 /// Unlike the fire-and-forget approval route adapter, this WAITS for the send
-/// result (bounded by [`POST_TIMEOUT`]): the comment IS the step's work product,
-/// so the SOP must observe success/failure. The sync->async bridge runs the send
-/// on a DEDICATED thread with its own small runtime (see [`run_bridged`]) rather
+/// result. The timeout is a soft alert boundary: if the channel send is still in
+/// flight at that point, the bridge joins it and returns the eventual result
+/// instead of letting a public comment continue in the background while the SOP
+/// takes `on_failure`. The sync->async bridge runs the send on a DEDICATED
+/// thread with its own small runtime (see [`run_bridged_to_completion`]) rather
 /// than spawning onto the host runtime: the capability executes while blocking a
 /// host thread, and on a current-thread host context a task spawned back onto
 /// that same runtime cannot be polled until the caller unblocks — a guaranteed
@@ -248,6 +250,23 @@ impl ChannelForgeAdapter {
             )),
         }
     }
+
+    fn post_comment_with_timeout(
+        &self,
+        channel: Option<&str>,
+        repo: &str,
+        number: u64,
+        body: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let target = self.resolve(channel)?;
+        let msg = SendMessage::new(body.to_string(), format!("{repo}#{number}")).suppress_voice();
+        super::bridge::run_bridged_to_completion(
+            async move { target.send(&msg).await.map_err(|e| e.to_string()) },
+            timeout,
+            "forge write",
+        )
+    }
 }
 
 impl ForgeCommentAdapter for ChannelForgeAdapter {
@@ -258,13 +277,7 @@ impl ForgeCommentAdapter for ChannelForgeAdapter {
         number: u64,
         body: &str,
     ) -> Result<(), String> {
-        let target = self.resolve(channel)?;
-        let msg = SendMessage::new(body.to_string(), format!("{repo}#{number}")).suppress_voice();
-        super::bridge::run_bridged(
-            async move { target.send(&msg).await.map_err(|e| e.to_string()) },
-            POST_TIMEOUT,
-            "forge write",
-        )
+        self.post_comment_with_timeout(channel, repo, number, body, POST_TIMEOUT)
     }
 }
 
@@ -272,6 +285,8 @@ impl ForgeCommentAdapter for ChannelForgeAdapter {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     /// (channel hint, repo, number, body) as received by `post_comment`.
     type RecordedCall = (Option<String>, String, u64, String);
@@ -296,6 +311,43 @@ mod tests {
                 body.to_string(),
             ));
             self.result.clone()
+        }
+    }
+
+    struct SlowChannel {
+        sends: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SlowChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(
+                zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "slow"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SlowChannel {
+        fn name(&self) -> &str {
+            "slow"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            tokio::time::sleep(self.delay).await;
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -400,5 +452,36 @@ mod tests {
             .unwrap();
         assert!(!out.success);
         assert!(out.error.unwrap().contains("forge said no"));
+    }
+
+    #[test]
+    fn channel_forge_waits_for_late_send_before_reporting() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        channels.insert(
+            "git".to_string(),
+            Arc::new(SlowChannel {
+                sends: Arc::clone(&sends),
+                delay: Duration::from_millis(75),
+            }),
+        );
+        let adapter = ChannelForgeAdapter::new(channels);
+        let started = Instant::now();
+
+        let out = adapter.post_comment_with_timeout(
+            None,
+            "example/hello",
+            5,
+            "triage",
+            Duration::from_millis(10),
+        );
+
+        assert_eq!(out, Ok(()));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "the forge send must finish before the capability can proceed"
+        );
     }
 }

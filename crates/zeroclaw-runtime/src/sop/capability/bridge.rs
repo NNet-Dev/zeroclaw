@@ -13,17 +13,20 @@
 //! thread + runtime cost is noise.
 
 use std::future::Future;
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Run `fut` to completion on a dedicated bridge thread, waiting at most
-/// `timeout`. `what` names the operation for thread naming and error text.
-pub(super) fn run_bridged<T, F>(fut: F, timeout: Duration, what: &str) -> Result<T, String>
+/// A spawned bridge worker: the result channel plus the worker's join handle.
+type BridgeWorker<T> = (Receiver<Result<T, String>>, JoinHandle<()>);
+
+fn spawn_bridge_thread<T, F>(fut: F, what: &str) -> Result<BridgeWorker<T>, String>
 where
     T: Send + 'static,
     F: Future<Output = Result<T, String>> + Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let spawned = std::thread::Builder::new()
+    let (tx, rx) = sync_channel(1);
+    let handle = std::thread::Builder::new()
         .name(format!("sop-bridge-{what}"))
         .spawn(move || {
             let result = match tokio::runtime::Builder::new_current_thread()
@@ -35,10 +38,20 @@ where
             };
             // Receiver gone = caller timed out; nothing left to report to.
             let _ = tx.send(result);
-        });
-    if let Err(e) = spawned {
-        return Err(format!("failed to spawn the {what} bridge thread: {e}"));
-    }
+        })
+        .map_err(|e| format!("failed to spawn the {what} bridge thread: {e}"))?;
+    Ok((rx, handle))
+}
+
+/// Run `fut` on a dedicated bridge thread, waiting at most `timeout`.
+/// `what` names the operation for thread naming and error text. Timeout detaches
+/// the worker, so this is only safe for non-public/idempotent effects.
+pub(super) fn run_bridged<T, F>(fut: F, timeout: Duration, what: &str) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, String>> + Send + 'static,
+{
+    let (rx, _handle) = spawn_bridge_thread(fut, what)?;
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
@@ -53,9 +66,44 @@ where
     }
 }
 
+/// Run `fut` on a dedicated bridge thread and return only after the worker has
+/// completed, even if it exceeds `timeout`. This is for public, non-idempotent
+/// writes: after the timeout expires, the caller waits for the eventual result
+/// instead of taking a failure path while the write continues in the background.
+pub(super) fn run_bridged_to_completion<T, F>(
+    fut: F,
+    timeout: Duration,
+    what: &str,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, String>> + Send + 'static,
+{
+    let (rx, handle) = spawn_bridge_thread(fut, what)?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let _ = handle.join();
+            result
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match handle.join() {
+            Ok(()) => rx.recv().map_err(|_| {
+                format!("{what} task died before reporting a result after timing out")
+            })?,
+            Err(_) => Err(format!("{what} task panicked after timing out")),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            Err(format!("{what} task died before reporting a result"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     #[test]
     fn runs_a_future_from_a_plain_thread() {
@@ -107,5 +155,29 @@ mod tests {
             "failop",
         );
         assert_eq!(failing.unwrap_err(), "boom");
+    }
+
+    #[test]
+    fn to_completion_waits_for_late_result_before_returning() {
+        let side_effect = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&side_effect);
+        let started = Instant::now();
+
+        let out = run_bridged_to_completion(
+            async move {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                marker.store(true, Ordering::SeqCst);
+                Ok::<_, String>("posted")
+            },
+            Duration::from_millis(10),
+            "late write",
+        );
+
+        assert_eq!(out, Ok("posted"));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(
+            side_effect.load(Ordering::SeqCst),
+            "the late side effect must have completed before the caller proceeds"
+        );
     }
 }

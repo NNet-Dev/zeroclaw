@@ -168,8 +168,9 @@ impl SopEngine {
     /// Resolve a gate THROUGH the broker (membership + quorum), then the chokepoint.
     /// This is the entry point out-of-band surfaces (gateway / CLI / tools) should
     /// call so a `[sop.approval]` policy is enforced; with no policy it is exactly
-    /// `resolve_gate`. The broker is cloned out first so it does not borrow `self`
-    /// while `self` is mutated by the chokepoint.
+    /// `resolve_gate` for a `WaitingApproval` run or the historical checkpoint
+    /// resolver for a `PausedCheckpoint` run. The broker is cloned out first so it
+    /// does not borrow `self` while `self` is mutated by the chokepoint.
     pub fn resolve_via_broker(
         &mut self,
         run_id: &str,
@@ -177,34 +178,26 @@ impl SopEngine {
         principal: super::approval::ApprovalPrincipal,
     ) -> Result<super::approval::BrokerOutcome> {
         let broker = Arc::clone(&self.approval_broker);
-        let outcome = broker.resolve(self, run_id, decision.clone(), principal.clone())?;
-        // Deterministic-checkpoint bridge: the broker owns only `WaitingApproval`
-        // gates and reports NotWaiting for a run paused at a checkpoint. Resolve
-        // the checkpoint HERE, at the same chokepoint, so every surface that
-        // routes through it (gateway HTTP/WS, loopback CLI, the `sop_approve`
-        // agent tool) gets identical audited behavior — including driving the
-        // resumed deterministic segment headlessly, since capability steps need
-        // no live agent turn. Checkpoints remain unpoliced (no membership/quorum;
-        // an in-band pause, matching the historical `approve_step` semantics) but
-        // ARE ledger-audited like any other gate resolution.
-        let not_waiting = matches!(
-            outcome,
-            super::approval::BrokerOutcome::NotWaiting
-                | super::approval::BrokerOutcome::Resolved(
-                    super::approval::ResolveOutcome::NotWaiting
-                )
-        );
-        if !not_waiting {
-            return Ok(outcome);
-        }
-        let is_checkpoint = self
+
+        // Deterministic-checkpoint bridge: a `PausedCheckpoint` is the same
+        // public-mutation guard as an approval gate when its step names a policy.
+        // Authorize the current checkpoint policy first, including membership and
+        // quorum, then resolve the checkpoint at the existing audited resolver.
+        // With no named policy this remains the historical pass-through.
+        if let Some(step) = self
             .active_runs
             .get(run_id)
-            .is_some_and(|r| r.status == SopRunStatus::PausedCheckpoint);
-        if !is_checkpoint {
-            return Ok(outcome);
+            .and_then(|r| (r.status == SopRunStatus::PausedCheckpoint).then_some(r.current_step))
+        {
+            if let Some(outcome) =
+                broker.authorize_checkpoint(self, run_id, step, &decision, &principal)?
+            {
+                return Ok(outcome);
+            }
+            return self.resolve_checkpoint(run_id, decision, principal);
         }
-        self.resolve_checkpoint(run_id, decision, principal)
+
+        broker.resolve(self, run_id, decision, principal)
     }
 
     /// Resolve a run paused at a deterministic checkpoint from an out-of-band (or
