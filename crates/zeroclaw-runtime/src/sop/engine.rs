@@ -2646,6 +2646,33 @@ impl SopEngine {
         )
     }
 
+    fn forge_comment_authorized_by_prior_checkpoint(
+        &self,
+        sop: &Sop,
+        run_id: &str,
+        step_number: u32,
+    ) -> bool {
+        let Some(run) = self.active_runs.get(run_id) else {
+            return false;
+        };
+        let has_completed_checkpoint = run.step_results.iter().any(|result| {
+            result.status == SopStepStatus::Completed
+                && result.step_number < step_number
+                && sop.steps.iter().any(|step| {
+                    step.number == result.step_number && step.kind == SopStepKind::Checkpoint
+                })
+        });
+        if !has_completed_checkpoint {
+            return false;
+        }
+
+        self.run_events(run_id).is_ok_and(|events| {
+            events
+                .iter()
+                .any(|event| event.kind.as_str() == "gate_resolved")
+        })
+    }
+
     fn execute_capability_step(
         &mut self,
         sop: &Sop,
@@ -2654,6 +2681,26 @@ impl SopEngine {
         input: serde_json::Value,
     ) -> Result<SopRunAction> {
         let started_at = now_iso8601();
+        if step.capability_id() == Some("forge.comment")
+            && !self.forge_comment_authorized_by_prior_checkpoint(sop, run_id, step.number)
+        {
+            self.metrics.record_capability_executed(&sop.name);
+            let completed_at = Some(now_iso8601());
+            let error =
+                "forge.comment requires a completed, ledger-audited checkpoint before execution"
+                    .to_string();
+            return self.record_deterministic_step_result(
+                run_id,
+                sop,
+                step,
+                SopStepStatus::Failed,
+                error.clone(),
+                serde_json::Value::String(error),
+                started_at,
+                completed_at,
+            );
+        }
+
         let ctx = super::capability::CapabilityContext {
             run_id: run_id.to_string(),
             sop_name: sop.name.clone(),
@@ -8436,6 +8483,97 @@ type = "manual"
         }
     }
 
+    struct CountingForgeCommentAdapter {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl super::super::capability::ForgeCommentAdapter for CountingForgeCommentAdapter {
+        fn post_comment(
+            &self,
+            _channel: Option<&str>,
+            _repo: &str,
+            _number: u64,
+            _body: &str,
+        ) -> std::result::Result<(), String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn forge_comment_registry(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<SopCapabilityRegistry> {
+        let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+        let adapter: Arc<dyn super::super::capability::ForgeCommentAdapter> =
+            Arc::new(CountingForgeCommentAdapter { calls });
+        registry.register(super::super::capability::ForgeCommentCapability::new(Some(
+            adapter,
+        )));
+        Arc::new(registry)
+    }
+
+    fn forge_comment_step(number: u32) -> SopStep {
+        SopStep {
+            number,
+            title: format!("Forge comment {number}"),
+            kind: SopStepKind::Capability,
+            capability: Some("forge.comment".into()),
+            capability_input: Some(serde_json::json!({
+                "channel": "git.main",
+                "repo": "o/r",
+                "number": 7,
+                "body": "triage approved",
+            })),
+            ..SopStep::default()
+        }
+    }
+
+    fn direct_forge_comment_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "forge without checkpoint".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![forge_comment_step(1)],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn checkpoint_forge_comment_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "checkpoint -> forge".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                forge_comment_step(2),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
     #[test]
     fn intake_gate_pipeline_pipes_the_trigger_payload_through_a_step_one_checkpoint() {
         // Marc's double-HITL shape: `checkpoint -> capability -> ...`. The
@@ -8520,6 +8658,89 @@ type = "manual"
             serde_json::json!({"repo": "o/r", "number": 7}),
             "the trigger payload must survive the step-1 checkpoint"
         );
+    }
+
+    #[test]
+    fn forge_comment_refuses_without_prior_ledgered_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![direct_forge_comment_sop("forge-direct")])
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine.start_run("forge-direct", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let final_action = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("direct forge run should fail closed");
+
+        assert!(
+            matches!(final_action, SopRunAction::Failed { .. }),
+            "direct forge.comment must fail closed, got {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forge adapter must not be called before a ledgered checkpoint"
+        );
+        let run = engine
+            .last_finished_run("forge-direct")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 1)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains("ledger-audited checkpoint"),
+            "failure should name the missing authorization invariant: {result:?}"
+        );
+    }
+
+    #[test]
+    fn forge_comment_runs_after_checkpoint_resolution() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![checkpoint_forge_comment_sop("forge-approved")])
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine.start_run("forge-approved", manual_event()).unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "forge run must park at the checkpoint before writing: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+
+        assert!(
+            matches!(*final_action, SopRunAction::Completed { .. }),
+            "approved forge tail must complete headlessly: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "forge adapter should run exactly once after checkpoint approval"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "checkpoint resolution must append the ledger row before forge.comment executes: {events:?}"
+        );
+        let run = engine
+            .last_finished_run("forge-approved")
+            .expect("run reached the finished list");
+        assert_eq!(run.status, SopRunStatus::Completed);
     }
 
     #[test]

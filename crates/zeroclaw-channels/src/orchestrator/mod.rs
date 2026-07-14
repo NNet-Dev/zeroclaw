@@ -6533,7 +6533,7 @@ fn channel_key_for_message(msg: &zeroclaw_api::channel::ChannelMessage) -> Strin
 fn text_gate_reply_matches_request_route(
     engine: &zeroclaw_runtime::sop::SopEngine,
     run_id: &str,
-    channel_key: &str,
+    channel_route_keys: &[String],
     reply_target: &str,
 ) -> bool {
     let Some(policy_name) = engine.current_step_policy_name(run_id) else {
@@ -6555,7 +6555,10 @@ fn text_gate_reply_matches_request_route(
         return false;
     };
 
-    route_channel_key == channel_key && route_recipient == reply_target
+    channel_route_keys
+        .iter()
+        .any(|channel_key| channel_key == route_channel_key)
+        && route_recipient == reply_target
 }
 
 /// Resolve a SOP gate answered from a chat channel. Two answer forms converge
@@ -6575,6 +6578,7 @@ async fn dispatch_channel_sop_gate(
     router: &AgentRouter,
     msg: &zeroclaw_api::channel::ChannelMessage,
     gate_channel: Option<Arc<dyn Channel>>,
+    gate_channel_route_keys: &[String],
 ) -> bool {
     const MARKER_PREFIX: &str = "sop.gate:";
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6630,9 +6634,15 @@ async fn dispatch_channel_sop_gate(
 
     let (ref_run, ref_rev) = parse_gate_reference(&reference);
     let channel_key = channel_key_for_message(msg);
+    let mut channel_route_keys = gate_channel_route_keys.to_vec();
+    if !channel_route_keys
+        .iter()
+        .any(|route_key| route_key == &channel_key)
+    {
+        channel_route_keys.push(channel_key.clone());
+    }
 
-    // Resolve against runs actually parked on a human. Marker messages keep the
-    // legacy suffix-compatible lookup for stale button payloads, but plain text
+    // Resolve against runs actually parked on a human. Both marker and plain text
     // replies must carry the full run id minted in the prompt. For the TEXT form
     // a non-match means "not a gate answer" — fall through to the agent; a marker
     // non-match is consumed (stale buttons after the run ended). A matched run
@@ -6652,16 +6662,13 @@ async fn dispatch_channel_sop_gate(
         });
         let matched: Vec<(String, u32, bool)> = candidates
             .by_ref()
-            .filter(|r| match form {
-                Form::Marker => r.run_id == ref_run || r.run_id.ends_with(&ref_run),
-                Form::Text => r.run_id == ref_run,
-            })
+            .filter(|r| r.run_id == ref_run)
             .map(|r| {
                 let text_admissible = matches!(form, Form::Marker)
                     || text_gate_reply_matches_request_route(
                         &guard,
                         &r.run_id,
-                        &channel_key,
+                        &channel_route_keys,
                         &msg.reply_target,
                     );
                 (r.run_id.clone(), r.revision, text_admissible)
@@ -6835,8 +6842,7 @@ async fn dispatch_channel_sop_gate(
                 _ => None,
             };
             // Finalize by the prompt's CANONICAL reference (revision-qualified
-            // when > 0): the prompt registry is keyed by what was sent, while
-            // marker compatibility may have resolved by suffix.
+            // when > 0): the prompt registry is keyed by what was sent.
             let finalize_reference = if ref_rev == 0 {
                 run_id.clone()
             } else {
@@ -6973,7 +6979,24 @@ async fn run_message_dispatch_loop(
         // resolve a PARKED run and must never start one, so they are consumed
         // BEFORE SOP-event ingress and before any agent dispatch.
         let gate_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-        if dispatch_channel_sop_gate(&router, &msg, gate_channel).await {
+        let gate_channel_route_keys = gate_channel
+            .as_ref()
+            .map(|target| {
+                let mut keys: Vec<String> = ctx
+                    .channels_by_name
+                    .iter()
+                    .filter_map(|(key, channel)| Arc::ptr_eq(channel, target).then(|| key.clone()))
+                    .collect();
+                let inbound_key = channel_key_for_message(&msg);
+                if !keys.iter().any(|key| key == &inbound_key) {
+                    keys.push(inbound_key);
+                }
+                keys.sort();
+                keys.dedup();
+                keys
+            })
+            .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
+        if dispatch_channel_sop_gate(&router, &msg, gate_channel, &gate_channel_route_keys).await {
             continue;
         }
         if dispatch_channel_sop_event(&router, &msg).await {
@@ -26765,6 +26788,24 @@ Done."#;
             .map(|run| run.status)
     }
 
+    async fn dispatch_test_channel_sop_gate(
+        router: &AgentRouter,
+        msg: &ChannelMessage,
+        gate_channel: Option<Arc<dyn Channel>>,
+    ) -> bool {
+        let route_keys = vec![channel_key_for_message(msg)];
+        dispatch_channel_sop_gate(router, msg, gate_channel, &route_keys).await
+    }
+
+    async fn dispatch_test_channel_sop_gate_with_route_keys(
+        router: &AgentRouter,
+        msg: &ChannelMessage,
+        route_keys: &[&str],
+    ) -> bool {
+        let route_keys: Vec<String> = route_keys.iter().map(|key| (*key).to_string()).collect();
+        dispatch_channel_sop_gate(router, msg, None, &route_keys).await
+    }
+
     #[tokio::test]
     async fn dispatch_channel_sop_event_ignores_user_controlled_subject() {
         // An email-shaped message: the reserved prefix sits in the
@@ -26821,7 +26862,7 @@ Done."#;
         };
         let router = router_without_sop_engine();
         assert!(
-            dispatch_channel_sop_gate(&router, &msg, None).await,
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
             "a gate-click marker must be consumed, not become an agent turn"
         );
     }
@@ -26840,7 +26881,7 @@ Done."#;
         };
         let router = router_without_sop_engine();
         assert!(
-            !dispatch_channel_sop_gate(&router, &msg, None).await,
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
             "a text reply with no parked-run match must fall through to the agent"
         );
     }
@@ -26859,7 +26900,7 @@ Done."#;
         };
 
         assert!(
-            !dispatch_channel_sop_gate(&router, &msg, None).await,
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
             "text replies must not clear parked runs that never emitted a request-route prompt"
         );
         assert_eq!(
@@ -26883,7 +26924,7 @@ Done."#;
         };
 
         assert!(
-            !dispatch_channel_sop_gate(&router, &msg, None).await,
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
             "a text reply from the wrong room must fall through instead of resolving the gate"
         );
         assert_eq!(
@@ -26907,7 +26948,7 @@ Done."#;
         };
 
         assert!(
-            !dispatch_channel_sop_gate(&router, &msg, None).await,
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
             "text replies must not normalize a configured request_route differently from delivery"
         );
         assert_eq!(
@@ -26935,12 +26976,69 @@ Done."#;
         };
 
         assert!(
-            !dispatch_channel_sop_gate(&router, &msg, None).await,
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
             "plain text replies must carry the full prompt reference, not a short run-id suffix"
         );
         assert_eq!(
             active_run_status(&engine, &run_id),
             Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_marker_rejects_short_suffix_reference() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord.ops:room-1"));
+        assert!(
+            run_id.ends_with('1'),
+            "the deterministic test run id should exercise the old one-character suffix match: {run_id}"
+        );
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: String::new(),
+            internal_sop_event: Some("sop.gate:approve:1".to_string()),
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "a stale marker is consumed, but must not resolve by short run-id suffix"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_resolves_bare_singleton_request_route() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord:room-1"));
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate_with_route_keys(
+                &router,
+                &msg,
+                &["discord.ops", "discord"],
+            )
+            .await,
+            "a bare singleton route should resolve when it maps to the same channel instance"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::Running)
         );
     }
 
@@ -26959,7 +27057,7 @@ Done."#;
         };
 
         assert!(
-            dispatch_channel_sop_gate(&router, &msg, None).await,
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
             "a text reply from the request route remains a valid fallback answer"
         );
         assert_eq!(
@@ -27002,7 +27100,7 @@ Done."#;
             };
             let router = router_without_sop_engine();
             assert!(
-                dispatch_channel_sop_gate(&router, &msg, None).await,
+                dispatch_test_channel_sop_gate(&router, &msg, None).await,
                 "a {choice} marker must be consumed, not become an agent turn"
             );
         }
@@ -27022,7 +27120,7 @@ Done."#;
         };
         let router = router_without_sop_engine();
         assert!(
-            dispatch_channel_sop_gate(&router, &msg, None).await,
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
             "an unknown-choice marker must still be consumed"
         );
     }
@@ -27046,7 +27144,7 @@ Done."#;
             };
             let router = router_without_sop_engine();
             assert!(
-                !dispatch_channel_sop_gate(&router, &msg, None).await,
+                !dispatch_test_channel_sop_gate(&router, &msg, None).await,
                 "ordinary chat must fall through: {content:?}"
             );
         }
