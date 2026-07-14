@@ -225,9 +225,11 @@ impl SopEngine {
             .map(|r| r.current_step)
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
 
-        // Pre-flight every path that mutates the run BEFORE the ledger append
-        // (mirror `resolve_gate`): a resolution that cannot possibly succeed must
-        // fail closed with the run untouched and NO false `gate_resolved` audit row.
+        // Pre-flight every path that mutates the run BEFORE reacquiring the claim or
+        // appending the ledger row (mirror `resolve_gate`): a resolution that cannot
+        // possibly succeed must fail closed with the run untouched and NO false
+        // `gate_resolved` audit row.
+        let mut claim_reacquired = false;
         match &decision {
             ApprovalDecision::Approve => {
                 if self.is_park_persist_pending(run_id) {
@@ -237,6 +239,8 @@ impl SopEngine {
                     );
                 }
                 self.can_advance_deterministic_step(run_id)?;
+                self.reacquire_claim_on_resume(run_id)?;
+                claim_reacquired = true;
             }
             ApprovalDecision::Amend { .. } => {
                 if self.is_park_persist_pending(run_id) {
@@ -247,6 +251,8 @@ impl SopEngine {
                 }
                 self.can_advance_deterministic_step(run_id)?;
                 self.can_amend_checkpoint(run_id)?;
+                self.reacquire_claim_on_resume(run_id)?;
+                claim_reacquired = true;
             }
             ApprovalDecision::Revise { .. } => {
                 if self.is_park_persist_pending(run_id) {
@@ -260,8 +266,10 @@ impl SopEngine {
             ApprovalDecision::Deny { .. } => {}
         }
 
-        // Audit FIRST, fail-closed: the checkpoint cannot clear or cancel without
-        // its durable ledger row (same rule as the approval-gate chokepoint).
+        // Audit before mutating the checkpoint: the checkpoint cannot clear or cancel
+        // without its durable ledger row (same rule as the approval-gate chokepoint).
+        // Approve/Amend already secured the exec claim above, so a claim-store
+        // failure cannot leave a false `gate_resolved` row for a still-parked run.
         //
         // Revise is the exception: its "apply" includes an irreducibly-fallible
         // model call (the re-draft), so appending the resolved row HERE would
@@ -270,24 +278,26 @@ impl SopEngine {
         // draft exists and before the run is mutated — so a failed re-draft
         // records nothing and leaves the old draft parked.
         if !matches!(decision, ApprovalDecision::Revise { .. }) {
-            self.record_gate_event(GateLedgerEntry {
+            if let Err(e) = self.record_gate_event(GateLedgerEntry {
                 run_id: run_id.to_string(),
                 step,
                 kind: GateEventKind::Resolved,
                 decision: Some(decision.clone()),
                 principal: principal.clone(),
                 ts: now_iso8601(),
-            })
-            .map_err(|e| {
-                anyhow::Error::msg(format!(
+            }) {
+                if claim_reacquired {
+                    self.release_claim_on_park(run_id);
+                }
+                return Err(anyhow::Error::msg(format!(
                     "failed to persist checkpoint resolution ledger event (fail-closed): {e}"
-                ))
-            })?;
+                )));
+            }
         }
 
         match decision {
             ApprovalDecision::Approve => {
-                let first = self.approve_step(run_id)?;
+                let first = self.resume_checkpoint_with_reacquired_claim(run_id, None)?;
                 self.record_approval_metric(run_id, principal.is_system());
                 let final_action = self.drive_headless_deterministic(run_id, first)?;
                 Ok(super::approval::BrokerOutcome::Resolved(
@@ -301,7 +311,8 @@ impl SopEngine {
             // step keeps the model's original for the audit trail.
             ApprovalDecision::Amend { text } => {
                 let field = self.checkpoint_edit_field(run_id)?;
-                let first = self.resume_checkpoint(run_id, Some((field, text)))?;
+                let first =
+                    self.resume_checkpoint_with_reacquired_claim(run_id, Some((field, text)))?;
                 self.record_approval_metric(run_id, principal.is_system());
                 let final_action = self.drive_headless_deterministic(run_id, first)?;
                 Ok(super::approval::BrokerOutcome::Resolved(
@@ -1852,6 +1863,23 @@ impl SopEngine {
         run_id: &str,
         amend: Option<(String, String)>,
     ) -> Result<SopRunAction> {
+        self.resume_checkpoint_inner(run_id, amend, false)
+    }
+
+    fn resume_checkpoint_with_reacquired_claim(
+        &mut self,
+        run_id: &str,
+        amend: Option<(String, String)>,
+    ) -> Result<SopRunAction> {
+        self.resume_checkpoint_inner(run_id, amend, true)
+    }
+
+    fn resume_checkpoint_inner(
+        &mut self,
+        run_id: &str,
+        amend: Option<(String, String)>,
+        claim_already_reacquired: bool,
+    ) -> Result<SopRunAction> {
         let status = self
             .active_runs
             .get(run_id)
@@ -1892,7 +1920,9 @@ impl SopEngine {
         // A1: fail-closed - re-acquire the exec claim released when this run parked
         // BEFORE flipping it to Running; if it cannot, abort and leave the run paused
         // (re-resolvable) rather than execute uncounted.
-        self.reacquire_claim_on_resume(run_id)?;
+        if !claim_already_reacquired {
+            self.reacquire_claim_on_resume(run_id)?;
+        }
         // A deterministic run paused at a checkpoint resumes through the
         // deterministic piping path: the checkpoint step is recorded as
         // completed and its input (the previous step's output — or, for a
@@ -6985,6 +7015,83 @@ mod tests {
         assert!(
             !events.iter().any(|ev| ev.kind == "gate_resolved"),
             "a failed resume must not write a gate_resolved row"
+        );
+    }
+
+    #[test]
+    fn checkpoint_approve_reacquire_failure_writes_no_ledger() {
+        let store = std::sync::Arc::new(FailingReacquireStore {
+            inner: InMemoryRunStore::new(),
+        });
+        let mut engine =
+            engine_with_sops(vec![capability_checkpoint_sop("cp-claim")]).with_store(store);
+        let first = engine.start_run("cp-claim", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        let res = engine.resolve_via_broker(
+            &run_id,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(None),
+        );
+        assert!(
+            res.is_err(),
+            "checkpoint approve must abort when the exec claim cannot be re-acquired"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint,
+            "the checkpoint must stay parked and re-resolvable"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            !events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "a failed checkpoint approve must not write a gate_resolved row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_amend_reacquire_failure_writes_no_ledger() {
+        let store = std::sync::Arc::new(FailingReacquireStore {
+            inner: InMemoryRunStore::new(),
+        });
+        let mut engine =
+            engine_with_sops(vec![editable_checkpoint_sop("cp-amend-claim")]).with_store(store);
+        let first = engine
+            .start_run(
+                "cp-amend-claim",
+                payload_event(r#"{"body":"model draft","repo":"o/r"}"#),
+            )
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        let res = engine.resolve_via_broker(
+            &run_id,
+            ApprovalDecision::Amend {
+                text: "operator edit".into(),
+            },
+            ApprovalPrincipal::cli(None),
+        );
+        assert!(
+            res.is_err(),
+            "checkpoint amend must abort when the exec claim cannot be re-acquired"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint,
+            "the checkpoint must stay parked and re-resolvable"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            !events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "a failed checkpoint amend must not write a gate_resolved row: {events:?}"
         );
     }
 

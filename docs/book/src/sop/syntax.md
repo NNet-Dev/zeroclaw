@@ -126,6 +126,12 @@ approve/deny route, or the `sop_approve` agent tool). Routes fire only in the da
 (where channels are configured); leave them unset (or empty) to notify only the
 originating surface, which is the default.
 
+Approval groups that grant channel-native approvers must use the channel-qualified
+member form `channel:<channel-key>:<sender>`, for example
+`channel:discord.ops:123456789012345678`. Unscoped members such as `channel:123` or
+bare `123` do not match channel approvals because sender ids can overlap across
+platforms and channel aliases.
+
 ### Deterministic checkpoints: approval and resume
 
 A deterministic run paused at a `kind: checkpoint` step is resolved by the SAME

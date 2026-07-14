@@ -4191,8 +4191,18 @@ impl RpcDispatcher {
                 .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
         };
         match outcome {
-            crate::sop::approval::BrokerOutcome::Resolved(_)
+            crate::sop::approval::BrokerOutcome::Resolved(
+                crate::sop::approval::ResolveOutcome::Resumed(_)
+                | crate::sop::approval::ResolveOutcome::Denied
+                | crate::sop::approval::ResolveOutcome::Revised,
+            )
             | crate::sop::approval::BrokerOutcome::PendingQuorum { .. } => {}
+            crate::sop::approval::BrokerOutcome::Resolved(other) => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!("checkpoint decision rejected: {}", other.label()),
+                ));
+            }
             other => {
                 return Err(rpc_err(
                     INVALID_PARAMS,
@@ -5552,6 +5562,119 @@ mod tests {
                 "second RPC decision must resolve through the broker ledger path: {events:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rejects_approval_mode_rejection() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{ApprovalMode, Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        fn dispatcher_with_sop_engine(
+            config: Config,
+            engine: Arc<Mutex<crate::sop::SopEngine>>,
+        ) -> RpcDispatcher {
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+            dispatcher.set_tui_id_for_test(Some("alice".to_string()));
+            dispatcher
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            default_execution_mode: "deterministic".to_string(),
+            approval_mode: ApprovalMode::AgentTool,
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+
+        let sop = Sop {
+            name: "rpc-agent-tool-only".to_string(),
+            description: "rpc approval-mode checkpoint".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Policy gate".to_string(),
+                kind: SopStepKind::Checkpoint,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).expect("save temp SOP");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        let engine = Arc::new(Mutex::new(engine));
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-agent-tool-only",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start approval-mode SOP");
+            let SopRunAction::CheckpointWait { run_id, .. } = action else {
+                panic!("approval-mode SOP must park at checkpoint, got {action:?}");
+            };
+            run_id
+        };
+
+        let dispatcher = dispatcher_with_sop_engine(config, Arc::clone(&engine));
+        let err = dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-agent-tool-only",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("RPC principal must be rejected by approval_mode=agent_tool");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("rejected_self_approval"),
+            "approval_mode rejection must surface, got: {}",
+            err.message
+        );
+        let guard = engine.lock().expect("engine lock");
+        assert_eq!(
+            guard.get_run(&run_id).expect("run still active").status,
+            SopRunStatus::PausedCheckpoint
+        );
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "rejected RPC decision must not append a gate_resolved row"
+        );
     }
 
     #[test]
