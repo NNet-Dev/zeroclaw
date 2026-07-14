@@ -358,6 +358,13 @@ impl SopEngine {
         match self.store.load_active_runs() {
             Ok(runs) => {
                 let mut restored = 0usize;
+                // Parking is durable before its out-of-band notice is attempted. A
+                // daemon can therefore exit in the interval between those two
+                // operations; replay the existing request seam after restore so a
+                // parked gate cannot become invisible forever. Delivery is
+                // intentionally at-least-once and keeps the canonical gate
+                // reference, allowing adapters to de-duplicate it if needed.
+                let mut replay_parked_requests = Vec::new();
                 for pr in runs {
                     // A1: a run persisted while parked at a HITL approval / paused at
                     // a deterministic checkpoint holds NO exec claim - it released its
@@ -410,13 +417,19 @@ impl SopEngine {
                         );
                         continue;
                     }
-                    if self
-                        .active_runs
-                        .insert(pr.run.run_id.clone(), pr.run)
-                        .is_none()
-                    {
+                    let run_id = pr.run.run_id.clone();
+                    if self.active_runs.insert(run_id.clone(), pr.run).is_none() {
                         restored += 1;
+                        if parked {
+                            replay_parked_requests.push(run_id);
+                        }
                     }
+                }
+                // Reuse the same policy resolution and request construction used
+                // by a newly parked run. Restored runs already released any claim,
+                // so this is delivery recovery only, not another park transition.
+                for run_id in replay_parked_requests {
+                    self.notify_park_request(&run_id);
                 }
                 if restored > 0 {
                     let span = ::zeroclaw_log::info_span!(
@@ -11220,6 +11233,66 @@ type = "manual"
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn restored_policied_checkpoint_replays_request_route() {
+        use zeroclaw_config::schema::ApprovalPolicyConfig;
+
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let broker = std::sync::Arc::new(crate::sop::approval::ApprovalBroker::with_route(adapter));
+        let mut config = SopConfig::default();
+        config.approval.policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 0,
+                request_route: Some("discord.ops:123456789".to_string()),
+                escalation_route: None,
+            },
+        );
+        let mut sop = deterministic_sop("det-restore-route");
+        sop.steps[1].policy = Some("prod".to_string());
+
+        let mut source = engine_with_config_sops(config.clone(), vec![sop.clone()])
+            .with_store(store.clone())
+            .with_approval_broker(broker.clone());
+        let action = source
+            .start_run("det-restore-route", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let action = source
+            .advance_deterministic_step(&run_id, serde_json::json!({"step": 1}), None)
+            .unwrap();
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+        assert_eq!(calls.lock().unwrap().len(), 1, "initial park delivers once");
+
+        // Model a daemon exit after persistence but before the external adapter's
+        // fire-and-forget delivery completes. Only the restored engine may send.
+        calls.lock().unwrap().clear();
+        let mut restarted = engine_with_config_sops(config, vec![sop])
+            .with_store(store)
+            .with_approval_broker(broker);
+        restarted.restore_runs();
+
+        assert_eq!(
+            restarted.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [(
+                "discord.ops:123456789".to_string(),
+                run_id,
+                "det-restore-route".to_string(),
+                2
+            )],
+            "restore replays the persisted checkpoint through its request route"
+        );
     }
 
     #[test]
