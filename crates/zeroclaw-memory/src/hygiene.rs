@@ -89,10 +89,9 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
     report.pruned_daily_rows += budget_report.daily_rows;
     report.pruned_core_rows += budget_report.core_rows;
 
-    // Prune audit entries if audit is enabled.
-    if config.audit_enabled
-        && let Err(e) = prune_audit_entries(workspace_dir, config.audit_retention_days)
-    {
+    // Retention cleanup is independent from new audit collection: disabling
+    // audit stops new rows, but existing sensitive rows still honor retention.
+    if let Err(e) = prune_audit_entries(workspace_dir, config.audit_retention_days) {
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -991,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_audit_rows_alone_when_audit_disabled() {
+    fn prunes_existing_audit_rows_when_audit_disabled() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path();
         let db_path = seed_audit_db(workspace);
@@ -1002,8 +1001,24 @@ mod tests {
 
         assert_eq!(
             audit_row_count(&db_path),
-            2,
-            "hygiene must not touch the audit db while audit is disabled"
+            1,
+            "disabling collection must not disable retention for existing audit rows"
+        );
+    }
+
+    #[test]
+    fn disabled_audit_does_not_create_missing_audit_db_for_pruning() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let audit_db = workspace.join("memory").join("audit.db");
+
+        let cfg = default_cfg();
+        assert!(!cfg.audit_enabled);
+        run_if_due(&cfg, workspace).unwrap();
+
+        assert!(
+            !audit_db.exists(),
+            "default-off audit must not create an audit db just to prune"
         );
     }
 }

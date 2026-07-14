@@ -14,6 +14,81 @@ use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(unix)]
+fn ensure_owner_only_dir(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_owner_only_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_owner_only_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if !path.exists() {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_owner_only_file(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_os_string();
+    path.push(suffix);
+    path.into()
+}
+
+#[cfg(unix)]
+fn harden_existing_sqlite_sidecars(db_path: &Path) -> anyhow::Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(db_path, suffix);
+        if sidecar.exists() {
+            ensure_owner_only_file(&sidecar)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_existing_sqlite_sidecars(_db_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 /// Audit log entry operations.
 #[derive(Debug, Clone, Copy)]
 pub enum AuditOp {
@@ -59,8 +134,9 @@ impl<M: Memory> AuditedMemory<M> {
     pub fn new(inner: M, workspace_dir: &Path) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("audit.db");
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            ensure_owner_only_dir(parent)?;
         }
+        ensure_owner_only_file(&db_path)?;
 
         let conn = Connection::open(&db_path)?;
         conn.execute_batch(
@@ -78,6 +154,8 @@ impl<M: Memory> AuditedMemory<M> {
              CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON memory_audit(timestamp);
              CREATE INDEX IF NOT EXISTS idx_audit_operation ON memory_audit(operation);",
         )?;
+        ensure_owner_only_file(&db_path)?;
+        harden_existing_sqlite_sidecars(&db_path)?;
 
         Ok(Self {
             inner,
@@ -535,6 +613,58 @@ mod tests {
         let pruned = audited.prune_older_than(30).unwrap();
         assert_eq!(pruned, 1);
         assert_eq!(audited.audit_count().unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audited_memory_hardens_existing_audit_storage_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let db_path = memory_dir.join("audit.db");
+        let seeding_conn = Connection::open(&db_path).unwrap();
+        seeding_conn
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE IF NOT EXISTS memory_audit (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     operation TEXT NOT NULL,
+                     key TEXT,
+                     namespace TEXT,
+                     session_id TEXT,
+                     timestamp TEXT NOT NULL,
+                     metadata TEXT
+                 );
+                 INSERT INTO memory_audit (operation, timestamp) VALUES ('store', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar_path(&db_path, suffix);
+            if sidecar.exists() {
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o666)).unwrap();
+            }
+        }
+
+        let _audited = AuditedMemory::new(NoneMemory::new("none"), tmp.path()).unwrap();
+
+        assert_eq!(mode(&memory_dir), 0o700);
+        assert_eq!(mode(&db_path), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar_path(&db_path, suffix);
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600);
+            }
+        }
     }
 
     #[tokio::test]
