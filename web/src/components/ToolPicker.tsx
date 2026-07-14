@@ -17,8 +17,10 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, X, Wrench, Terminal } from 'lucide-react';
-import { loadToolCatalog, peekToolCatalog, type CatalogEntry } from '@/lib/toolCatalog';
+import { loadToolCatalog, peekToolCatalog, type CatalogEntry as ToolCatalogEntry } from '@/lib/toolCatalog';
 import { t } from '@/lib/i18n';
+
+export { loadToolCatalog as loadCatalog, type CatalogEntry } from '@/lib/toolCatalog';
 
 export interface ToolPickerProps {
   /** Currently-selected tool names. Order is preserved on toggle. */
@@ -48,7 +50,7 @@ export default function ToolPicker({
   agent,
 }: ToolPickerProps) {
   const cacheKey = agent ?? '';
-  const [catalog, setCatalog] = useState<CatalogEntry[] | null>(
+  const [catalog, setCatalog] = useState<ToolCatalogEntry[] | null>(
     () => peekToolCatalog(cacheKey),
   );
   const [loading, setLoading] = useState(() => peekToolCatalog(cacheKey) === null);
@@ -89,7 +91,7 @@ export default function ToolPicker({
 
   // Fast membership lookups for the catalog and the current selection.
   const byName = useMemo(() => {
-    const map = new Map<string, CatalogEntry>();
+    const map = new Map<string, ToolCatalogEntry>();
     for (const e of catalog ?? []) map.set(e.name, e);
     return map;
   }, [catalog]);
@@ -117,7 +119,7 @@ export default function ToolPicker({
   // entry is already selected, deselect them all; otherwise add the missing
   // ones. Operates on the filtered list so it honors an active search, and
   // matches the count shown in the group header.
-  const toggleAll = (entries: CatalogEntry[]) => {
+  const toggleAll = (entries: ToolCatalogEntry[]) => {
     if (disabled || entries.length === 0) return;
     const names = entries.map((e) => e.name);
     const allSelected = names.every((n) => selectedSet.has(n));

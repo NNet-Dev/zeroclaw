@@ -3,7 +3,7 @@
 // place that fetches and caches it so the two components (and anything else
 // that needs the catalog) stay in sync instead of hitting the network twice.
 
-import type { ToolSpec, CliTool } from "@/types/api";
+import type { ToolSpec, CliTool, OptionDomain } from "@/types/api";
 import { getTools, getCliTools } from "@/lib/api";
 
 /** A flattened, group-tagged catalog entry. */
@@ -11,6 +11,12 @@ export interface CatalogEntry {
   name: string;
   description: string;
   group: "agent" | "cli";
+  /** JSON Schema for the tool's args (agent tools only; CLI tools omit it). */
+  parameters?: unknown;
+  /** Declared structured-output schema, when the tool declares one. */
+  output?: unknown;
+  /** Parameter name -> runtime option domain, for domain-typed params. */
+  param_domains?: Record<string, OptionDomain>;
 }
 
 // Process-wide cache so re-mounting a consumer (e.g. reopening the Cron
@@ -45,12 +51,29 @@ export function loadToolCatalog(agent?: string): Promise<CatalogEntry[]> {
   if (cached) return Promise.resolve(cached);
   const inflight = catalogInflight.get(key);
   if (inflight) return inflight;
-  const promise = Promise.all([getTools(agent), getCliTools()])
-    .then(([tools, cliTools]) => {
+  const promise = Promise.allSettled([getTools(agent), getCliTools()])
+    .then(([toolsResult, cliToolsResult]) => {
+      if (toolsResult.status === "rejected" && cliToolsResult.status === "rejected") {
+        const toolsMessage =
+          toolsResult.reason instanceof Error
+            ? toolsResult.reason.message
+            : String(toolsResult.reason);
+        const cliMessage =
+          cliToolsResult.reason instanceof Error
+            ? cliToolsResult.reason.message
+            : String(cliToolsResult.reason);
+        throw new Error(`${toolsMessage}; ${cliMessage}`);
+      }
+
+      const tools = toolsResult.status === "fulfilled" ? toolsResult.value : [];
+      const cliTools = cliToolsResult.status === "fulfilled" ? cliToolsResult.value : [];
       const agentEntries: CatalogEntry[] = tools.map((tnt: ToolSpec) => ({
         name: tnt.name,
         description: tnt.description,
         group: "agent" as const,
+        parameters: tnt.parameters,
+        output: tnt.output,
+        param_domains: tnt.param_domains,
       }));
       const cli: CatalogEntry[] = cliTools.map((c: CliTool) => ({
         name: c.name,
