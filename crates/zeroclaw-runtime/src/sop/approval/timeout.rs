@@ -113,9 +113,10 @@ fn log_terminal_skip(run_id: &str, action: &str, e: &impl std::fmt::Display) {
     );
 }
 
-/// EPIC G (Phase 10): deliver a timeout escalation notice to the second route named
-/// by the waiting step's approval policy, if any. Best-effort - a missing policy,
-/// missing route, or delivery error never affects the (still-open) gate.
+/// EPIC G (Phase 10): deliver a timeout escalation notice to the policy's explicit
+/// escalation route, or re-surface it to the request route when no distinct route
+/// is configured. Best-effort - a missing policy, missing route, or delivery error
+/// never affects the (still-open) gate.
 fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
     let Some(run) = engine.get_run(run_id) else {
         return;
@@ -126,7 +127,7 @@ fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
         return;
     };
     let broker = engine.approval_broker();
-    if let Some(route) = broker.escalation_route(engine.approval_config(), &policy_name) {
+    if let Some(route) = broker.escalation_delivery_route(engine.approval_config(), &policy_name) {
         broker.deliver_escalation(
             &route,
             &super::GateNotice {

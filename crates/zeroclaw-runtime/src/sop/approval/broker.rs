@@ -178,10 +178,10 @@ impl ApprovalBroker {
         Self::with_route(Arc::new(NoopRouteAdapter))
     }
 
-    /// The escalation route for a named policy (Phase 10), read from live config.
-    /// An empty string is treated the same as `None` (re-surface to the same
-    /// route) - the config contract says "`None`/empty" - so a blank
-    /// `escalation_route = ""` does not route a timeout notice nowhere.
+    /// The explicit escalation route for a named policy (Phase 10), read from live
+    /// config. An empty string is treated the same as `None`; callers that deliver
+    /// a timeout notice must use [`escalation_delivery_route`](Self::escalation_delivery_route)
+    /// to apply the request-route fallback promised by the config contract.
     pub fn escalation_route(&self, cfg: &SopApprovalConfig, policy_name: &str) -> Option<String> {
         cfg.policies
             .get(policy_name)
@@ -216,6 +216,34 @@ impl ApprovalBroker {
             .get(policy_name)
             .and_then(|p| p.request_route.clone())
             .filter(|r| !r.is_empty())
+    }
+
+    /// The route a timeout escalation actually delivers to: an explicit escalation
+    /// route when present, otherwise the initial request route. `None` means the
+    /// policy has no out-of-band route to re-surface.
+    pub fn escalation_delivery_route(
+        &self,
+        cfg: &SopApprovalConfig,
+        policy_name: &str,
+    ) -> Option<String> {
+        self.escalation_route(cfg, policy_name)
+            .or_else(|| self.request_route(cfg, policy_name))
+    }
+
+    /// Every route that can receive approval reply instructions for a policy's
+    /// current gate. The request route is first; a distinct effective escalation
+    /// route follows. Text fallback admission uses this exact set so it cannot
+    /// drift from timeout delivery semantics.
+    pub fn reply_routes(&self, cfg: &SopApprovalConfig, policy_name: &str) -> Vec<String> {
+        let request = self.request_route(cfg, policy_name);
+        let escalation = self.escalation_delivery_route(cfg, policy_name);
+        match (request, escalation) {
+            (Some(request), Some(escalation)) if request == escalation => vec![request],
+            (Some(request), Some(escalation)) => vec![request, escalation],
+            (Some(request), None) => vec![request],
+            (None, Some(escalation)) => vec![escalation],
+            (None, None) => Vec::new(),
+        }
     }
 
     /// Deliver the initial approval-request notice to a route (best-effort). Fired
@@ -1533,6 +1561,66 @@ mod tests {
             broker.request_route(&cfg, "absent"),
             None,
             "an unknown policy has no request_route"
+        );
+    }
+
+    #[test]
+    fn reply_routes_match_request_and_effective_escalation_delivery() {
+        let mut policies = HashMap::new();
+        policies.insert(
+            "fallback".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                request_route: Some("discord.ops:123".to_string()),
+                escalation_route: None,
+            },
+        );
+        policies.insert(
+            "separate".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                request_route: Some("discord.ops:123".to_string()),
+                escalation_route: Some("discord.oncall:456".to_string()),
+            },
+        );
+        policies.insert(
+            "escalation_only".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                request_route: None,
+                escalation_route: Some("discord.oncall:456".to_string()),
+            },
+        );
+        let cfg = SopApprovalConfig {
+            groups: HashMap::new(),
+            policies,
+        };
+        let broker = ApprovalBroker::disabled();
+
+        assert_eq!(
+            broker
+                .escalation_delivery_route(&cfg, "fallback")
+                .as_deref(),
+            Some("discord.ops:123"),
+            "an unset escalation route re-surfaces to the request route"
+        );
+        assert_eq!(
+            broker.reply_routes(&cfg, "fallback"),
+            vec!["discord.ops:123"],
+            "the same route is listed once"
+        );
+        assert_eq!(
+            broker.reply_routes(&cfg, "separate"),
+            vec!["discord.ops:123", "discord.oncall:456"],
+            "text replies are admitted from both routes that can present the gate"
+        );
+        assert_eq!(
+            broker.reply_routes(&cfg, "escalation_only"),
+            vec!["discord.oncall:456"],
+            "an explicit escalation route remains answerable without an initial route"
         );
     }
 

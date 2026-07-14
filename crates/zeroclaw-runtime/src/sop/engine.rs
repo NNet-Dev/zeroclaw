@@ -6980,6 +6980,36 @@ mod tests {
     }
 
     #[test]
+    fn timeout_escalation_without_distinct_route_resurfaces_request_route() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let mut engine = policied_supervised_engine(Some("discord.ops:123456789"), adapter);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+        calls.lock().unwrap().clear();
+
+        crate::sop::approval::timeout::apply_timeout_action(
+            &mut engine,
+            &run_id,
+            zeroclaw_config::schema::ApprovalTimeoutAction::Escalate,
+        );
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [(
+                "discord.ops:123456789".to_string(),
+                run_id,
+                "s1".to_string(),
+                1
+            )],
+            "an unset escalation_route must re-surface the gate to request_route"
+        );
+    }
+
+    #[test]
     fn maintenance_tick_fires_fail_closed_timeout() {
         // EPIC A1: the daemon tick drives check_approval_timeouts. An overdue gate
         // under the default fail-closed Escalate stays WaitingApproval (no

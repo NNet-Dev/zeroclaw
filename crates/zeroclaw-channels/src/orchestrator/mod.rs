@@ -6530,7 +6530,7 @@ fn channel_key_for_message(msg: &zeroclaw_api::channel::ChannelMessage) -> Strin
     }
 }
 
-fn text_gate_reply_matches_request_route(
+fn text_gate_reply_matches_approval_route(
     engine: &zeroclaw_runtime::sop::SopEngine,
     run_id: &str,
     channel_route_keys: &[String],
@@ -6539,26 +6539,21 @@ fn text_gate_reply_matches_request_route(
     let Some(policy_name) = engine.current_step_policy_name(run_id) else {
         return false;
     };
-    let Some(policy) = engine.approval_config().policies.get(&policy_name) else {
-        return false;
-    };
-    let Some(route) = policy
-        .request_route
-        .as_deref()
-        .filter(|route| !route.is_empty())
-    else {
-        return false;
-    };
-    let Some((route_channel_key, route_recipient)) =
-        zeroclaw_runtime::sop::approval::channel_route::parse_approval_route(route)
-    else {
-        return false;
-    };
-
-    channel_route_keys
+    let broker = engine.approval_broker();
+    broker
+        .reply_routes(engine.approval_config(), &policy_name)
         .iter()
-        .any(|channel_key| channel_key == route_channel_key)
-        && route_recipient == reply_target
+        .any(|route| {
+            let Some((route_channel_key, route_recipient)) =
+                zeroclaw_runtime::sop::approval::channel_route::parse_approval_route(route)
+            else {
+                return false;
+            };
+            channel_route_keys
+                .iter()
+                .any(|channel_key| channel_key == route_channel_key)
+                && route_recipient == reply_target
+        })
 }
 
 /// Resolve a SOP gate answered from a chat channel. Two answer forms converge
@@ -6569,8 +6564,8 @@ fn text_gate_reply_matches_request_route(
 ///   text, same guarantee as the git producer's SOP-event marker);
 /// - a plain `<choice> <reference>` text reply (the fallback prompt tells the
 ///   operator to send exactly this) — consumed ONLY when the reference matches a
-///   run actually parked on a human AND the run's current policy delivered its
-///   request prompt to this same channel route. Ordinary conversation and
+///   run actually parked on a human AND the run's current policy can deliver its
+///   approval prompt to this same channel route. Ordinary conversation and
 ///   unauthorised channel traffic never get swallowed.
 ///
 /// Returns `true` when the message was consumed as a gate answer.
@@ -6647,8 +6642,8 @@ async fn dispatch_channel_sop_gate(
     // a non-match means "not a gate answer" — fall through to the agent; a marker
     // non-match is consumed (stale buttons after the run ended). A matched run
     // whose CURRENT revision differs from the reference's is superseded, but text
-    // replies must first prove they came through the request route that actually
-    // presented fallback instructions.
+    // replies must first prove they came through a policy route that can present
+    // fallback instructions.
     let resolved = {
         let Ok(guard) = engine.lock() else {
             return matches!(form, Form::Marker);
@@ -6665,7 +6660,7 @@ async fn dispatch_channel_sop_gate(
             .filter(|r| r.run_id == ref_run)
             .map(|r| {
                 let text_admissible = matches!(form, Form::Marker)
-                    || text_gate_reply_matches_request_route(
+                    || text_gate_reply_matches_approval_route(
                         &guard,
                         &r.run_id,
                         &channel_route_keys,
@@ -6690,7 +6685,7 @@ async fn dispatch_channel_sop_gate(
                     "reply_target": msg.reply_target.as_str(),
                 })
             ),
-            "channel SOP-gate text reply did not match the gate request route"
+            "channel SOP-gate text reply did not match a gate approval route"
         );
         return false;
     }
@@ -26735,13 +26730,17 @@ Done."#;
         }
     }
 
-    fn channel_gate_config(request_route: Option<&str>) -> zeroclaw_config::schema::SopConfig {
+    fn channel_gate_config_with_routes(
+        request_route: Option<&str>,
+        escalation_route: Option<&str>,
+    ) -> zeroclaw_config::schema::SopConfig {
         let mut config = zeroclaw_config::schema::SopConfig::default();
-        if let Some(route) = request_route {
+        if request_route.is_some() || escalation_route.is_some() {
             config.approval.policies.insert(
                 "prod".to_string(),
                 zeroclaw_config::schema::ApprovalPolicyConfig {
-                    request_route: Some(route.to_string()),
+                    request_route: request_route.map(str::to_string),
+                    escalation_route: escalation_route.map(str::to_string),
                     ..zeroclaw_config::schema::ApprovalPolicyConfig::default()
                 },
             );
@@ -26757,7 +26756,22 @@ Done."#;
         Arc<Mutex<zeroclaw_runtime::sop::SopEngine>>,
         String,
     ) {
-        let mut engine = zeroclaw_runtime::sop::SopEngine::new(channel_gate_config(request_route));
+        parked_channel_gate_router_with_routes(policy, request_route, None)
+    }
+
+    fn parked_channel_gate_router_with_routes(
+        policy: Option<&str>,
+        request_route: Option<&str>,
+        escalation_route: Option<&str>,
+    ) -> (
+        AgentRouter,
+        Arc<Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        String,
+    ) {
+        let mut engine = zeroclaw_runtime::sop::SopEngine::new(channel_gate_config_with_routes(
+            request_route,
+            escalation_route,
+        ));
         engine.set_sops_for_test(vec![channel_gate_sop(policy)]);
         let action = engine
             .start_run("channel-gate", manual_sop_event())
@@ -27059,6 +27073,33 @@ Done."#;
         assert!(
             dispatch_test_channel_sop_gate(&router, &msg, None).await,
             "a text reply from the request route remains a valid fallback answer"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::Running)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_resolves_matching_escalation_route() {
+        let (router, engine, run_id) = parked_channel_gate_router_with_routes(
+            Some("prod"),
+            Some("discord.ops:room-1"),
+            Some("discord.oncall:room-2"),
+        );
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("oncall".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-2".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-2", "", "discord", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "a text reply from the route that receives escalation instructions must resolve"
         );
         assert_eq!(
             active_run_status(&engine, &run_id),
