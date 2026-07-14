@@ -2753,6 +2753,11 @@ impl SopEngine {
                         .get("checkpoint_revision")
                         .and_then(|value| value.as_u64())
                         == Some(u64::from(checkpoint_revision))
+                    && event
+                        .payload
+                        .get("source")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|source| source != "agent" && source != "system")
                     && matches!(
                         event
                             .payload
@@ -9167,6 +9172,66 @@ type = "manual"
         assert_eq!(run.status, SopRunStatus::Completed);
     }
 
+    #[test]
+    fn forge_comment_rejects_agent_resolved_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![checkpoint_forge_comment_sop("forge-agent")])
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-agent", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "forge run must park at the checkpoint before writing: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::agent("triage-agent"),
+            )
+            .expect("agent checkpoint approve resolves through default approval mode");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+
+        assert!(
+            matches!(*final_action, SopRunAction::Failed { .. }),
+            "agent-cleared checkpoint must not authorize forge.comment: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forge adapter must not run after an agent-sourced checkpoint approval"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("source").and_then(|value| value.as_str()) == Some("agent")
+            }),
+            "test must prove the rejected ledger row was agent-sourced: {events:?}"
+        );
+        let run = engine
+            .last_finished_run("forge-agent")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 2)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains("immediately preceding checkpoint"),
+            "failure should name the checkpoint authorization invariant: {result:?}"
+        );
+    }
     #[test]
     fn forge_comment_rejects_payload_mutated_after_checkpoint() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
