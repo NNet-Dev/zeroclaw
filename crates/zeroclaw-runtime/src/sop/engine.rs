@@ -2911,7 +2911,7 @@ impl SopEngine {
                 run_id,
                 sop,
                 step,
-                "forge.comment requires the immediately preceding checkpoint to approve the exact repo, number, and body"
+                "forge.comment requires the immediately preceding checkpoint to approve the exact repo, number, body, and channel"
                     .to_string(),
                 started_at,
             );
@@ -4488,10 +4488,20 @@ fn forge_comment_input_matches_checkpoint_output(
         .filter(|repo| !repo.is_empty());
     let approved_number = approved.get("number").and_then(Value::as_u64);
     let approved_body = approved.get("body").and_then(Value::as_str);
+    let approved_channel = approved
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|channel| !channel.is_empty());
+    let channel_matches = match target.channel {
+        Some(channel) => approved_channel == Some(channel),
+        None => true,
+    };
 
     approved_repo == Some(target.repo)
         && approved_number == Some(target.number)
         && approved_body == Some(target.body)
+        && channel_matches
 }
 
 fn jsonish_value(raw: &str) -> Value {
@@ -9170,6 +9180,7 @@ type = "manual"
             topic: None,
             payload: Some(
                 serde_json::json!({
+                    "channel": "git.main",
                     "repo": "o/r",
                     "number": 7,
                     "body": "triage approved",
@@ -9181,13 +9192,17 @@ type = "manual"
     }
 
     fn forge_comment_step(number: u32) -> SopStep {
+        forge_comment_step_with_channel(number, "git.main")
+    }
+
+    fn forge_comment_step_with_channel(number: u32, channel: &str) -> SopStep {
         SopStep {
             number,
             title: format!("Forge comment {number}"),
             kind: SopStepKind::Capability,
             capability: Some("forge.comment".into()),
             capability_input: Some(serde_json::json!({
-                "channel": "git.main",
+                "channel": channel,
                 "repo": "o/r",
                 "number": 7,
                 "body": "triage approved",
@@ -9216,6 +9231,10 @@ type = "manual"
     }
 
     fn checkpoint_forge_comment_sop(name: &str) -> Sop {
+        checkpoint_forge_comment_sop_with_channel(name, "git.main")
+    }
+
+    fn checkpoint_forge_comment_sop_with_channel(name: &str, channel: &str) -> Sop {
         Sop {
             name: name.into(),
             description: "checkpoint -> forge".into(),
@@ -9230,7 +9249,7 @@ type = "manual"
                     kind: SopStepKind::Checkpoint,
                     ..SopStep::default()
                 },
-                forge_comment_step(2),
+                forge_comment_step_with_channel(2, channel),
             ],
             cooldown_secs: 0,
             max_concurrent: 1,
@@ -9890,8 +9909,68 @@ type = "manual"
             .expect("forge step result recorded");
         assert_eq!(result.status, SopStepStatus::Failed);
         assert!(
-            result.output.contains("exact repo, number, and body"),
+            result
+                .output
+                .contains("exact repo, number, body, and channel"),
             "failure should name the exact payload invariant: {result:?}"
+        );
+    }
+
+    #[test]
+    fn forge_comment_rejects_channel_changed_after_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![checkpoint_forge_comment_sop_with_channel(
+            "forge-channel-mismatch",
+            "git.admin",
+        )])
+        .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-channel-mismatch", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the checkpoint before any forge write: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+
+        assert!(
+            matches!(*final_action, SopRunAction::Failed { .. }),
+            "changed forge channel must require a new checkpoint: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forge adapter must not run when the approved channel differs from the static forge target"
+        );
+        let run = engine
+            .last_finished_run("forge-channel-mismatch")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 2)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result
+                .output
+                .contains("exact repo, number, body, and channel"),
+            "failure should name the exact target invariant: {result:?}"
         );
     }
 

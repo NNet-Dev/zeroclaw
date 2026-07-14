@@ -93,16 +93,34 @@ pub(crate) fn resolve_forge_comment_target(
 ) -> std::result::Result<ForgeCommentTarget<'_>, String> {
     // The step's static capability_input is merged with the piped value under
     // the `input` key. Accept repo/number/body field-by-field from nested input
-    // with top-level fallback, but never accept channel routing from the nested
-    // piped payload: forge writes must route through static SOP-authored input,
-    // not model- or tool-produced data.
+    // with top-level fallback. The channel route still comes only from the static
+    // top-level input, but an approved checkpoint may echo the same channel under
+    // `input.channel`; that echo is accepted only when it exactly matches the
+    // static channel.
     let nested_input = input.get("input").filter(|v| v.is_object());
-    if nested_input
+    let channel = input
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    if let Some(nested_channel) = nested_input
+        .and_then(|nested| nested.get("channel"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        if channel != Some(nested_channel) {
+            return Err(
+                "forge.comment: field 'input.channel' must match top-level 'channel' in capability_input"
+                    .to_string(),
+            );
+        }
+    } else if nested_input
         .and_then(Value::as_object)
         .is_some_and(|nested| nested.contains_key("channel"))
     {
         return Err(
-            "forge.comment: field 'input.channel' is not accepted; set top-level 'channel' in capability_input"
+            "forge.comment: field 'input.channel' must be a non-empty string matching top-level 'channel'"
                 .to_string(),
         );
     }
@@ -113,11 +131,6 @@ pub(crate) fn resolve_forge_comment_target(
         .ok_or_else(|| "forge.comment: missing integer field 'number'".to_string())?;
     let body = string_field(nested_input, input, "body", false)
         .ok_or_else(|| "forge.comment: missing non-empty string field 'body'".to_string())?;
-    let channel = input
-        .get("channel")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|c| !c.is_empty());
 
     Ok(ForgeCommentTarget {
         channel,
@@ -459,7 +472,7 @@ mod tests {
                 ctx(),
                 json!({
                     "channel": "git.main",
-                    "input": {"repo": "o/r", "number": 9, "body": "x"},
+                    "input": {"repo": "o/r", "number": 9, "body": "x", "channel": "git.main"},
                 }),
             )
             .unwrap();
@@ -539,6 +552,44 @@ mod tests {
         assert!(
             adapter.calls.lock().unwrap().is_empty(),
             "nested channel input must fail before any forge adapter call"
+        );
+    }
+
+    #[test]
+    fn rejects_nested_channel_that_differs_from_static_channel() {
+        let adapter = Arc::new(RecordingAdapter {
+            calls: Mutex::new(Vec::new()),
+            result: Ok(()),
+        });
+        let cap = ForgeCommentCapability::new(Some(adapter.clone()));
+        let out = cap
+            .execute(
+                ctx(),
+                json!({
+                    "channel": "git.main",
+                    "input": {
+                        "repo": "o/r",
+                        "number": 9,
+                        "body": "x",
+                        "channel": "git.admin",
+                    },
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            !out.success,
+            "expected mismatched nested channel rejection, got {out:?}"
+        );
+        assert!(
+            out.error
+                .as_deref()
+                .is_some_and(|e| e.contains("input.channel")),
+            "expected field-specific error, got {out:?}"
+        );
+        assert!(
+            adapter.calls.lock().unwrap().is_empty(),
+            "mismatched nested channel input must fail before any forge adapter call"
         );
     }
 
