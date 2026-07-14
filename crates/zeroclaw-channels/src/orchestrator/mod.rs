@@ -9717,30 +9717,46 @@ struct ChannelAssembledTools {
 async fn assemble_channel_agent_tools(
     config: &Config,
     agent_alias: &str,
+    model_provider: &str,
+    model: &str,
     security: &Arc<SecurityPolicy>,
     built: tools::AllToolsResult,
     skills: &[zeroclaw_runtime::skills::Skill],
     runtime: Arc<dyn platform::RuntimeAdapter>,
 ) -> ChannelAssembledTools {
-    let assembled = zeroclaw_runtime::tools::scoped::ScopedToolRegistry::assemble(
-        zeroclaw_runtime::tools::scoped::ScopedAssembly {
-            config,
-            agent_alias,
-            security,
-            built,
-            skills,
-            runtime,
-            caller_allowed: None,
-            connect_mcp: true,
-            connect_peripherals: true,
-            exclude_memory: false,
-            // Channel startup is an execution surface (the agent actually runs),
-            // so deferral behaves as normal; the dashboard-only per-spec listing
-            // is off, matching `run`/`process_message`.
-            list_deferred_mcp_specs: false,
-            emit_assembly_logs: true,
-        },
-    )
+    use zeroclaw_log::Instrument as _;
+
+    let agent_attribution = zeroclaw_runtime::agent::AgentAttribution(agent_alias);
+    let assembled = async {
+        zeroclaw_log::scope!(
+            model_provider: model_provider,
+            model: model,
+            => async {
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::assemble(
+                    zeroclaw_runtime::tools::scoped::ScopedAssembly {
+                        config,
+                        agent_alias,
+                        security,
+                        built,
+                        skills,
+                        runtime,
+                        caller_allowed: None,
+                        connect_mcp: true,
+                        connect_peripherals: true,
+                        exclude_memory: false,
+                        // Channel startup is an execution surface (the agent actually runs),
+                        // so deferral behaves as normal; the dashboard-only per-spec listing
+                        // is off, matching `run`/`process_message`.
+                        list_deferred_mcp_specs: false,
+                        emit_assembly_logs: true,
+                    },
+                )
+                .await
+            }
+        )
+        .await
+    }
+    .instrument(zeroclaw_log::attribution_span!(&agent_attribution))
     .await;
     let deferred_section = assembled.deferred_section().to_string();
     let pinned_section = assembled.pinned_section().to_string();
@@ -10018,6 +10034,8 @@ pub async fn start_channels(
         } = assemble_channel_agent_tools(
             &config,
             agent_alias,
+            provider_name.as_str(),
+            model.as_str(),
             &security,
             all_tools_result_ch,
             &skills,
@@ -14798,6 +14816,8 @@ BTC is currently around $65,000 based on latest tool output."#
             assemble_channel_agent_tools(
                 &config,
                 "channel-agent",
+                "openai.test-provider",
+                "gpt-test",
                 &security,
                 channel_all_tools_result(Vec::new()),
                 &[],
@@ -14854,6 +14874,116 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn assemble_channel_agent_tools_attributes_assembly_logs_to_agent_and_model() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let server = mock_mcp_server_with_pinned_resource().await;
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "docs".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            pinned_resources: vec!["file:///handbook.md".into()],
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "docsbundle".into(),
+            McpBundleConfig {
+                servers: vec!["docs".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "channel-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                mcp_bundles: vec!["docsbundle".into()],
+                ..Default::default()
+            },
+        );
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let _assembled = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            assemble_channel_agent_tools(
+                &config,
+                "channel-agent",
+                "openai.test-provider",
+                "gpt-test",
+                &security,
+                channel_all_tools_result(Vec::new()),
+                &[],
+                Arc::new(platform::NativeRuntime::new()),
+            ),
+        )
+        .await
+        .expect("assemble must not hang");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut assembly_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.starts_with("Initializing MCP client"))
+                    {
+                        assembly_event = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_) => {}
+            }
+        }
+
+        let value = assembly_event.expect("assembly log should be emitted");
+        assert_eq!(
+            value["zeroclaw"]["agent_alias"], "channel-agent",
+            "assembly log must inherit the channel agent attribution span, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model_provider"], "openai.test-provider",
+            "assembly log must preserve the startup model_provider scope, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model_provider_type"], "openai",
+            "assembly log must split the scoped provider family, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model_provider_alias"], "test-provider",
+            "assembly log must split the scoped provider alias, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model"], "gpt-test",
+            "assembly log must preserve the startup model scope, got: {value}"
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
+    }
+
     /// The `channel_path_*` tests elsewhere pin the shared filter/registration
     /// helpers directly, not `start_channels`'s actual assembly call - a bad edit
     /// to `assemble_channel_agent_tools`'s knobs (flipping `exclude_memory`,
@@ -14880,6 +15010,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let assembled = assemble_channel_agent_tools(
             &config,
             "test-agent",
+            "test-provider",
+            "test-model",
             &security,
             built,
             &[],
@@ -14913,6 +15045,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let assembled = assemble_channel_agent_tools(
             &config,
             "test-agent",
+            "test-provider",
+            "test-model",
             &security,
             built,
             &[],
@@ -14949,6 +15083,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let assembled = assemble_channel_agent_tools(
             &config,
             "test-agent",
+            "test-provider",
+            "test-model",
             &security,
             built,
             &[],
@@ -15033,6 +15169,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let assembled = assemble_channel_agent_tools(
             &config,
             "test-agent",
+            "test-provider",
+            "test-model",
             &security,
             built,
             &skills,
