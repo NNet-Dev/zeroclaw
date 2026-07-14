@@ -942,9 +942,78 @@ pub async fn agent_turn(
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
 ) -> Result<String> {
+    agent_turn_with_sop_reassembly(
+        model_provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        channel_name,
+        channel_reply_target,
+        multimodal_config,
+        max_tool_iterations,
+        approval,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
+        model_switch_callback,
+        strict_tool_parsing,
+        parallel_tools,
+        max_tool_result_chars,
+        context_token_budget,
+        channel,
+        origin,
+        memory,
+        agent_alias,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn agent_turn_with_sop_reassembly(
+    model_provider: &dyn ModelProvider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: Option<f64>,
+    silent: bool,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    max_tool_iterations: usize,
+    approval: Option<&ApprovalManager>,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
+    strict_tool_parsing: bool,
+    parallel_tools: bool,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
+    channel: Option<&dyn Channel>,
+    origin: TurnOrigin,
+    memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
+    agent_alias: Option<&str>,
+    sop_reassembly: Option<SopStepReassembly<'_>>,
+) -> Result<String> {
     let turn_id = uuid::Uuid::new_v4().to_string();
+    #[cfg(test)]
+    if let Some(hook) = AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
+        .lock()
+        .expect("agent-turn reassembly test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        hook(sop_reassembly.is_some());
+    }
     run_tool_call_loop(ToolLoop {
-        sop_reassembly: None,
+        sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider,
@@ -1178,6 +1247,14 @@ type ResolvedAgentForTurnTestHook = Arc<dyn Fn(&str, usize) + Send + Sync>;
 #[cfg(test)]
 static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentForTurnTestHook>>> =
     LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+type AgentTurnSopReassemblyTestHook = Arc<dyn Fn(bool) + Send + Sync>;
+
+#[cfg(test)]
+static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
+    Mutex<Option<AgentTurnSopReassemblyTestHook>>,
+> = LazyLock::new(|| Mutex::new(None));
 
 /// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
 /// config when `provider_name` is a dotted `<family>.<alias>` reference.
@@ -3400,7 +3477,7 @@ pub async fn process_message(
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
-                agent_turn(
+                agent_turn_with_sop_reassembly(
                     model_provider.as_ref(),
                     &mut history,
                     &tools_registry,
@@ -3438,6 +3515,7 @@ pub async fn process_message(
                         },
                     }),
                     Some(agent_alias),
+                    Some(SopStepReassembly { config: &config }),
                 ),
             )
             .await
@@ -15328,6 +15406,75 @@ Let me check the result."#;
             matching, 2,
             "run and process_message must both resolve runtime_profiles.*.max_tool_iterations \
              before provider setup; observed {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_provides_sop_reassembly_to_agent_turn() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("process-message-reassembly-test".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "process-message-reassembly-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let seen_for_hook = Arc::clone(&seen);
+        {
+            let mut hook = super::AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
+                .lock()
+                .expect("agent-turn reassembly test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move |has_reassembly| {
+                seen_for_hook
+                    .lock()
+                    .expect("seen lock should not be poisoned")
+                    .push(has_reassembly);
+            }));
+        }
+
+        let result = super::process_message(
+            config,
+            "process-message-reassembly-agent",
+            "hello",
+            Some("session"),
+            TurnOrigin::SubTurn,
+        )
+        .await;
+
+        {
+            let mut hook = super::AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
+                .lock()
+                .expect("agent-turn reassembly test hook lock should not be poisoned");
+            *hook = None;
+        }
+
+        let seen = seen.lock().expect("seen lock should not be poisoned");
+        assert!(
+            seen.iter().any(|has_reassembly| *has_reassembly),
+            "process_message must pass a config-backed SopStepReassembly handle into agent_turn; \
+             observed {seen:?}; process_message result: {result:?}"
         );
     }
 
