@@ -66,6 +66,10 @@ pub enum BrokerOutcome {
     /// than treated as an unpoliced (quorum-1, no-membership) gate, so a typo can
     /// never downgrade a policied step to open approval.
     PolicyMissing { name: String },
+    /// The broker could not resolve the parked run's live SOP/step state well
+    /// enough to know whether the step is intentionally unpoliced. FAIL CLOSED:
+    /// the parked run is left untouched rather than downgraded to open approval.
+    PolicyUnavailable { reason: String },
     /// The run is not a waiting gate (unknown / already-resolved / not applicable).
     NotWaiting,
 }
@@ -85,6 +89,9 @@ impl BrokerOutcome {
             BrokerOutcome::PolicyMissing { name } => {
                 format!("policy_missing ('{name}')")
             }
+            BrokerOutcome::PolicyUnavailable { reason } => {
+                format!("policy_unavailable ({reason})")
+            }
         }
     }
 }
@@ -103,6 +110,9 @@ enum StepPolicy {
     /// The step names a policy ABSENT from config: fail closed, never treat as
     /// unpoliced.
     MissingNamed(String),
+    /// The run/SOP/current step could not be resolved from live state. Fail closed:
+    /// this is not the same as an authored step with no policy.
+    Unavailable(String),
 }
 
 /// Authorization + quorum layer over `resolve_gate`. Holds NO copy of the approval
@@ -168,8 +178,10 @@ impl ApprovalBroker {
     /// from the engine's live config. Three-state so a NAMED-but-absent policy is
     /// distinguished from no policy at all - the caller fails closed on the former.
     fn step_policy(&self, engine: &SopEngine, run_id: &str) -> StepPolicy {
-        let Some(name) = engine.current_step_policy_name(run_id) else {
-            return StepPolicy::Unpoliced;
+        let name = match engine.current_step_policy_lookup(run_id) {
+            Ok(Some(name)) => name,
+            Ok(None) => return StepPolicy::Unpoliced,
+            Err(e) => return StepPolicy::Unavailable(e.to_string()),
         };
         match engine.approval_config().policies.get(&name) {
             Some(p) => StepPolicy::Named {
@@ -177,6 +189,81 @@ impl ApprovalBroker {
                 config: p.clone(),
             },
             None => StepPolicy::MissingNamed(name),
+        }
+    }
+
+    /// Authorize a deterministic checkpoint through the same named-policy model as
+    /// approval gates. `None` means the caller may resolve the checkpoint now;
+    /// `Some(outcome)` is a terminal broker answer and the checkpoint must stay
+    /// parked. Positive approval quorum uses the existing gate-vote ledger scoped
+    /// to the current policy and step; denials are still single-authorized-member
+    /// fail-safe decisions.
+    pub(crate) fn authorize_checkpoint(
+        &self,
+        engine: &mut SopEngine,
+        run_id: &str,
+        step: u32,
+        decision: &ApprovalDecision,
+        principal: &ApprovalPrincipal,
+    ) -> anyhow::Result<Option<BrokerOutcome>> {
+        let policy: Option<(String, ApprovalPolicyConfig)> = match self.step_policy(engine, run_id)
+        {
+            StepPolicy::Unavailable(reason) => {
+                return Ok(Some(BrokerOutcome::PolicyUnavailable { reason }));
+            }
+            StepPolicy::MissingNamed(name) => {
+                return Ok(Some(BrokerOutcome::PolicyMissing { name }));
+            }
+            StepPolicy::Unpoliced => None,
+            StepPolicy::Named { name, config } => Some((name, config)),
+        };
+
+        if let Some(group) = policy
+            .as_ref()
+            .and_then(|(_, p)| p.required_group.as_deref())
+            .filter(|g| !g.is_empty())
+            && !self
+                .resolver
+                .is_member(engine.approval_config(), principal, group)
+        {
+            return Ok(Some(BrokerOutcome::NotAuthorized {
+                required_group: group.to_string(),
+            }));
+        }
+
+        if super::resolve::is_rejected_by_approval_mode(engine.config().approval_mode, principal) {
+            return Ok(Some(BrokerOutcome::Resolved(
+                ResolveOutcome::RejectedSelfApproval,
+            )));
+        }
+
+        if matches!(decision, ApprovalDecision::Deny { .. }) {
+            return Ok(None);
+        }
+        let Some((policy_name, cfg)) = policy.as_ref() else {
+            return Ok(None);
+        };
+        let need = (cfg.quorum.max(1)) as usize;
+        if need <= 1 {
+            return Ok(None);
+        }
+        if engine.is_park_persist_pending(run_id) {
+            anyhow::bail!(
+                "cannot record checkpoint approval vote for run {run_id}: its parked snapshot is not yet durably persisted (retrying)"
+            );
+        }
+        engine.record_gate_vote(run_id, step, policy_name, principal)?;
+        let have = self.count_qualified_voters(
+            engine,
+            run_id,
+            step,
+            policy_name,
+            cfg.required_group.as_deref().filter(|g| !g.is_empty()),
+        )?;
+        if have >= need {
+            Ok(None)
+        } else {
+            Ok(Some(BrokerOutcome::PendingQuorum { have, need }))
         }
     }
 
@@ -202,6 +289,9 @@ impl ApprovalBroker {
         // waiting rather than falling through to an unpoliced (quorum-1) resolution.
         let policy: Option<(String, ApprovalPolicyConfig)> = match self.step_policy(engine, run_id)
         {
+            StepPolicy::Unavailable(reason) => {
+                return Ok(BrokerOutcome::PolicyUnavailable { reason });
+            }
             StepPolicy::MissingNamed(name) => return Ok(BrokerOutcome::PolicyMissing { name }),
             StepPolicy::Unpoliced => None,
             StepPolicy::Named { name, config } => Some((name, config)),
@@ -416,6 +506,40 @@ mod tests {
         }
     }
 
+    /// A deterministic SOP whose first checkpoint step names `policy`.
+    fn checkpoint_policy_sop(policy: &str) -> Sop {
+        Sop {
+            name: "checkpointed".into(),
+            description: "t".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    policy: Some(policy.into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "go".into(),
+                    kind: SopStepKind::Execute,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
     /// approval config: group `release` with the given members, policy `prod`
     /// requiring that group and the given quorum.
     fn approval_cfg(members: &[&str], quorum: u32) -> SopApprovalConfig {
@@ -462,6 +586,22 @@ mod tests {
         (e, id)
     }
 
+    fn checkpoint_engine_with_broker(cfg: SopApprovalConfig) -> (SopEngine, String) {
+        let broker = Arc::new(ApprovalBroker::disabled());
+        let sop_config = SopConfig {
+            approval: cfg,
+            ..SopConfig::default()
+        };
+        let mut e = SopEngine::new(sop_config).with_approval_broker(broker);
+        e.set_sops_for_test(vec![checkpoint_policy_sop("prod")]);
+        let action = e.start_run("checkpointed", manual()).unwrap();
+        let id = match action {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected CheckpointWait, got {other:?}"),
+        };
+        (e, id)
+    }
+
     #[test]
     fn non_member_is_not_authorized_and_gate_stays_open() {
         let (mut e, id) = engine_with_broker(approval_cfg(&["alice"], 1));
@@ -476,6 +616,71 @@ mod tests {
         assert!(
             matches!(e.gate_state(&id), GateState::Waiting { .. }),
             "an unauthorized attempt must leave the gate waiting"
+        );
+    }
+
+    #[test]
+    fn checkpoint_non_member_is_not_authorized_and_stays_paused() {
+        let (mut e, id) = checkpoint_engine_with_broker(approval_cfg(&["alice"], 1));
+        let out = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("mallory".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(out, BrokerOutcome::NotAuthorized { .. }),
+            "a checkpoint must enforce named-policy group membership, got {out:?}"
+        );
+        assert_eq!(
+            e.get_run(&id).map(|r| r.status),
+            Some(SopRunStatus::PausedCheckpoint),
+            "an unauthorized checkpoint decision must leave the run parked"
+        );
+        let events = e.run_events(&id).unwrap_or_default();
+        assert!(
+            events.iter().all(|ev| ev.kind != "gate_resolved"),
+            "an unauthorized checkpoint decision must not append a resolved row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_quorum_blocks_tail_until_second_distinct_member() {
+        let (mut e, id) = checkpoint_engine_with_broker(approval_cfg(&["alice", "bob"], 2));
+
+        let first = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+        assert_eq!(
+            e.get_run(&id).map(|r| r.status),
+            Some(SopRunStatus::PausedCheckpoint),
+            "one authorized checkpoint vote must not resume the run"
+        );
+
+        let second = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("bob".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(second, BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))),
+            "the second distinct authorized checkpoint vote must resolve, got {second:?}"
+        );
+        assert_ne!(
+            e.get_run(&id).map(|r| r.status),
+            Some(SopRunStatus::PausedCheckpoint),
+            "the checkpoint tail must not remain parked after quorum is met"
         );
     }
 
@@ -1196,6 +1401,43 @@ mod tests {
             matches!(e.gate_state(&id), GateState::Waiting { .. }),
             "the gate must stay waiting when its named policy is missing"
         );
+    }
+
+    #[test]
+    fn unavailable_live_policy_state_fails_closed_for_approve_and_deny() {
+        // A parked gate that originally named a policy must not become unpoliced if
+        // its live SOP definition disappears while the run is waiting. Both approve
+        // and deny fail closed before authorization or state mutation.
+        let (mut e, id) = engine_with_broker(approval_cfg(&["alice"], 1));
+        e.set_sops_for_test(vec![]);
+
+        for decision in [
+            ApprovalDecision::Approve,
+            ApprovalDecision::Deny {
+                reason: Some("no".into()),
+            },
+        ] {
+            let out = e
+                .resolve_via_broker(
+                    &id,
+                    decision,
+                    ApprovalPrincipal::cli(Some("mallory".into())),
+                )
+                .unwrap();
+            assert!(
+                matches!(out, BrokerOutcome::PolicyUnavailable { .. }),
+                "unavailable live SOP/step state must fail closed, got {out:?}"
+            );
+            assert!(
+                matches!(e.gate_state(&id), GateState::Waiting { .. }),
+                "the waiting gate must remain parked when policy state is unavailable"
+            );
+            let events = e.run_events(&id).unwrap_or_default();
+            assert!(
+                events.iter().all(|ev| ev.kind != "gate_resolved"),
+                "policy-unavailable decisions must not append a resolved row: {events:?}"
+            );
+        }
     }
 
     #[test]

@@ -244,6 +244,10 @@ fn broker_outcome_response(outcome: &BrokerOutcome) -> (StatusCode, String) {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("policy_missing ('{name}')"),
         ),
+        BrokerOutcome::PolicyUnavailable { reason } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("policy_unavailable ({reason})"),
+        ),
     }
 }
 

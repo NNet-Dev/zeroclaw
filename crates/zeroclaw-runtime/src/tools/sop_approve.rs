@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, BrokerOutcome, ResolveOutcome};
-use crate::sop::types::{SopRunAction, SopRunStatus};
+use crate::sop::types::SopRunAction;
 use crate::sop::{SopAuditLogger, SopEngine};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
@@ -72,17 +72,11 @@ impl Tool for SopApproveTool {
             anyhow::Error::msg("Missing 'run_id' parameter")
         })?;
 
-        // Lock the engine, route through the chokepoint, then drop the lock.
-        // resolve_gate records both the append-only ledger row and the approval
-        // completion metric (every principal meters identically there); the tool
-        // no longer writes a legacy Memory audit key nor a separate metric. Under
-        // approval_mode=out_of_band_required this returns RejectedSelfApproval (the
-        // gate stays open for a CLI/gateway approver).
-        //
-        // A deterministic SOP paused at a checkpoint is an in-band agent pause, not
-        // an out-of-band approval gate, so resolve_gate reports NotWaiting for it;
-        // resume it through approve_step (the checkpoint owner) so the agent can
-        // still advance deterministic runs.
+        // Lock the engine, route through the broker/chokepoint, then drop the lock.
+        // `resolve_via_broker` records ledger/metrics for approval gates and also
+        // authorizes deterministic checkpoints before delegating to the checkpoint
+        // resolver. Under `approval_mode = out_of_band_required` this returns
+        // RejectedSelfApproval (the gate stays open for a CLI/gateway approver).
         let result = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
@@ -100,30 +94,11 @@ impl Tool for SopApproveTool {
             // `[sop.approval]` policy it is exactly `resolve_gate`, so behavior is
             // unchanged; with a policy the agent must be an authorized member and a
             // quorum must be met before the chokepoint clears the gate.
-            match engine.resolve_via_broker(
+            engine.resolve_via_broker(
                 run_id,
                 ApprovalDecision::Approve,
                 ApprovalPrincipal::agent(&self.agent_alias),
-            ) {
-                // A deterministic checkpoint is an in-band agent pause, not an
-                // out-of-band gate, so the broker reports NotWaiting; resume it
-                // through approve_step (the checkpoint owner).
-                Ok(BrokerOutcome::NotWaiting)
-                | Ok(BrokerOutcome::Resolved(ResolveOutcome::NotWaiting)) => {
-                    let is_checkpoint = matches!(
-                        engine.get_run(run_id).map(|r| r.status),
-                        Some(SopRunStatus::PausedCheckpoint)
-                    );
-                    if is_checkpoint {
-                        engine.approve_step(run_id).map(|action| {
-                            BrokerOutcome::Resolved(ResolveOutcome::Resumed(Box::new(action)))
-                        })
-                    } else {
-                        Ok(BrokerOutcome::NotWaiting)
-                    }
-                }
-                other => other,
-            }
+            )
         };
 
         match result {
@@ -201,6 +176,14 @@ impl Tool for SopApproveTool {
                 error: Some(format!(
                     "Approval failed: step names approval policy '{name}', which is not \
                      defined in [sop.approval].policies; the gate is left waiting."
+                )),
+            }),
+            Ok(BrokerOutcome::PolicyUnavailable { reason }) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Approval failed: the parked step's approval policy could not be \
+                     resolved ({reason}); the gate is left waiting."
                 )),
             }),
             Err(e) => Ok(ToolResult {

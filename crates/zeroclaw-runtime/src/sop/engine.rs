@@ -165,11 +165,13 @@ impl SopEngine {
         Arc::clone(&self.approval_broker)
     }
 
-    /// Resolve a gate THROUGH the broker (membership + quorum), then the chokepoint.
+    /// Resolve a gate or deterministic checkpoint THROUGH the broker (membership +
+    /// quorum), then the chokepoint/checkpoint owner.
     /// This is the entry point out-of-band surfaces (gateway / CLI / tools) should
     /// call so a `[sop.approval]` policy is enforced; with no policy it is exactly
-    /// `resolve_gate`. The broker is cloned out first so it does not borrow `self`
-    /// while `self` is mutated by the chokepoint.
+    /// `resolve_gate` for `WaitingApproval` and the historical checkpoint resolver
+    /// for `PausedCheckpoint`. The broker is cloned out first so it does not borrow
+    /// `self` while `self` is mutated by the chokepoint.
     pub fn resolve_via_broker(
         &mut self,
         run_id: &str,
@@ -177,6 +179,23 @@ impl SopEngine {
         principal: super::approval::ApprovalPrincipal,
     ) -> Result<super::approval::BrokerOutcome> {
         let broker = Arc::clone(&self.approval_broker);
+
+        if let Some(step) = self
+            .active_runs
+            .get(run_id)
+            .and_then(|r| (r.status == SopRunStatus::PausedCheckpoint).then_some(r.current_step))
+        {
+            if let Some(outcome) =
+                broker.authorize_checkpoint(self, run_id, step, &decision, &principal)?
+            {
+                return Ok(outcome);
+            }
+            let action = self.decide_checkpoint(run_id, decision)?;
+            return Ok(super::approval::BrokerOutcome::Resolved(
+                super::approval::ResolveOutcome::Resumed(Box::new(action)),
+            ));
+        }
+
         broker.resolve(self, run_id, decision, principal)
     }
     /// Reconstruct in-flight runs from the store at startup (durable backends).
@@ -2891,29 +2910,48 @@ impl SopEngine {
         &self.config.approval
     }
 
-    /// The name of the approval policy that applies to the run's currently-waiting
-    /// step, if that step names one. Shared by the broker (membership/quorum) and
-    /// the approval query surfaces so the "which policy applies now" lookup lives in
-    /// exactly one place.
-    pub fn current_step_policy_name(&self, run_id: &str) -> Option<String> {
-        let run = self.get_run(run_id)?;
-        let sop = self.get_sop(&run.sop_name)?;
+    /// Fallible lookup for the approval policy that applies to the run's current
+    /// parked step. `Ok(None)` means the step is intentionally unpoliced; `Err`
+    /// means the live run/SOP/step state is unavailable and callers must fail
+    /// closed rather than treating it as unpoliced.
+    pub(crate) fn current_step_policy_lookup(&self, run_id: &str) -> Result<Option<String>> {
+        let run = self
+            .get_run(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        let sop = self.get_sop(&run.sop_name).ok_or_else(|| {
+            anyhow::Error::msg(format!("SOP '{}' no longer loaded", run.sop_name))
+        })?;
         // Match the step by its `number`, NOT by vec position: routed / non-contiguous
         // step numbers mean position != number, and a positional lookup would read the
         // wrong step's policy (silently unpolicing a policied gate, or vice versa).
-        let name = sop
+        let step = sop
             .steps
             .iter()
-            .find(|s| s.number == run.current_step)?
-            .policy
-            .as_deref()?
-            .trim();
+            .find(|s| s.number == run.current_step)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "SOP '{}' no longer contains step {}",
+                    run.sop_name, run.current_step
+                ))
+            })?;
+        let Some(name) = step.policy.as_deref() else {
+            return Ok(None);
+        };
+        let name = name.trim();
         // An empty/whitespace name means "no policy", same as the Markdown parser's
         // `policy:` bullet (mod.rs). Without this, a TOML `policy = ""` step would
         // deserialize as `Some("")` and the broker would treat it as a NAMED-but-absent
         // policy (fail closed, gate stuck waiting forever) instead of unpoliced -
         // diverging from the equivalent Markdown SOP, which normalizes to `None`.
-        (!name.is_empty()).then(|| name.to_string())
+        Ok((!name.is_empty()).then(|| name.to_string()))
+    }
+
+    /// The name of the approval policy that applies to the run's current step, if
+    /// that step names one. Legacy query helper: unavailable live state collapses
+    /// to `None` for read surfaces, while the broker uses the fallible lookup above
+    /// to fail closed.
+    pub fn current_step_policy_name(&self, run_id: &str) -> Option<String> {
+        self.current_step_policy_lookup(run_id).ok().flatten()
     }
 
     /// Classify a run's approval gate for `resolve_gate` (idempotency + typed

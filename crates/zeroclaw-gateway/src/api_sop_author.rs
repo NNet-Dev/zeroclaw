@@ -418,12 +418,16 @@ pub async fn handle_sop_decide(
         };
         let status = guard.get_run(&run_id).map(|r| r.status);
         match status {
-            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval) => {
+            Some(
+                zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval
+                | zeroclaw_runtime::sop::types::SopRunStatus::PausedCheckpoint,
+            ) => {
                 use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
                 // Route through the broker (membership + quorum), not `resolve_gate`
-                // directly, otherwise this authoring surface would
-                // clear a policied approval gate without enforcing group membership or
-                // quorum. With no `[sop.approval]` policy this is exactly `resolve_gate`.
+                // directly. Otherwise this authoring surface would clear a policied
+                // approval gate or deterministic checkpoint without enforcing group
+                // membership or quorum. With no `[sop.approval]` policy this is the
+                // historical transition path.
                 match guard.resolve_via_broker(&run_id, decision, principal) {
                     Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
                         resumed_action = Some(*action);
@@ -472,6 +476,15 @@ pub async fn handle_sop_decide(
                         )
                             .into_response();
                     }
+                    Ok(BrokerOutcome::PolicyUnavailable { reason }) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("approval policy could not be resolved: {reason} (gate left waiting)")
+                            })),
+                        )
+                            .into_response();
+                    }
                     // The vote counted but quorum is not yet met: the gate stays
                     // waiting for the remaining approvers.
                     Ok(BrokerOutcome::PendingQuorum { have, need }) => {
@@ -493,18 +506,17 @@ pub async fn handle_sop_decide(
                     }
                 }
             }
-            _ => match guard.decide_checkpoint(&run_id, decision) {
-                Ok(action) => {
-                    resumed_action = Some(action);
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": e.to_string() })),
-                    )
-                        .into_response();
-                }
-            },
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "Run {run_id} is not waiting for approval or paused at a checkpoint"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
 
