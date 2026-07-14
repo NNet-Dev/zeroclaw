@@ -311,6 +311,9 @@ impl SopEngine {
                 let first = self.resume_checkpoint_with_reacquired_claim(run_id, None)?;
                 self.record_approval_metric(run_id, principal.is_system());
                 let final_action = self.drive_headless_deterministic(run_id, first)?;
+                if let Some(reason) = Self::terminal_persistence_failure(&final_action) {
+                    return Err(anyhow::Error::msg(reason.to_string()));
+                }
                 Ok(super::approval::BrokerOutcome::Resolved(
                     ResolveOutcome::Resumed(Box::new(final_action)),
                 ))
@@ -326,6 +329,9 @@ impl SopEngine {
                     self.resume_checkpoint_with_reacquired_claim(run_id, Some((field, text)))?;
                 self.record_approval_metric(run_id, principal.is_system());
                 let final_action = self.drive_headless_deterministic(run_id, first)?;
+                if let Some(reason) = Self::terminal_persistence_failure(&final_action) {
+                    return Err(anyhow::Error::msg(reason.to_string()));
+                }
                 Ok(super::approval::BrokerOutcome::Resolved(
                     ResolveOutcome::Resumed(Box::new(final_action)),
                 ))
@@ -333,7 +339,7 @@ impl SopEngine {
             ApprovalDecision::Deny { reason } => {
                 let why =
                     reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
-                self.finish_run(run_id, SopRunStatus::Cancelled, Some(why));
+                self.finish_run_checked(run_id, SopRunStatus::Cancelled, Some(why))?;
                 Ok(super::approval::BrokerOutcome::Resolved(
                     ResolveOutcome::Denied,
                 ))
@@ -1884,7 +1890,7 @@ impl SopEngine {
         if !self.active_runs.contains_key(run_id) {
             bail!("Active run not found: {run_id}");
         }
-        self.finish_run(run_id, SopRunStatus::Cancelled, None);
+        self.finish_run_checked(run_id, SopRunStatus::Cancelled, None)?;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3817,6 +3823,30 @@ impl SopEngine {
                 run_id: run_id_owned,
                 sop_name,
             },
+        }
+    }
+
+    pub(crate) fn finish_run_checked(
+        &mut self,
+        run_id: &str,
+        status: SopRunStatus,
+        reason: Option<String>,
+    ) -> Result<SopRunAction> {
+        let action = self.finish_run(run_id, status, reason);
+        if let Some(reason) = Self::terminal_persistence_failure(&action) {
+            return Err(anyhow::Error::msg(reason.to_string()));
+        }
+        Ok(action)
+    }
+
+    pub(crate) fn terminal_persistence_failure(action: &SopRunAction) -> Option<&str> {
+        match action {
+            SopRunAction::Failed { reason, .. }
+                if reason.starts_with("failed to persist terminal run") =>
+            {
+                Some(reason.as_str())
+            }
+            _ => None,
         }
     }
 
@@ -7020,6 +7050,44 @@ mod tests {
     }
 
     #[test]
+    fn timeout_cancel_terminal_persist_failure_keeps_gate_waiting() {
+        let store: Arc<dyn SopRunStore> = Arc::new(FailFirstFinishStore::new());
+        let mut engine = SopEngine::new(SopConfig {
+            approval_timeout_secs: 1,
+            approval_timeout_action: zeroclaw_config::schema::ApprovalTimeoutAction::Cancel,
+            ..SopConfig::default()
+        })
+        .with_store(store);
+        engine.set_sops_for_test(vec![test_sop(
+            "timeout-terminal-fail",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )]);
+        let action = engine
+            .start_run("timeout-terminal-fail", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine.active_runs.get_mut(&run_id).unwrap().waiting_since =
+            Some("2000-01-01T00:00:00Z".into());
+
+        let actions = engine.check_approval_timeouts();
+
+        assert!(
+            actions.is_empty(),
+            "timeout cancel must not report a terminal action when persistence failed"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::WaitingApproval),
+            "the approval gate remains waiting for retry"
+        );
+        assert!(
+            engine.last_finished_run("timeout-terminal-fail").is_none(),
+            "failed terminal persistence must not move the run to finished_runs"
+        );
+    }
+
+    #[test]
     fn timeout_auto_approve_legacy_resumes() {
         // The legacy fail-open behavior is reachable ONLY via the explicit opt-in.
         let mut engine = SopEngine::new(SopConfig {
@@ -9613,26 +9681,16 @@ type = "manual"
         );
         let run_id = extract_run_id(&first).to_string();
 
-        let first_outcome = engine
+        let err = engine
             .resolve_via_broker(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
             )
-            .expect("first checkpoint approve reaches forge tail");
-        let super::super::approval::BrokerOutcome::Resolved(
-            super::super::approval::ResolveOutcome::Resumed(first_final_action),
-        ) = first_outcome
-        else {
-            panic!("expected Resolved(Resumed), got {first_outcome:?}");
-        };
+            .expect_err("terminal persistence failure must propagate to the caller");
         assert!(
-            matches!(
-                &*first_final_action,
-                SopRunAction::Failed { reason, .. }
-                    if reason.contains("failed to persist terminal run")
-            ),
-            "injected terminal persistence failure must fail closed: {first_final_action:?}"
+            err.to_string().contains("failed to persist terminal run"),
+            "unexpected error: {err}"
         );
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -10136,6 +10194,90 @@ type = "manual"
         assert!(
             events.iter().any(|ev| ev.kind == "gate_resolved"),
             "checkpoint deny must append a gate_resolved ledger row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_via_broker_approval_deny_terminal_persist_failure_errors() {
+        let store: Arc<dyn SopRunStore> = Arc::new(FailFirstFinishStore::new());
+        let mut engine = engine_with_sops(vec![test_sop(
+            "gate-deny-terminal-fail",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )])
+        .with_store(store);
+        let action = engine
+            .start_run("gate-deny-terminal-fail", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::WaitingApproval)
+        );
+
+        let err = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Deny {
+                    reason: Some("not appropriate".into()),
+                },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect_err("terminal persistence failure must propagate to the caller");
+
+        assert!(
+            err.to_string().contains("failed to persist terminal run"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::WaitingApproval),
+            "approval gate remains waiting for retry"
+        );
+        assert!(
+            engine
+                .last_finished_run("gate-deny-terminal-fail")
+                .is_none(),
+            "failed terminal persistence must not move the run to finished_runs"
+        );
+    }
+
+    #[test]
+    fn resolve_via_broker_checkpoint_deny_terminal_persist_failure_errors() {
+        let store: Arc<dyn SopRunStore> = Arc::new(FailFirstFinishStore::new());
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-deny-terminal-fail")])
+            .with_store(store);
+        let first = engine
+            .start_run("cp-deny-terminal-fail", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to the checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        let err = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Deny {
+                    reason: Some("not appropriate".into()),
+                },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect_err("terminal persistence failure must propagate to the caller");
+
+        assert!(
+            err.to_string().contains("failed to persist terminal run"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint),
+            "checkpoint gate remains parked for retry"
+        );
+        assert!(
+            engine.last_finished_run("cp-deny-terminal-fail").is_none(),
+            "failed terminal persistence must not move the run to finished_runs"
         );
     }
 

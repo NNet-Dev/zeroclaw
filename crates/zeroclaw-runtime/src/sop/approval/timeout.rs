@@ -52,11 +52,17 @@ pub fn apply_timeout_action(
                 log_audit_skip(run_id, "cancel", &e);
                 return None;
             }
-            Some(engine.finish_run(
+            match engine.finish_run_checked(
                 run_id,
                 SopRunStatus::Cancelled,
                 Some("approval timeout (fail-closed cancel)".to_string()),
-            ))
+            ) {
+                Ok(action) => Some(action),
+                Err(e) => {
+                    log_terminal_skip(run_id, "cancel", &e);
+                    None
+                }
+            }
         }
         // LEGACY, opt-in only: the single path that self-approves on timeout,
         // attributed to the system principal and routed through the chokepoint.
@@ -92,6 +98,18 @@ fn log_audit_skip(run_id: &str, action: &str, e: &impl std::fmt::Display) {
                 "run_id": run_id, "action": action, "error": e.to_string()
             })),
         "SOP timeout: skipped, audit ledger append failed; gate left for retry"
+    );
+}
+
+fn log_terminal_skip(run_id: &str, action: &str, e: &impl std::fmt::Display) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "run_id": run_id, "action": action, "error": e.to_string()
+            })),
+        "SOP timeout: skipped, terminal persistence failed; gate left for retry"
     );
 }
 

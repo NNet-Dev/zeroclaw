@@ -174,11 +174,14 @@ pub fn resolve_gate(
             // approval. Keeps the live counters in lockstep with the ledger-sourced
             // `rebuild_from_persistence`.
             engine.record_approval_metric(run_id, principal.is_system());
+            if let Some(reason) = SopEngine::terminal_persistence_failure(&action) {
+                return Err(anyhow::Error::msg(reason.to_string()));
+            }
             ResolveOutcome::Resumed(Box::new(action))
         }
         ApprovalDecision::Deny { reason } => {
             let why = reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
-            engine.finish_run(run_id, SopRunStatus::Cancelled, Some(why));
+            engine.finish_run_checked(run_id, SopRunStatus::Cancelled, Some(why))?;
             ResolveOutcome::Denied
         }
         // Rejected at entry (before the claim reacquire and ledger append);
