@@ -126,19 +126,17 @@ pub fn unresolvable_approval_routes(
 /// act on it through their normal approval surface; the return path (approve/deny)
 /// is the existing HTTP/WS/tool -> broker -> chokepoint flow, not this adapter.
 fn render_notice(notice: ApprovalNoticeKind, run_id: &str, sop_name: &str, step: u32) -> String {
-    match notice {
-        ApprovalNoticeKind::Request => format!(
-            "SOP approval needed: '{sop_name}' run `{run_id}` is waiting for approval at step {step}. \
-             Approve or deny it through your approval surface (e.g. `zeroclaw sop approve {run_id}` / \
-             `zeroclaw sop deny {run_id}`, or the gateway approve/deny route)."
-        ),
-        ApprovalNoticeKind::Escalation => format!(
-            "SOP approval escalation: '{sop_name}' run `{run_id}` is still waiting for approval at \
-             step {step}; its approval timeout elapsed. Please approve or deny it through your approval \
-             surface (e.g. `zeroclaw sop approve {run_id}` / `zeroclaw sop deny {run_id}`, or the \
-             gateway approve/deny route)."
-        ),
-    }
+    let step = step.to_string();
+    let args = [
+        ("run_id", run_id),
+        ("sop_name", sop_name),
+        ("step", step.as_str()),
+    ];
+    let key = match notice {
+        ApprovalNoticeKind::Request => "cli-sop-approval-route-request-notice",
+        ApprovalNoticeKind::Escalation => "cli-sop-approval-route-escalation-notice",
+    };
+    crate::i18n::get_required_cli_string_with_args(key, &args)
 }
 
 /// Build the (channel_key, message) delivery pair from a route + run identity, or an
@@ -320,6 +318,14 @@ mod tests {
         assert!(msg.content.contains("run-7"), "identifies the run");
         assert!(msg.content.contains("triage"), "names the SOP");
         assert!(msg.content.contains("step 3"), "names the step");
+        assert!(
+            msg.content.contains("authenticated approval surface"),
+            "notice must direct the user to an authenticated path"
+        );
+        assert!(
+            !msg.content.contains("zeroclaw sop approve"),
+            "notice must not recommend anonymous CLI approval"
+        );
         assert!(msg.suppress_voice, "an approval notice must not be voiced");
     }
 
