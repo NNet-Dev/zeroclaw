@@ -702,6 +702,7 @@ mod tests {
         let foreign = &uuids[2];
         let query = "archive axis bridge cipher delta ember frost glyph";
         let excluded_session_match = format!("{} ", query).repeat(16);
+        let excluded_agent_match = format!("{} ", query).repeat(20);
 
         inner
             .store_with_agent(
@@ -746,6 +747,18 @@ mod tests {
         }
         inner
             .store_with_agent(
+                "foreign_agent_stronger",
+                &excluded_agent_match,
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(foreign),
+            )
+            .await
+            .unwrap();
+        inner
+            .store_with_agent(
                 "allowlisted_global",
                 "archive shared note",
                 MemoryCategory::Core,
@@ -769,6 +782,12 @@ mod tests {
             .unwrap()
             .expect("other-session row must exist")
             .id;
+        let foreign_agent_id = inner
+            .get_for_agent("foreign_agent_stronger", foreign)
+            .await
+            .unwrap()
+            .expect("foreign-agent row must exist")
+            .id;
         let unscoped_fts = {
             let conn = inner.connection().lock();
             SqliteMemory::fts5_search(&conn, query, 10).unwrap()
@@ -783,9 +802,18 @@ mod tests {
             .find(|(id, _)| id == &excluded_id)
             .map(|(_, score)| *score)
             .expect("other-session row must match the unscoped FTS query");
+        let foreign_agent_raw_score = unscoped_fts
+            .iter()
+            .find(|(id, _)| id == &foreign_agent_id)
+            .map(|(_, score)| *score)
+            .expect("foreign-agent row must match the unscoped FTS query");
         assert!(
             excluded_raw_score > eligible_raw_score * 2.5,
             "the excluded row must be strong enough to reproduce batch normalization pressure: excluded={excluded_raw_score}, eligible={eligible_raw_score}"
+        );
+        assert!(
+            foreign_agent_raw_score > eligible_raw_score * 2.5,
+            "the foreign-agent row must be strong enough to reproduce agent-scope normalization pressure: foreign={foreign_agent_raw_score}, eligible={eligible_raw_score}"
         );
 
         let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha, vec![beta.clone()]);
@@ -802,7 +830,7 @@ mod tests {
 
         assert!(
             eligible_score >= 0.4,
-            "an excluded session must not depress the best eligible FTS score below the default relevance floor: {eligible_score}"
+            "excluded session/agent rows must not depress the best eligible FTS score below the default relevance floor: {eligible_score}"
         );
         assert!(
             keys.contains(&"allowlisted_global"),
@@ -811,6 +839,10 @@ mod tests {
         assert!(
             !keys.contains(&"other_session_stronger"),
             "rows bound to another session must not surface: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"foreign_agent_stronger"),
+            "rows bound to a non-allowlisted agent must not surface or depress allowed scores: {keys:?}"
         );
         assert!(
             !keys.contains(&"foreign_global_core") && !keys.contains(&"foreign_global_daily"),

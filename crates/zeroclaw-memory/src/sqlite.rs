@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, params};
-use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -736,7 +735,7 @@ impl SqliteMemory {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_for_session(conn, query, limit, None)
+        Self::fts5_search_scoped(conn, query, limit, None, None)
     }
 
     /// FTS5 BM25 search constrained to the rows a live vector-stage recall
@@ -747,6 +746,26 @@ impl SqliteMemory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::fts5_search_scoped(conn, query, limit, session_id, None)
+    }
+
+    fn fts5_search_for_session_and_agents(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        allowed_agent_ids: &[String],
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::fts5_search_scoped(conn, query, limit, session_id, Some(allowed_agent_ids))
+    }
+
+    fn fts5_search_scoped(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        allowed_agent_ids: Option<&[String]>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
         let fts_query: String = query
@@ -784,6 +803,19 @@ impl SqliteMemory {
                 param_values.push(Box::new(Self::category_to_str(category)));
             }
             param_idx += 1 + Self::DURABLE_GLOBAL_CATEGORIES.len();
+        }
+        if let Some(allowed_agent_ids) = allowed_agent_ids
+            && !allowed_agent_ids.is_empty()
+        {
+            let agent_placeholders = (0..allowed_agent_ids.len())
+                .map(|offset| format!("?{}", param_idx + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(sql, " AND m.agent_id IN ({agent_placeholders})");
+            for agent_id in allowed_agent_ids {
+                param_values.push(Box::new(agent_id.clone()));
+            }
+            param_idx += allowed_agent_ids.len();
         }
 
         let _ = write!(sql, " ORDER BY score LIMIT ?{param_idx}");
@@ -874,6 +906,35 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::vector_search_scoped(conn, query_embedding, limit, category, session_id, None)
+    }
+
+    fn vector_search_for_agents(
+        conn: &Connection,
+        query_embedding: &[f32],
+        limit: usize,
+        category: Option<&str>,
+        session_id: Option<&str>,
+        allowed_agent_ids: &[String],
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::vector_search_scoped(
+            conn,
+            query_embedding,
+            limit,
+            category,
+            session_id,
+            Some(allowed_agent_ids),
+        )
+    }
+
+    fn vector_search_scoped(
+        conn: &Connection,
+        query_embedding: &[f32],
+        limit: usize,
+        category: Option<&str>,
+        session_id: Option<&str>,
+        allowed_agent_ids: Option<&[String]>,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
         let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
@@ -897,6 +958,19 @@ impl SqliteMemory {
             param_values.push(Box::new(sid.to_string()));
             for category in &Self::DURABLE_GLOBAL_CATEGORIES {
                 param_values.push(Box::new(Self::category_to_str(category)));
+            }
+            idx += 1 + Self::DURABLE_GLOBAL_CATEGORIES.len();
+        }
+        if let Some(allowed_agent_ids) = allowed_agent_ids
+            && !allowed_agent_ids.is_empty()
+        {
+            let agent_placeholders = (0..allowed_agent_ids.len())
+                .map(|offset| format!("?{}", idx + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(sql, " AND agent_id IN ({agent_placeholders})");
+            for agent_id in allowed_agent_ids {
+                param_values.push(Box::new(agent_id.clone()));
             }
         }
 
@@ -1001,93 +1075,41 @@ impl SqliteMemory {
         .await?
     }
 
-    /// Replace the live embedder in place. Shared by the runtime
-    /// `refresh_embedder` hook (after a `config/set` provider-profile change)
-    /// and tests that need to inject a fake embedder. Existing `Arc<dyn Memory>`
-    /// holders observe the new embedder on their next embed without rebuilding
-    /// the handle (#8359).
-    pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
-        *self.embedder.write() = embedder;
-        // `embedding_cache` is keyed by content hash only, so every cached
-        // vector belongs to the *previous* provider/model/dimensions. Drop the
-        // cache on swap so the next embed goes through the new embedder instead
-        // of returning a stale vector (#8359). Best-effort — a cache-clear
-        // failure must not block the swap.
-        if let Err(e) = self.conn.lock().execute("DELETE FROM embedding_cache", []) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                "memory embedder refresh: failed to clear stale embedding cache"
-            );
-        }
-    }
-
-    /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
-    /// Cheap read-only diagnostic; lets callers confirm a live embedder refresh
-    /// took effect after a `config/set` provider-profile change (#8359).
-    pub fn embedder_dimensions(&self) -> usize {
-        self.embedder.read().dimensions()
-    }
-}
-
-#[async_trait]
-impl Memory for SqliteMemory {
-    fn name(&self) -> &str {
-        "sqlite"
-    }
-
-    fn refresh_embedder(
-        &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
-    ) {
-        // Rebuild from the freshly-resolved settings and swap in place. No
-        // provider state is duplicated into a separate cache — the endpoint/key
-        // come from the canonical config via the runtime resolver.
-        let embedder: Arc<dyn EmbeddingProvider> =
-            Arc::from(super::embeddings::create_embedding_provider(
-                model_provider,
-                api_key,
-                model,
-                dimensions,
-            ));
-        self.swap_embedder(embedder);
-    }
-
-    async fn store(
-        &self,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        // Trait-level `store` has no agent context; route through
-        // `store_with_agent` so the row gets attributed to the default
-        // agent (the NOT NULL FK on `agent_id` rejects unattributed
-        // inserts).
-        self.store_with_agent(key, content, category, session_id, None, None, None)
-            .await
-    }
-
-    async fn recall(
+    async fn recall_scoped(
         &self,
         query: &str,
         limit: usize,
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        allowed_agent_ids: Option<Vec<String>>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let allowed_agent_ids = allowed_agent_ids.unwrap_or_default();
         // Time-only query: list by time range when no keywords.
         // Treat only a bare "*" as the same recent-entry request; keep
         // real wildcard searches such as "wild*" on the keyword path.
         if is_recent_recall_query(query) {
-            return self
-                .recall_by_time_only(limit, session_id, since, until)
-                .await;
+            let recall_limit = if allowed_agent_ids.is_empty() {
+                limit
+            } else {
+                self.count().await?.max(limit)
+            };
+            let raw = self
+                .recall_by_time_only(recall_limit, session_id, since, until)
+                .await?;
+            if allowed_agent_ids.is_empty() {
+                return Ok(raw);
+            }
+            return Ok(raw
+                .into_iter()
+                .filter(|entry| {
+                    entry
+                        .agent_id
+                        .as_deref()
+                        .is_some_and(|agent_id| allowed_agent_ids.iter().any(|id| id == agent_id))
+                })
+                .take(limit)
+                .collect());
         }
 
         // Compute query embedding only when needed (skip for BM25-only mode)
@@ -1105,12 +1127,18 @@ impl Memory for SqliteMemory {
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
         let search_mode = self.search_mode.clone();
+        let allowed = allowed_agent_ids;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
+            let agent_filter = if allowed.is_empty() {
+                None
+            } else {
+                Some(allowed.as_slice())
+            };
             // The vector stage is live only when an embedder produced a
             // query vector. The BM25-only path (stock
             // `embedding_provider = "none"` => Noop embedder, and explicit
@@ -1121,6 +1149,20 @@ impl Memory for SqliteMemory {
             // FTS5 BM25 keyword search (skip for embedding-only mode)
             let keyword_results = if search_mode == SearchMode::Embedding {
                 Vec::new()
+            } else if let Some(agent_filter) = agent_filter {
+                if vector_live {
+                    Self::fts5_search_for_session_and_agents(
+                        &conn,
+                        &query,
+                        limit * 2,
+                        session_ref,
+                        agent_filter,
+                    )
+                    .unwrap_or_default()
+                } else {
+                    Self::fts5_search_scoped(&conn, &query, limit * 2, None, Some(agent_filter))
+                        .unwrap_or_default()
+                }
             } else if vector_live {
                 Self::fts5_search_for_session(&conn, &query, limit * 2, session_ref)
                     .unwrap_or_default()
@@ -1132,7 +1174,12 @@ impl Memory for SqliteMemory {
             let vector_results = if search_mode == SearchMode::Bm25 {
                 Vec::new()
             } else if let Some(ref qe) = query_embedding {
-                Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
+                if let Some(agent_filter) = agent_filter {
+                    Self::vector_search_for_agents(&conn, qe, limit * 2, None, session_ref, agent_filter)
+                        .unwrap_or_default()
+                } else {
+                    Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
+                }
             } else {
                 Vec::new()
             };
@@ -1357,10 +1404,19 @@ impl Memory for SqliteMemory {
                         let _ = write!(time_conditions, " AND m.created_at <= ?{param_idx}");
                         param_idx += 1;
                     }
+                    let mut agent_conditions = String::new();
+                    if let Some(agent_filter) = agent_filter {
+                        let agent_placeholders = (0..agent_filter.len())
+                            .map(|offset| format!("?{}", param_idx + offset))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = write!(agent_conditions, " AND m.agent_id IN ({agent_placeholders})");
+                        param_idx += agent_filter.len();
+                    }
                     let sql = format!(
                         "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                          FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
-                         WHERE m.superseded_by IS NULL AND ({where_clause}){time_conditions}
+                         WHERE m.superseded_by IS NULL AND ({where_clause}){time_conditions}{agent_conditions}
                          ORDER BY m.updated_at DESC
                          LIMIT ?{param_idx}"
                     );
@@ -1375,6 +1431,11 @@ impl Memory for SqliteMemory {
                     }
                     if let Some(u) = until_ref {
                         param_values.push(Box::new(u.to_string()));
+                    }
+                    if let Some(agent_filter) = agent_filter {
+                        for agent_id in agent_filter {
+                            param_values.push(Box::new(agent_id.clone()));
+                        }
                     }
                     #[allow(clippy::cast_possible_wrap)]
                     param_values.push(Box::new(sql_limit as i64));
@@ -1425,6 +1486,90 @@ impl Memory for SqliteMemory {
             Ok(results)
         })
         .await?
+    }
+
+    /// Replace the live embedder in place. Shared by the runtime
+    /// `refresh_embedder` hook (after a `config/set` provider-profile change)
+    /// and tests that need to inject a fake embedder. Existing `Arc<dyn Memory>`
+    /// holders observe the new embedder on their next embed without rebuilding
+    /// the handle (#8359).
+    pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
+        *self.embedder.write() = embedder;
+        // `embedding_cache` is keyed by content hash only, so every cached
+        // vector belongs to the *previous* provider/model/dimensions. Drop the
+        // cache on swap so the next embed goes through the new embedder instead
+        // of returning a stale vector (#8359). Best-effort — a cache-clear
+        // failure must not block the swap.
+        if let Err(e) = self.conn.lock().execute("DELETE FROM embedding_cache", []) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "memory embedder refresh: failed to clear stale embedding cache"
+            );
+        }
+    }
+
+    /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
+    /// Cheap read-only diagnostic; lets callers confirm a live embedder refresh
+    /// took effect after a `config/set` provider-profile change (#8359).
+    pub fn embedder_dimensions(&self) -> usize {
+        self.embedder.read().dimensions()
+    }
+}
+
+#[async_trait]
+impl Memory for SqliteMemory {
+    fn name(&self) -> &str {
+        "sqlite"
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Rebuild from the freshly-resolved settings and swap in place. No
+        // provider state is duplicated into a separate cache — the endpoint/key
+        // come from the canonical config via the runtime resolver.
+        let embedder: Arc<dyn EmbeddingProvider> =
+            Arc::from(super::embeddings::create_embedding_provider(
+                model_provider,
+                api_key,
+                model,
+                dimensions,
+            ));
+        self.swap_embedder(embedder);
+    }
+
+    async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Trait-level `store` has no agent context; route through
+        // `store_with_agent` so the row gets attributed to the default
+        // agent (the NOT NULL FK on `agent_id` rejects unattributed
+        // inserts).
+        self.store_with_agent(key, content, category, session_id, None, None, None)
+            .await
+    }
+
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_scoped(query, limit, session_id, since, until, None)
+            .await
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -2127,72 +2272,13 @@ impl Memory for SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        // Empty allowlist means "no agent filter": fall back to plain
-        // recall. The wrapper always includes the bound agent's UUID,
-        // so a non-empty allowlist is the live-runtime case.
         if allowed_agent_ids.is_empty() {
             return self.recall(query, limit, session_id, since, until).await;
         }
 
-        let full_candidate_limit = self.count().await?.max(limit);
-        let raw = self
-            .recall(query, full_candidate_limit, session_id, since, until)
-            .await?;
-        if raw.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let conn = self.conn.clone();
-        let ids: Vec<String> = raw.iter().map(|e| e.id.clone()).collect();
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
-
-        // Single SQL pass that returns only the candidate IDs whose
-        // agent_id is on the allowlist. Legacy NULL-agent_id rows do
-        // not match (the V3 migration backfills `default`, and the
-        // NOT NULL FK rejects new NULLs), so cross-agent leakage of
-        // unattributed rows that an earlier post-fetch fall-through
-        // would have allowed is closed at the query boundary.
-        let kept: HashSet<String> =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<HashSet<String>> {
-                let conn = conn.lock();
-                let id_placeholders: String = (1..=ids.len())
-                    .map(|i| format!("?{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let agent_placeholders: String = (ids.len() + 1..=ids.len() + allowed.len())
-                    .map(|i| format!("?{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "SELECT id FROM memories \
-                     WHERE id IN ({id_placeholders}) \
-                       AND agent_id IN ({agent_placeholders})"
-                );
-                let mut stmt = conn.prepare(&sql)?;
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-                    Vec::with_capacity(ids.len() + allowed.len());
-                for id in &ids {
-                    params.push(Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>);
-                }
-                for aid in &allowed {
-                    params.push(Box::new(aid.clone()) as Box<dyn rusqlite::types::ToSql>);
-                }
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(AsRef::as_ref).collect();
-                let rows = stmt.query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))?;
-                let mut set = HashSet::new();
-                for row in rows {
-                    set.insert(row?);
-                }
-                Ok(set)
-            })
-            .await??;
-
-        Ok(raw
-            .into_iter()
-            .filter(|e| kept.contains(&e.id))
-            .take(limit)
-            .collect())
+        self.recall_scoped(query, limit, session_id, since, until, Some(allowed))
+            .await
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
