@@ -127,7 +127,9 @@ enum StepPolicy {
     MissingNamed(String),
 }
 
-fn checkpoint_decision_identity(decision: &ApprovalDecision) -> Option<(&'static str, String)> {
+pub(crate) fn checkpoint_decision_identity(
+    decision: &ApprovalDecision,
+) -> Option<(&'static str, String)> {
     let (label, payload) = match decision {
         ApprovalDecision::Approve => return Some(("approve", "approve".to_string())),
         ApprovalDecision::Amend { text } => ("amend", text.as_str()),

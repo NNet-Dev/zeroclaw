@@ -81,6 +81,88 @@ impl ForgeCommentCapability {
     }
 }
 
+pub(crate) struct ForgeCommentTarget<'a> {
+    pub channel: Option<&'a str>,
+    pub repo: &'a str,
+    pub number: u64,
+    pub body: &'a str,
+}
+
+pub(crate) fn resolve_forge_comment_target(
+    input: &Value,
+) -> std::result::Result<ForgeCommentTarget<'_>, String> {
+    // The step's static capability_input is merged with the piped value under
+    // the `input` key. Accept repo/number/body field-by-field from nested input
+    // with top-level fallback, but never accept channel routing from the nested
+    // piped payload: forge writes must route through static SOP-authored input,
+    // not model- or tool-produced data.
+    let nested_input = input.get("input").filter(|v| v.is_object());
+    if nested_input
+        .and_then(Value::as_object)
+        .is_some_and(|nested| nested.contains_key("channel"))
+    {
+        return Err(
+            "forge.comment: field 'input.channel' is not accepted; set top-level 'channel' in capability_input"
+                .to_string(),
+        );
+    }
+
+    let repo = string_field(nested_input, input, "repo", true)
+        .ok_or_else(|| "forge.comment: missing string field 'repo' (owner/repo)".to_string())?;
+    let number = number_field(nested_input, input, "number")
+        .ok_or_else(|| "forge.comment: missing integer field 'number'".to_string())?;
+    let body = string_field(nested_input, input, "body", false)
+        .ok_or_else(|| "forge.comment: missing non-empty string field 'body'".to_string())?;
+    let channel = input
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+
+    Ok(ForgeCommentTarget {
+        channel,
+        repo,
+        number,
+        body,
+    })
+}
+
+fn string_field<'a>(
+    nested: Option<&'a Value>,
+    input: &'a Value,
+    key: &str,
+    trim_output: bool,
+) -> Option<&'a str> {
+    if let Some(value) = nested
+        .and_then(|nested| nested.get(key))
+        .and_then(Value::as_str)
+        .and_then(|value| nonempty_string(value, trim_output))
+    {
+        return Some(value);
+    }
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|value| nonempty_string(value, trim_output))
+}
+
+fn nonempty_string(value: &str, trim_output: bool) -> Option<&str> {
+    if value.trim().is_empty() {
+        None
+    } else if trim_output {
+        Some(value.trim())
+    } else {
+        Some(value)
+    }
+}
+
+fn number_field(nested: Option<&Value>, input: &Value, key: &str) -> Option<u64> {
+    nested
+        .and_then(|nested| nested.get(key))
+        .and_then(Value::as_u64)
+        .or_else(|| input.get(key).and_then(Value::as_u64))
+}
+
 impl SopCapability for ForgeCommentCapability {
     fn id(&self) -> &'static str {
         "forge.comment"
@@ -130,62 +212,20 @@ impl SopCapability for ForgeCommentCapability {
             ));
         };
 
-        // The step's static capability_input is merged with the piped value under
-        // the `input` key. Accept repo/number/body at either level, but never accept
-        // channel routing from the nested piped payload: forge writes must route
-        // through static SOP-authored input, not model- or tool-produced data.
-        let nested_input = input.get("input").filter(|v| v.is_object());
-        if nested_input
-            .and_then(Value::as_object)
-            .is_some_and(|nested| nested.contains_key("channel"))
-        {
-            return Ok(CapabilityResult::failure(
-                "forge.comment: field 'input.channel' is not accepted; set top-level 'channel' in capability_input",
-            ));
-        }
-        let src = nested_input.unwrap_or(&input);
+        let target = match resolve_forge_comment_target(&input) {
+            Ok(target) => target,
+            Err(error) => return Ok(CapabilityResult::failure(error)),
+        };
 
-        let repo = match src.get("repo").and_then(Value::as_str) {
-            Some(r) if !r.trim().is_empty() => r.trim(),
-            _ => {
-                return Ok(CapabilityResult::failure(
-                    "forge.comment: missing string field 'repo' (owner/repo)",
-                ));
-            }
-        };
-        let number = match src.get("number").and_then(Value::as_u64) {
-            Some(n) => n,
-            None => {
-                return Ok(CapabilityResult::failure(
-                    "forge.comment: missing integer field 'number'",
-                ));
-            }
-        };
-        let body = match src.get("body").and_then(Value::as_str) {
-            Some(b) if !b.trim().is_empty() => b,
-            _ => {
-                return Ok(CapabilityResult::failure(
-                    "forge.comment: missing non-empty string field 'body'",
-                ));
-            }
-        };
-        // `channel` is authored in the static capability_input, so it lives at the
-        // TOP level of the merged input (unlike repo/number/body, which usually
-        // arrive in the nested piped payload).
-        let channel = input
-            .get("channel")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|c| !c.is_empty());
-
-        match adapter.post_comment(channel, repo, number, body) {
+        match adapter.post_comment(target.channel, target.repo, target.number, target.body) {
             Ok(()) => Ok(CapabilityResult::success(json!({
                 "posted": true,
-                "repo": repo,
-                "number": number,
+                "repo": target.repo,
+                "number": target.number,
             }))),
             Err(e) => Ok(CapabilityResult::failure(format!(
-                "forge.comment: post to {repo}#{number} failed: {e}"
+                "forge.comment: post to {}#{} failed: {e}",
+                target.repo, target.number
             ))),
         }
     }
@@ -431,6 +471,36 @@ mod tests {
                 "o/r".to_string(),
                 9,
                 "x".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn reads_mixed_nested_and_top_level_fields_field_by_field() {
+        let adapter = Arc::new(RecordingAdapter {
+            calls: Mutex::new(Vec::new()),
+            result: Ok(()),
+        });
+        let cap = ForgeCommentCapability::new(Some(adapter.clone()));
+        let out = cap
+            .execute(
+                ctx(),
+                json!({
+                    "channel": "git.main",
+                    "repo": "o/r",
+                    "number": 9,
+                    "input": {"body": "mixed payload"},
+                }),
+            )
+            .unwrap();
+        assert!(out.success, "expected success, got {out:?}");
+        assert_eq!(
+            adapter.calls.lock().unwrap()[0],
+            (
+                Some("git.main".to_string()),
+                "o/r".to_string(),
+                9,
+                "mixed payload".to_string()
             )
         );
     }

@@ -134,6 +134,8 @@ fn system_entry(engine: &SopEngine, run_id: &str, kind: GateEventKind) -> GateLe
     GateLedgerEntry {
         run_id: run_id.to_string(),
         step: engine.run_current_step(run_id),
+        checkpoint_revision: None,
+        decision_identity: None,
         kind,
         decision: None,
         principal: ApprovalPrincipal::system(),

@@ -224,6 +224,14 @@ impl SopEngine {
             .get(run_id)
             .map(|r| r.current_step)
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        let checkpoint_revision = self
+            .active_runs
+            .get(run_id)
+            .map(|r| r.revision)
+            .unwrap_or_default();
+        let checkpoint_decision_identity =
+            super::approval::broker::checkpoint_decision_identity(&decision)
+                .map(|(_, identity)| identity);
 
         // Pre-flight every path that mutates the run BEFORE reacquiring the claim or
         // appending the ledger row (mirror `resolve_gate`): a resolution that cannot
@@ -281,6 +289,8 @@ impl SopEngine {
             if let Err(e) = self.record_gate_event(GateLedgerEntry {
                 run_id: run_id.to_string(),
                 step,
+                checkpoint_revision: Some(checkpoint_revision),
+                decision_identity: checkpoint_decision_identity.clone(),
                 kind: GateEventKind::Resolved,
                 decision: Some(decision.clone()),
                 principal: principal.clone(),
@@ -2147,13 +2157,24 @@ impl SopEngine {
         // append leaves the old draft parked (no mutation yet) and releases the
         // reacquired claim, exactly like a failed model call; it can never leave
         // a false resolved row (the model-call failures above bailed with none).
+        let checkpoint_revision = self
+            .get_run(run_id)
+            .map(|run| run.revision)
+            .unwrap_or_default();
+        let revision_decision = super::approval::ApprovalDecision::Revise {
+            guidance: guidance.to_string(),
+        };
+        let decision_identity =
+            super::approval::broker::checkpoint_decision_identity(&revision_decision)
+                .map(|(_, identity)| identity);
+
         if let Err(e) = self.record_gate_event(super::approval::GateLedgerEntry {
             run_id: run_id.to_string(),
             step: checkpoint_step,
+            checkpoint_revision: Some(checkpoint_revision),
+            decision_identity,
             kind: super::approval::GateEventKind::Resolved,
-            decision: Some(super::approval::ApprovalDecision::Revise {
-                guidance: guidance.to_string(),
-            }),
+            decision: Some(revision_decision),
             principal: principal.clone(),
             ts: now_iso8601(),
         }) {
@@ -2686,6 +2707,7 @@ impl SopEngine {
         let Some(run) = self.active_runs.get(run_id) else {
             return false;
         };
+        let checkpoint_revision = run.revision;
         let Some(checkpoint_result) = run
             .step_results
             .iter()
@@ -2712,6 +2734,11 @@ impl SopEngine {
                 event.kind.as_str() == "gate_resolved"
                     && event.payload.get("step").and_then(|value| value.as_u64())
                         == Some(u64::from(checkpoint_step_number))
+                    && event
+                        .payload
+                        .get("checkpoint_revision")
+                        .and_then(|value| value.as_u64())
+                        == Some(u64::from(checkpoint_revision))
                     && matches!(
                         event
                             .payload
@@ -4079,7 +4106,7 @@ fn forge_comment_input_matches_checkpoint_output(
     input: &Value,
     checkpoint_result: &SopStepResult,
 ) -> bool {
-    let Some((repo, number, body)) = forge_comment_target(input) else {
+    let Ok(target) = super::capability::resolve_forge_comment_target(input) else {
         return false;
     };
     let approved = step_result_value(checkpoint_result);
@@ -4094,25 +4121,9 @@ fn forge_comment_input_matches_checkpoint_output(
     let approved_number = approved.get("number").and_then(Value::as_u64);
     let approved_body = approved.get("body").and_then(Value::as_str);
 
-    approved_repo == Some(repo) && approved_number == Some(number) && approved_body == Some(body)
-}
-
-fn forge_comment_target(input: &Value) -> Option<(&str, u64, &str)> {
-    let src = input
-        .get("input")
-        .filter(|value| value.is_object())
-        .unwrap_or(input);
-    let repo = src
-        .get("repo")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|repo| !repo.is_empty())?;
-    let number = src.get("number").and_then(Value::as_u64)?;
-    let body = src
-        .get("body")
-        .and_then(Value::as_str)
-        .filter(|body| !body.trim().is_empty())?;
-    Some((repo, number, body))
+    approved_repo == Some(target.repo)
+        && approved_number == Some(target.number)
+        && approved_body == Some(target.body)
 }
 
 fn jsonish_value(raw: &str) -> Value {
@@ -8704,6 +8715,7 @@ type = "manual"
                     "repo": "o/r",
                     "number": 7,
                     "body": "mutated after approval",
+                    "looped": true,
                 }),
             ))
         }
@@ -8872,6 +8884,59 @@ type = "manual"
                     title: "Mutate approved body".into(),
                     kind: SopStepKind::Capability,
                     capability: Some("mutate.forge".into()),
+                    ..SopStep::default()
+                },
+                forge_comment_step(3),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn same_step_revisit_forge_comment_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "checkpoint -> marker -> checkpoint -> forge".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    routing: crate::sop::step_contract::StepRouting {
+                        switch: vec![
+                            crate::sop::step_contract::SwitchRule {
+                                name: "second-visit".into(),
+                                when: Some("$.steps.2.looped == true".into()),
+                                goto: Some(3),
+                            },
+                            crate::sop::step_contract::SwitchRule {
+                                name: "first-visit".into(),
+                                when: None,
+                                goto: Some(2),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Mark loop".into(),
+                    kind: SopStepKind::Capability,
+                    capability: Some("mutate.forge".into()),
+                    routing: crate::sop::step_contract::StepRouting {
+                        next: Some(1),
+                        ..Default::default()
+                    },
                     ..SopStep::default()
                 },
                 forge_comment_step(3),
@@ -9185,6 +9250,104 @@ type = "manual"
         assert!(
             result.output.contains("immediately preceding checkpoint"),
             "failure should name the missing checkpoint-specific ledger row: {result:?}"
+        );
+    }
+
+    #[test]
+    fn forge_comment_rejects_stale_ledger_from_prior_visit_of_same_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![same_step_revisit_forge_comment_sop(
+            "forge-same-step-revisit",
+        )])
+        .with_capabilities(forge_comment_registry_with_mutator(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-same-step-revisit", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the first checkpoint visit: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.revision),
+            Some(0),
+            "first checkpoint presentation starts at revision 0"
+        );
+
+        let first_outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("first checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(second_visit),
+        ) = first_outcome
+        else {
+            panic!("expected first checkpoint to resume into second visit, got {first_outcome:?}");
+        };
+        assert!(
+            matches!(*second_visit, SopRunAction::CheckpointWait { .. }),
+            "first approval should loop back and park at checkpoint step 1 again: {second_visit:?}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.revision),
+            Some(1),
+            "same-step checkpoint revisit must carry a fresh revision"
+        );
+
+        let final_action = engine
+            .decide_checkpoint(&run_id, super::super::approval::ApprovalDecision::Approve)
+            .expect("direct second checkpoint approval should resume into guarded forge step");
+        assert!(
+            matches!(final_action, SopRunAction::Failed { .. }),
+            "direct second visit approval must not reuse the revision-0 ledger row: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stale first-visit ledger row must not authorize the second-visit forge write"
+        );
+
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
+                    && event
+                        .payload
+                        .get("checkpoint_revision")
+                        .and_then(|value| value.as_u64())
+                        == Some(0)
+            }),
+            "first visit must write the revision-0 ledger row: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
+                    && event
+                        .payload
+                        .get("checkpoint_revision")
+                        .and_then(|value| value.as_u64())
+                        == Some(1)
+            }),
+            "direct second visit approval must not synthesize a revision-1 ledger row: {events:?}"
+        );
+        let run = engine
+            .last_finished_run("forge-same-step-revisit")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 3)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains("immediately preceding checkpoint"),
+            "failure should name the checkpoint authorization invariant: {result:?}"
         );
     }
 

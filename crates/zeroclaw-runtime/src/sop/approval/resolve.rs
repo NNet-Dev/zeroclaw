@@ -121,6 +121,8 @@ pub fn resolve_gate(
     if let Err(e) = engine.record_gate_event(GateLedgerEntry {
         run_id: run_id.to_string(),
         step,
+        checkpoint_revision: None,
+        decision_identity: None,
         kind: GateEventKind::Resolved,
         decision: Some(decision.clone()),
         principal: principal.clone(),

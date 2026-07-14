@@ -5,6 +5,7 @@ mod llm_generate;
 mod registry;
 mod types;
 
+pub(crate) use forge_comment::resolve_forge_comment_target;
 pub use forge_comment::{ChannelForgeAdapter, ForgeCommentAdapter, ForgeCommentCapability};
 pub use llm_generate::{LlmGenerateAdapter, LlmGenerateCapability, ProviderLlmAdapter};
 pub use registry::SopCapabilityRegistry;

@@ -42,6 +42,8 @@ impl GateEventKind {
 pub struct GateLedgerEntry {
     pub run_id: String,
     pub step: u32,
+    pub checkpoint_revision: Option<u32>,
+    pub decision_identity: Option<String>,
     pub kind: GateEventKind,
     pub decision: Option<ApprovalDecision>,
     pub principal: ApprovalPrincipal,
@@ -72,12 +74,20 @@ impl GateLedgerEntry {
             Some(ApprovalDecision::Revise { .. }) => Some("revise"),
             None => None,
         };
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "step": self.step,
             "source": self.principal.source_label(),
             "channel": self.principal.channel,
             "decision": decision_label,
         });
+        if let Some(object) = payload.as_object_mut() {
+            if let Some(revision) = self.checkpoint_revision {
+                object.insert("checkpoint_revision".into(), serde_json::json!(revision));
+            }
+            if let Some(identity) = self.decision_identity {
+                object.insert("decision_identity".into(), serde_json::json!(identity));
+            }
+        }
         SopEventRecord {
             run_id: self.run_id,
             seq: 0,
@@ -99,6 +109,8 @@ mod tests {
         let entry = GateLedgerEntry {
             run_id: "r1".into(),
             step: 2,
+            checkpoint_revision: None,
+            decision_identity: None,
             kind: GateEventKind::Resolved,
             decision: Some(ApprovalDecision::Approve),
             principal: ApprovalPrincipal::cli(Some("alice".into())),
@@ -118,6 +130,8 @@ mod tests {
         let entry = GateLedgerEntry {
             run_id: "r1".into(),
             step: 1,
+            checkpoint_revision: None,
+            decision_identity: None,
             kind: GateEventKind::Resolved,
             decision: Some(ApprovalDecision::Deny {
                 reason: Some("policy".into()),
