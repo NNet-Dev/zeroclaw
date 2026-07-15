@@ -120,7 +120,6 @@ pub struct RelayBridgeConfig {
 /// its fingerprint.
 pub fn ensure_signing_key(data_dir: &std::path::Path) -> Result<Vec<u8>> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let dir = data_dir.join("relay");
     let path = dir.join("registration.key");
@@ -130,21 +129,44 @@ pub fn ensure_signing_key(data_dir: &std::path::Path) -> Result<Vec<u8>> {
         return Ok(bytes);
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    set_private_dir_permissions(&dir);
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
         .map_err(|e| anyhow::Error::msg(format!("generating relay signing key: {e}")))?;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut f = private_key_create_options()
         .open(&path)
         .with_context(|| format!("writing {}", path.display()))?;
     f.write_all(pkcs8.as_ref())
         .context("writing relay signing key")?;
     Ok(pkcs8.as_ref().to_vec())
 }
+
+#[cfg(unix)]
+fn set_private_dir_permissions(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_dir: &std::path::Path) {}
+
+fn private_key_create_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    private_key_permissions(&mut options);
+    options
+}
+
+#[cfg(unix)]
+fn private_key_permissions(options: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn private_key_permissions(_options: &mut std::fs::OpenOptions) {}
 
 /// Resolve this daemon's relay node-id.
 ///

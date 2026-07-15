@@ -122,11 +122,15 @@ fn should_close_after_response(head: &[u8]) -> bool {
 }
 
 fn response_for(head: &[u8]) -> Vec<u8> {
+    response_for_from_dist(head, &web_dist_dir())
+}
+
+fn response_for_from_dist(head: &[u8], web_dist: &std::path::Path) -> Vec<u8> {
     let path = request_path(head).unwrap_or("/");
     match path {
         "/" | "/index.html" => http_response("200 OK", "text/html; charset=utf-8", INDEX_HTML),
         "/app.js" => http_response("200 OK", "application/javascript; charset=utf-8", APP_JS),
-        "/webui" | "/webui/" => webui_index_response(),
+        "/webui" | "/webui/" => webui_index_response(web_dist),
         "/sw.js" => http_response(
             "200 OK",
             "application/javascript; charset=utf-8",
@@ -143,12 +147,12 @@ fn response_for(head: &[u8]) -> Vec<u8> {
             TLS_ENGINE_JS,
         ),
         path if path.starts_with("/webui/_app/") => {
-            webui_asset_response(path.trim_start_matches("/webui/_app/"), true)
+            webui_asset_response(web_dist, path.trim_start_matches("/webui/_app/"), true)
         }
         path if path.starts_with("/_app/") => {
-            webui_asset_response(path.trim_start_matches("/_app/"), false)
+            webui_asset_response(web_dist, path.trim_start_matches("/_app/"), false)
         }
-        path if path.starts_with("/webui/") => webui_index_response(),
+        path if path.starts_with("/webui/") => webui_index_response(web_dist),
         _ => http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
     }
 }
@@ -182,8 +186,8 @@ fn http_bytes_response(
     response
 }
 
-fn webui_index_response() -> Vec<u8> {
-    match std::fs::read_to_string(web_dist_dir().join("index.html")) {
+fn webui_index_response(web_dist: &std::path::Path) -> Vec<u8> {
+    match std::fs::read_to_string(web_dist.join("index.html")) {
         Ok(html) => {
             let script = format!(
                 r#"<script>window.__ZEROCLAW_BASE__="/webui";</script><script>{WEBUI_FETCH_BRIDGE_JS}</script>"#
@@ -201,7 +205,7 @@ fn webui_index_response() -> Vec<u8> {
     }
 }
 
-fn webui_asset_response(path: &str, rewrite_base: bool) -> Vec<u8> {
+fn webui_asset_response(web_dist: &std::path::Path, path: &str, rewrite_base: bool) -> Vec<u8> {
     if path.contains("..") || path.starts_with('/') {
         return http_response(
             "400 Bad Request",
@@ -209,7 +213,7 @@ fn webui_asset_response(path: &str, rewrite_base: bool) -> Vec<u8> {
             "invalid path\n",
         );
     }
-    match std::fs::read(web_dist_dir().join(path)) {
+    match std::fs::read(web_dist.join(path)) {
         Ok(bytes) => {
             let bytes = if rewrite_base && rewritable_webui_asset(path) {
                 match String::from_utf8(bytes) {
@@ -344,6 +348,34 @@ where
 mod tests {
     use super::*;
 
+    fn webui_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let assets = dir.path().join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            r#"<!doctype html><html><head><title>ZeroClaw</title><script type="module" src="/_app/assets/dashboard.js"></script></head><body>Dashboard</body></html>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            assets.join("dashboard.js"),
+            r#"const assetBase = () => {return`/_app/`+"assets/"}; const logo = "/_app/logo.png";"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn response_for_fixture(head: &[u8], fixture: &tempfile::TempDir) -> Vec<u8> {
+        response_for_from_dist(head, fixture.path())
+    }
+
+    fn dashboard_asset_from(text: &str) -> &str {
+        text.split("/webui/_app/")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("dashboard index must reference a rewritten asset")
+    }
+
     #[test]
     fn pipelined_request_heads_are_split_without_dropping_overflow() {
         let mut pending =
@@ -411,7 +443,8 @@ mod tests {
 
     #[test]
     fn webui_route_serves_remote_dashboard() {
-        let resp = response_for(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let fixture = webui_fixture();
+        let resp = response_for_fixture(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n", &fixture);
         let text = String::from_utf8(resp).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK"));
         assert!(text.contains("<title>ZeroClaw</title>"));
@@ -434,15 +467,12 @@ mod tests {
 
     #[test]
     fn webui_asset_route_serves_dashboard_assets() {
-        let index = response_for(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let fixture = webui_fixture();
+        let index = response_for_fixture(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n", &fixture);
         let text = String::from_utf8(index).unwrap();
-        let asset = text
-            .split("/webui/_app/")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .expect("dashboard index must reference a rewritten asset");
+        let asset = dashboard_asset_from(&text);
         let request = format!("GET /webui/_app/{asset} HTTP/1.1\r\nHost: x\r\n\r\n");
-        let resp = response_for(request.as_bytes());
+        let resp = response_for_fixture(request.as_bytes(), &fixture);
         assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"));
         let head_end = header_end(&resp).expect("response should include an HTTP header");
         let headers = String::from_utf8(resp[..head_end].to_vec()).unwrap();
@@ -452,15 +482,12 @@ mod tests {
 
     #[test]
     fn head_webui_asset_route_uses_requested_path() {
-        let index = response_for(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let fixture = webui_fixture();
+        let index = response_for_fixture(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n", &fixture);
         let text = String::from_utf8(index).unwrap();
-        let asset = text
-            .split("/webui/_app/")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .expect("dashboard index must reference a rewritten asset");
+        let asset = dashboard_asset_from(&text);
         let request = format!("HEAD /_app/{asset} HTTP/1.1\r\nHost: x\r\n\r\n");
-        let resp = response_for(request.as_bytes());
+        let resp = response_for_fixture(request.as_bytes(), &fixture);
         let head_end = header_end(&resp).expect("response should include an HTTP header");
         let headers = String::from_utf8(resp[..head_end].to_vec()).unwrap();
         assert!(headers.starts_with("HTTP/1.1 200 OK"));
@@ -469,7 +496,8 @@ mod tests {
 
     #[test]
     fn webui_javascript_assets_rewrite_absolute_app_base() {
-        let index = response_for(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let fixture = webui_fixture();
+        let index = response_for_fixture(b"GET /webui/ HTTP/1.1\r\nHost: x\r\n\r\n", &fixture);
         let text = String::from_utf8(index).unwrap();
         let asset = text
             .split("src=\"/webui/_app/")
@@ -477,7 +505,7 @@ mod tests {
             .and_then(|rest| rest.split('"').next())
             .expect("dashboard index must reference the rewritten entry script");
         let request = format!("GET /webui/_app/{asset} HTTP/1.1\r\nHost: x\r\n\r\n");
-        let resp = response_for(request.as_bytes());
+        let resp = response_for_fixture(request.as_bytes(), &fixture);
         let text = String::from_utf8(resp).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK"));
         assert!(text.contains("return`/webui/_app/`+"));

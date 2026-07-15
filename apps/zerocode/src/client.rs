@@ -665,7 +665,7 @@ pub async fn probe_relay_cert_pin(relay_addr: &str, relay_host: &str) -> Result<
     let tcp = tokio::net::TcpStream::connect(relay_addr)
         .await
         .with_context(|| format!("connecting to relay {relay_addr}"))?;
-    let verifier = Arc::new(zeroclaw_tls::RelayPinVerifier::tofu());
+    let verifier = Arc::new(crate::client_crypto::RelayPinVerifier::tofu());
     let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -730,10 +730,10 @@ enum RelayRoute {
 }
 
 impl RelayRoute {
-    fn open_control(self, node_id: String) -> zeroclaw_relay_proto::Control {
+    fn open_control(self, node_id: String) -> crate::relay_proto::Control {
         match self {
-            Self::Wss => zeroclaw_relay_proto::Control::Connect { node_id },
-            Self::Enrollment => zeroclaw_relay_proto::Control::Enroll { node_id },
+            Self::Wss => crate::relay_proto::Control::Connect { node_id },
+            Self::Enrollment => crate::relay_proto::Control::Enroll { node_id },
         }
     }
 
@@ -749,7 +749,7 @@ fn relay_outer_connector(
     relay: &RelayDial,
 ) -> Result<(
     Option<tokio_tungstenite::Connector>,
-    Option<Arc<zeroclaw_tls::RelayPinVerifier>>,
+    Option<Arc<crate::client_crypto::RelayPinVerifier>>,
 )> {
     // Outer TLS connector verifying the relay's OWN certificate (distinct from the
     // inner mTLS to the daemon). Precedence: insecure (dev) > configured CA > a
@@ -782,7 +782,7 @@ fn relay_outer_connector(
         };
         Ok(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
     };
-    let mut tofu_verifier: Option<Arc<zeroclaw_tls::RelayPinVerifier>> = None;
+    let mut tofu_verifier: Option<Arc<crate::client_crypto::RelayPinVerifier>> = None;
     let outer = if relay.relay_insecure {
         Some(finish(
             builder()
@@ -796,12 +796,14 @@ fn relay_outer_connector(
         }
         Some(finish(builder().with_root_certificates(roots))?)
     } else if let Some(pin) = relay.relay_pin.as_deref().filter(|p| !p.is_empty()) {
-        let v = Arc::new(zeroclaw_tls::RelayPinVerifier::pinned(pin.to_string()));
+        let v = Arc::new(crate::client_crypto::RelayPinVerifier::pinned(
+            pin.to_string(),
+        ));
         Some(finish(
             builder().dangerous().with_custom_certificate_verifier(v),
         )?)
     } else if relay.relay_tofu {
-        let v = Arc::new(zeroclaw_tls::RelayPinVerifier::tofu());
+        let v = Arc::new(crate::client_crypto::RelayPinVerifier::tofu());
         tofu_verifier = Some(v.clone());
         Some(finish(
             builder().dangerous().with_custom_certificate_verifier(v),
@@ -823,13 +825,13 @@ async fn dial_through_relay(
     relay: &RelayDial,
     route: RelayRoute,
 ) -> Result<tokio::io::DuplexStream> {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_tungstenite::tungstenite::Message;
-    use zeroclaw_relay_proto::{
+    use crate::relay_proto::{
         ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data,
         encode_data,
     };
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
 
     let tcp = tokio::net::TcpStream::connect(&relay.relay_addr)
         .await
@@ -4113,15 +4115,16 @@ mod tls_tests {
         // skip_verify AND a real client cert+key and assert the resolver still
         // carries certs. (`has_certs` is a trait-object method on the resolver, so
         // no trait import is needed here.)
-        let (ca_crt, ca_key) = zeroclaw_tls::testing::gen_ca();
-        let (csr_pem, key_pem) = zeroclaw_tls::testing::gen_client_csr("dev_skipverify");
-        let leaf = zeroclaw_tls::sign_csr(&ca_crt, &ca_key, "dev_skipverify", &csr_pem)
-            .expect("signing the test CSR");
+        let (_, ca_crt, ca_key) = crate::client_crypto::test_pki::gen_ca();
+        let (csr_pem, key_pem) =
+            crate::client_crypto::generate_client_csr("dev_skipverify").unwrap();
+        let leaf =
+            crate::client_crypto::test_pki::sign_csr(&ca_crt, &ca_key, "dev_skipverify", &csr_pem);
 
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("client.crt");
         let key_path = dir.path().join("client.key");
-        std::fs::write(&cert_path, leaf.cert_pem.as_bytes()).unwrap();
+        std::fs::write(&cert_path, leaf.as_bytes()).unwrap();
         std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
 
         let tls = ClientTls {
@@ -4139,8 +4142,8 @@ mod tls_tests {
 
     #[test]
     fn cached_daemon_ca_requires_single_certificate() {
-        let (daemon_ca, _) = zeroclaw_tls::testing::gen_ca();
-        let (extra_ca, _) = zeroclaw_tls::testing::gen_ca();
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        let (extra_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.crt");
         std::fs::write(&ca_path, format!("{daemon_ca}\n{extra_ca}")).unwrap();

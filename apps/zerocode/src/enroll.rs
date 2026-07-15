@@ -20,7 +20,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use zeroclaw_tls::{ClientKey, CsrSigner, SoftwareP256Signer};
 
 /// The daemon's default enrollment endpoint port (`[enroll].port`).
 pub const DEFAULT_ENROLL_PORT: u16 = 9782;
@@ -116,7 +115,7 @@ fn prepare_enrollment_request() -> Result<(String, String, zeroize::Zeroizing<St
 fn confirm_daemon_ca(code: &str, ca_chain_pem: &str) -> Result<()> {
     // Confirm the CA out of band via the short-auth-string before trusting it.
     let ca_fp = ca_fingerprint(ca_chain_pem)?;
-    let sas = zeroclaw_tls::enrollment_sas(code, &ca_fp);
+    let sas = crate::client_crypto::enrollment_sas(code, &ca_fp);
     eprintln!();
     eprintln!("The daemon CA's short-auth-string (SAS) is:");
     eprintln!("    {sas}");
@@ -154,20 +153,12 @@ fn cache_confirmed_response(
     Ok(())
 }
 
-/// Generate a CSR and its software private key via the desktop signer seam
-/// ([`SoftwareP256Signer`]). A mobile build swaps in a hardware-keystore
-/// [`CsrSigner`] here so the key is non-exportable (A5); the desktop path expects
-/// an extractable software key it can persist to `client.key`.
+/// Generate a CSR and its software private key. A mobile build can replace this
+/// call site with a hardware-keystore signer so the key is non-exportable (A5);
+/// the desktop path expects an extractable software key it can persist to
+/// `client.key`.
 fn software_csr(subject_hint: &str) -> Result<(String, zeroize::Zeroizing<String>)> {
-    let csr = SoftwareP256Signer
-        .generate_csr(subject_hint)
-        .context("generating client CSR")?;
-    match csr.key {
-        ClientKey::Software(key_pem) => Ok((csr.csr_pem, key_pem)),
-        ClientKey::HardwareAlias(_) => {
-            anyhow::bail!("desktop enrollment expects a software key from the CSR signer")
-        }
-    }
+    crate::client_crypto::generate_client_csr(subject_hint).context("generating client CSR")
 }
 
 /// The client-cert TTL we assume to place the 50% renewal point. The daemon
@@ -403,7 +394,7 @@ fn parse_http_json<T: serde::de::DeserializeOwned>(raw: &[u8]) -> Result<T> {
 /// SHA-256 fingerprint of the only accepted daemon CA certificate.
 fn ca_fingerprint(ca_chain_pem: &str) -> Result<String> {
     let der = single_ca_cert_der(ca_chain_pem)?;
-    Ok(zeroclaw_tls::cert_sha256_fingerprint(der.as_ref()))
+    Ok(crate::client_crypto::cert_sha256_fingerprint(der.as_ref()))
 }
 
 fn ensure_response_ca_matches_confirmed(
@@ -628,19 +619,19 @@ mod tests {
     }
 
     #[test]
-    fn sas_matches_zeroclaw_tls() {
-        // The client SAS computation must equal the daemon's for the same inputs.
+    fn sas_is_stable_for_daemon_comparison() {
+        // The client SAS computation must stay stable for daemon comparison.
         let fp = "aabbccdd";
         assert_eq!(
-            zeroclaw_tls::enrollment_sas("270391", fp),
-            zeroclaw_tls::enrollment_sas("270391", fp)
+            crate::client_crypto::enrollment_sas("270391", fp),
+            crate::client_crypto::enrollment_sas("270391", fp)
         );
     }
 
     #[test]
     fn enrollment_rejects_appended_ca_before_cache() {
-        let (daemon_ca, _) = zeroclaw_tls::testing::gen_ca();
-        let (rogue_ca, _) = zeroclaw_tls::testing::gen_ca();
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        let (rogue_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
         let chain = format!("{daemon_ca}\n{rogue_ca}");
 
         let err = ca_fingerprint(&chain).unwrap_err().to_string();
@@ -669,8 +660,8 @@ mod tests {
 
     #[test]
     fn enrollment_response_ca_must_match_confirmed_ca() {
-        let (daemon_ca, _) = zeroclaw_tls::testing::gen_ca();
-        let (rogue_ca, _) = zeroclaw_tls::testing::gen_ca();
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        let (rogue_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
         let err = ensure_response_ca_matches_confirmed(&daemon_ca, &rogue_ca)
             .unwrap_err()
             .to_string();
@@ -681,21 +672,14 @@ mod tests {
     #[tokio::test]
     async fn post_enroll_refuses_unconfirmed_ca_before_sending_code_or_csr() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let (confirmed_ca, _) = zeroclaw_tls::testing::gen_ca();
-        let (rogue_ca, rogue_key) = zeroclaw_tls::testing::gen_ca();
-        let (server_cert, server_key) =
-            zeroclaw_tls::testing::gen_server_cert(&rogue_ca, &rogue_key, &["localhost".into()]);
-        let dir = tempfile::tempdir().unwrap();
-        let cert_path = dir.path().join("server.crt");
-        let key_path = dir.path().join("server.key");
-        std::fs::write(&cert_path, server_cert).unwrap();
-        std::fs::write(&key_path, server_key).unwrap();
-        let acceptor = zeroclaw_tls::build_tls_acceptor(&zeroclaw_tls::ServerConfigParams {
-            cert_path: cert_path.to_string_lossy().into_owned(),
-            key_path: key_path.to_string_lossy().into_owned(),
-            client_auth: None,
-        })
-        .unwrap();
+        let (confirmed_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        let (_, rogue_ca, rogue_key) = crate::client_crypto::test_pki::gen_ca();
+        let (server_cert, server_key) = crate::client_crypto::test_pki::gen_server_cert(
+            &rogue_ca,
+            &rogue_key,
+            &["localhost".into()],
+        );
+        let acceptor = crate::client_crypto::test_pki::tls_acceptor(&server_cert, &server_key);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let saw_request = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -735,7 +719,7 @@ mod tests {
 
     #[test]
     fn cache_materials_preserves_existing_identity_when_key_write_fails() {
-        let (daemon_ca, _) = zeroclaw_tls::testing::gen_ca();
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
         let dir = tempfile::tempdir().unwrap();
         let tls_dir = dir.path().join("tls");
         std::fs::create_dir_all(&tls_dir).unwrap();
