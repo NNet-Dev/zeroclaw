@@ -218,10 +218,18 @@ impl ApprovalBroker {
             StepPolicy::Named { name, config } => Some((name, config)),
         };
 
-        if let Some(group) = policy
-            .as_ref()
-            .and_then(|(_, p)| p.required_group.as_deref())
-            .filter(|g| !g.is_empty())
+        // Unpoliced checkpoint: the broker is a pass-through to the HISTORICAL
+        // checkpoint resolver (`approve_step` / `deny_checkpoint`), which applies NO
+        // `approval_mode` gate - see the `resolve_via_broker` contract in engine.rs.
+        // Return BEFORE the membership and `approval_mode` checks so an unpoliced
+        // checkpoint under a non-default `approval_mode` (e.g. `OutOfBandRequired`)
+        // is not wrongly rejected as self-approval and stranded at PausedCheckpoint.
+        // The `approval_mode` gate below still governs every POLICIED checkpoint.
+        let Some((policy_name, cfg)) = policy.as_ref() else {
+            return Ok(None);
+        };
+
+        if let Some(group) = cfg.required_group.as_deref().filter(|g| !g.is_empty())
             && !self
                 .resolver
                 .is_member(engine.approval_config(), principal, group)
@@ -240,9 +248,6 @@ impl ApprovalBroker {
         if matches!(decision, ApprovalDecision::Deny { .. }) {
             return Ok(None);
         }
-        let Some((policy_name, cfg)) = policy.as_ref() else {
-            return Ok(None);
-        };
         let need = (cfg.quorum.max(1)) as usize;
         if need <= 1 {
             return Ok(None);
@@ -602,6 +607,29 @@ mod tests {
         (e, id)
     }
 
+    /// An engine parked at an UNPOLICED deterministic checkpoint (the first step
+    /// names no policy) under the given `approval_mode` - so a test can prove the
+    /// unpoliced checkpoint path applies no `approval_mode` gate.
+    fn unpoliced_checkpoint_engine(
+        mode: zeroclaw_config::schema::ApprovalMode,
+    ) -> (SopEngine, String) {
+        let broker = Arc::new(ApprovalBroker::disabled());
+        let sop_config = SopConfig {
+            approval_mode: mode,
+            ..SopConfig::default()
+        };
+        let mut e = SopEngine::new(sop_config).with_approval_broker(broker);
+        let mut sop = checkpoint_policy_sop("prod");
+        sop.steps[0].policy = None; // unpoliced checkpoint
+        e.set_sops_for_test(vec![sop]);
+        let action = e.start_run("checkpointed", manual()).unwrap();
+        let id = match action {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected CheckpointWait, got {other:?}"),
+        };
+        (e, id)
+    }
+
     #[test]
     fn non_member_is_not_authorized_and_gate_stays_open() {
         let (mut e, id) = engine_with_broker(approval_cfg(&["alice"], 1));
@@ -682,6 +710,72 @@ mod tests {
             Some(SopRunStatus::PausedCheckpoint),
             "the checkpoint tail must not remain parked after quorum is met"
         );
+    }
+
+    #[test]
+    fn unpoliced_checkpoint_is_not_gated_by_approval_mode() {
+        // Regression: an UNPOLICED deterministic checkpoint must behave exactly like
+        // the historical checkpoint resolver, which applies NO `approval_mode` gate.
+        // Previously `authorize_checkpoint` ran the `approval_mode` check ahead of the
+        // unpoliced pass-through, so a non-default mode (`OutOfBandRequired` /
+        // `AgentTool`) wrongly rejected the resolver as self-approval
+        // (`RejectedSelfApproval`) and stranded the run at `PausedCheckpoint`. The mode
+        // gate must still govern POLICIED checkpoints (the other checkpoint tests cover
+        // that); only unpoliced ones are exempt.
+        use zeroclaw_config::schema::ApprovalMode;
+
+        // Each (mode, principal) pair is one `approval_mode` WOULD reject if the gate
+        // were (wrongly) applied to an unpoliced checkpoint: the agent under
+        // `OutOfBandRequired`, an out-of-band principal under `AgentTool`. The final
+        // `Both` case is the default, where the fix must be a no-op.
+        let cases = [
+            (
+                ApprovalMode::OutOfBandRequired,
+                ApprovalPrincipal::agent("bot"),
+            ),
+            (
+                ApprovalMode::AgentTool,
+                ApprovalPrincipal::cli(Some("alice".into())),
+            ),
+            (ApprovalMode::Both, ApprovalPrincipal::agent("bot")),
+        ];
+
+        for (mode, principal) in cases {
+            // Approve resolves and leaves PausedCheckpoint.
+            let (mut e, id) = unpoliced_checkpoint_engine(mode);
+            let out = e
+                .resolve_via_broker(&id, ApprovalDecision::Approve, principal.clone())
+                .unwrap();
+            assert!(
+                matches!(out, BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))),
+                "unpoliced checkpoint approve must resolve under {mode:?}, got {out:?}"
+            );
+            assert_ne!(
+                e.get_run(&id).map(|r| r.status),
+                Some(SopRunStatus::PausedCheckpoint),
+                "unpoliced checkpoint approve must not stay parked under {mode:?}"
+            );
+
+            // Deny resolves (routes through the checkpoint's on_failure) and likewise
+            // leaves PausedCheckpoint - it is not rejected as self-approval either.
+            let (mut e, id) = unpoliced_checkpoint_engine(mode);
+            let out = e
+                .resolve_via_broker(
+                    &id,
+                    ApprovalDecision::Deny { reason: None },
+                    principal.clone(),
+                )
+                .unwrap();
+            assert!(
+                matches!(out, BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))),
+                "unpoliced checkpoint deny must resolve under {mode:?}, got {out:?}"
+            );
+            assert_ne!(
+                e.get_run(&id).map(|r| r.status),
+                Some(SopRunStatus::PausedCheckpoint),
+                "unpoliced checkpoint deny must not stay parked under {mode:?}"
+            );
+        }
     }
 
     #[test]
