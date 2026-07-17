@@ -244,7 +244,7 @@ impl SecretStore {
 
                 // First, ensure the current user owns the file. Without this,
                 // Windows may assign an invalid SID as owner, making the file
-                // unreadable for subsequent commands. (See issue #4532.)
+                // unreadable for subsequent commands.
                 match std::process::Command::new("takeown")
                     .arg("/F")
                     .arg(&self.key_path)
