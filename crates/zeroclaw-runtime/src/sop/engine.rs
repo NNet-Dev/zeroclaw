@@ -6415,7 +6415,7 @@ mod tests {
         );
     }
 
-    // ── Advance step gate guard (#8678) ─────────────────
+    // ── Advance step gate guard ─────────────────────────────
     //
     // A driver calling `sop_advance` while a run is parked at an external
     // gate (WaitingApproval or PausedCheckpoint) used to be allowed to
