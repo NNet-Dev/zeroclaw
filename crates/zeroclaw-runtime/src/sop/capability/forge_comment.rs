@@ -447,16 +447,13 @@ mod tests {
         });
         let cap = ForgeCommentCapability::new(Some(adapter.clone()));
         let out = cap
-            .execute(
-                ctx(),
-                json!({"repo": "Nillth/hello", "number": 5, "body": "triage"}),
-            )
+            .execute(ctx(), json!({"repo": "o/r", "number": 5, "body": "triage"}))
             .unwrap();
         assert!(out.success, "expected success, got {out:?}");
         assert_eq!(out.output["posted"], true);
         assert_eq!(
             adapter.calls.lock().unwrap().as_slice(),
-            &[(None, "Nillth/hello".to_string(), 5, "triage".to_string())]
+            &[(None, "o/r".to_string(), 5, "triage".to_string())]
         );
     }
 

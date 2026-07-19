@@ -274,30 +274,37 @@ impl SopEngine {
             ApprovalDecision::Deny { .. } => {}
         }
 
-        // Audit before mutating the checkpoint: the checkpoint cannot clear or cancel
-        // without its durable ledger row (same rule as the approval-gate chokepoint).
-        // Approve/Amend already secured the exec claim above, so a claim-store
-        // failure cannot leave a false `gate_resolved` row for a still-parked run.
+        // Audit before mutating the checkpoint: for a path that CLEARS the gate
+        // (Approve/Amend) the resolved row must be durable first, and the exec
+        // claim is already secured above, so a claim-store failure cannot leave a
+        // false `gate_resolved` row for a still-parked run.
         //
-        // Revise is the exception: its "apply" includes an irreducibly-fallible
-        // model call (the re-draft), so appending the resolved row HERE would
-        // leave a false `gate_resolved` row if that call fails. Its row is
-        // appended INSIDE `revise_checkpoint_draft` instead — only once the new
-        // draft exists and before the run is mutated — so a failed re-draft
-        // records nothing and leaves the old draft parked.
-        if !matches!(decision, ApprovalDecision::Revise { .. })
-            && let Err(e) = self.record_gate_event(GateLedgerEntry {
-                run_id: run_id.to_string(),
-                step,
-                gate_revision: Some(checkpoint_revision),
-                checkpoint_revision: Some(checkpoint_revision),
-                decision_identity: checkpoint_decision_identity.clone(),
-                kind: GateEventKind::Resolved,
-                decision: Some(decision.clone()),
-                principal: principal.clone(),
-                ts: now_iso8601(),
-            })
-        {
+        // Deny and Revise invert that ordering and append their row later, because
+        // for them appending first is what would MINT a false `gate_resolved` row:
+        //   - Revise's "apply" includes an irreducibly-fallible model call (the
+        //     re-draft), so its row is appended INSIDE `revise_checkpoint_draft`
+        //     only once the new draft exists (a failed re-draft records nothing
+        //     and leaves the old draft parked).
+        //   - Deny's SOLE mutation is the terminal cancel, so appending first
+        //     would leave a false `gate_resolved` row if terminal persistence
+        //     fails and the run stays parked. Its row is appended in the Deny arm
+        //     below, only after the run is durably Cancelled. The inverse residual
+        //     (a cancelled run whose deny row failed to append) is benign: restore
+        //     rebuilds terminal state from the run snapshot, not the ledger.
+        if !matches!(
+            decision,
+            ApprovalDecision::Revise { .. } | ApprovalDecision::Deny { .. }
+        ) && let Err(e) = self.record_gate_event(GateLedgerEntry {
+            run_id: run_id.to_string(),
+            step,
+            gate_revision: Some(checkpoint_revision),
+            checkpoint_revision: Some(checkpoint_revision),
+            decision_identity: checkpoint_decision_identity.clone(),
+            kind: GateEventKind::Resolved,
+            decision: Some(decision.clone()),
+            principal: principal.clone(),
+            ts: now_iso8601(),
+        }) {
             if claim_reacquired {
                 self.release_claim_on_park(run_id);
             }
@@ -337,9 +344,31 @@ impl SopEngine {
                 ))
             }
             ApprovalDecision::Deny { reason } => {
-                let why =
-                    reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
+                let why = reason
+                    .clone()
+                    .unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
+                // Terminal snapshot FIRST: only a durably-Cancelled run earns its
+                // `gate_resolved` row. If terminal persistence fails, the run stays
+                // parked and NO resolved row is written (asserted by the Deny
+                // terminal-persistence-failure regression).
                 self.finish_run_checked(run_id, SopRunStatus::Cancelled, Some(why))?;
+                self.record_gate_event(GateLedgerEntry {
+                    run_id: run_id.to_string(),
+                    step,
+                    gate_revision: Some(checkpoint_revision),
+                    checkpoint_revision: Some(checkpoint_revision),
+                    decision_identity: checkpoint_decision_identity.clone(),
+                    kind: GateEventKind::Resolved,
+                    decision: Some(ApprovalDecision::Deny { reason }),
+                    principal: principal.clone(),
+                    ts: now_iso8601(),
+                })
+                .map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "checkpoint denied and cancelled, but persisting its resolution \
+                         ledger event failed (fail-closed): {e}"
+                    ))
+                })?;
                 Ok(super::approval::BrokerOutcome::Resolved(
                     ResolveOutcome::Denied,
                 ))
@@ -10468,6 +10497,14 @@ type = "manual"
         assert!(
             engine.last_finished_run("cp-deny-terminal-fail").is_none(),
             "failed terminal persistence must not move the run to finished_runs"
+        );
+        // The whole point of persisting the terminal snapshot BEFORE appending the
+        // resolved row: a failed cancel must leave the ledger untouched, so the
+        // audit-of-record never claims the gate resolved while the run is parked.
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            !events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "a failed checkpoint deny must not write a gate_resolved row: {events:?}"
         );
     }
 

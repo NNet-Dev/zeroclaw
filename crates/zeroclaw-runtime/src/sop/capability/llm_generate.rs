@@ -349,20 +349,20 @@ mod tests {
                     "system": "You are a triage bot.",
                     "output_key": "body",
                     "echo": ["repo", "number"],
-                    "input": {"repo": "Nillth/hello", "number": 5, "title": "t", "body": "b"}
+                    "input": {"repo": "o/r", "number": 5, "title": "t", "body": "b"}
                 }),
             )
             .unwrap();
         assert!(out.success, "expected success, got {out:?}");
         assert_eq!(out.output["body"], "a triage draft");
-        assert_eq!(out.output["repo"], "Nillth/hello");
+        assert_eq!(out.output["repo"], "o/r");
         assert_eq!(out.output["number"], 5);
         let calls = adapter.calls.lock().unwrap();
         let (system, prompt) = &calls[0];
         assert_eq!(system.as_deref(), Some("You are a triage bot."));
         assert!(prompt.starts_with("Draft a triage comment."));
         assert!(prompt.contains("UNTRUSTED EVENT PAYLOAD"));
-        assert!(prompt.contains("Nillth/hello"));
+        assert!(prompt.contains("o/r"));
     }
 
     #[test]
