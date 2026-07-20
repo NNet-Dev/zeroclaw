@@ -62,6 +62,17 @@ pub struct SopEngine {
     /// `resolve_gate` chokepoint. Defaults to a pass-through (no policies) so
     /// behavior is unchanged until a `[sop.approval]` policy is configured.
     approval_broker: Arc<super::approval::ApprovalBroker>,
+    /// Bounded per-message idempotency window for durable transport redelivery.
+    /// Each entry maps `(SOP name, transport delivery key)` to the run started by
+    /// that message. An empty run id marks a reused, ambiguous publisher key and
+    /// deliberately disables coalescing for that key.
+    dispatch_dedup: std::collections::VecDeque<(String, String)>,
+}
+
+const DISPATCH_DEDUP_CAP: usize = 512;
+
+fn dispatch_dedup_composite(sop_name: &str, dedup_key: &str) -> String {
+    format!("{sop_name}\u{0}{dedup_key}")
 }
 
 /// Outcome of one [`SopEngine::run_maintenance_tick`] pass (EPIC A1), for
@@ -103,6 +114,7 @@ impl SopEngine {
             capabilities: Arc::new(SopCapabilityRegistry::with_builtins()),
             claims_pending_persist: std::collections::HashSet::new(),
             approval_broker: Arc::new(super::approval::ApprovalBroker::disabled()),
+            dispatch_dedup: std::collections::VecDeque::new(),
         }
     }
 
@@ -279,18 +291,14 @@ impl SopEngine {
         // claim is already secured above, so a claim-store failure cannot leave a
         // false `gate_resolved` row for a still-parked run.
         //
-        // Deny and Revise invert that ordering and append their row later, because
-        // for them appending first is what would MINT a false `gate_resolved` row:
+        // Deny and Revise use different commit boundaries because appending first
+        // would mint a false `gate_resolved` row:
         //   - Revise's "apply" includes an irreducibly-fallible model call (the
         //     re-draft), so its row is appended INSIDE `revise_checkpoint_draft`
         //     only once the new draft exists (a failed re-draft records nothing
         //     and leaves the old draft parked).
-        //   - Deny's SOLE mutation is the terminal cancel, so appending first
-        //     would leave a false `gate_resolved` row if terminal persistence
-        //     fails and the run stays parked. Its row is appended in the Deny arm
-        //     below, only after the run is durably Cancelled. The inverse residual
-        //     (a cancelled run whose deny row failed to append) is benign: restore
-        //     rebuilds terminal state from the run snapshot, not the ledger.
+        //   - Deny's sole mutation is the terminal cancel, so its terminal snapshot,
+        //     claim release, and resolved row commit atomically in the Deny arm.
         if !matches!(
             decision,
             ApprovalDecision::Revise { .. } | ApprovalDecision::Deny { .. }
@@ -347,12 +355,7 @@ impl SopEngine {
                 let why = reason
                     .clone()
                     .unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
-                // Terminal snapshot FIRST: only a durably-Cancelled run earns its
-                // `gate_resolved` row. If terminal persistence fails, the run stays
-                // parked and NO resolved row is written (asserted by the Deny
-                // terminal-persistence-failure regression).
-                self.finish_run_checked(run_id, SopRunStatus::Cancelled, Some(why))?;
-                self.record_gate_event(GateLedgerEntry {
+                let gate_event = GateLedgerEntry {
                     run_id: run_id.to_string(),
                     step,
                     gate_revision: Some(checkpoint_revision),
@@ -362,13 +365,14 @@ impl SopEngine {
                     decision: Some(ApprovalDecision::Deny { reason }),
                     principal: principal.clone(),
                     ts: now_iso8601(),
-                })
-                .map_err(|e| {
-                    anyhow::Error::msg(format!(
-                        "checkpoint denied and cancelled, but persisting its resolution \
-                         ledger event failed (fail-closed): {e}"
-                    ))
-                })?;
+                }
+                .into_event_record();
+                self.finish_run_with_gate_event(
+                    run_id,
+                    SopRunStatus::Cancelled,
+                    Some(why),
+                    &gate_event,
+                )?;
                 Ok(super::approval::BrokerOutcome::Resolved(
                     ResolveOutcome::Denied,
                 ))
@@ -1051,32 +1055,6 @@ impl SopEngine {
         self.evaluate_admission_with_reserved(sop_name, 0, 0)
     }
 
-    /// Evaluate a group of matched SOPs as one delivery unit. Each `Admit` reserves
-    /// one simulated exec slot before evaluating later siblings, so all-or-nothing
-    /// transports can detect a batch that would exceed per-SOP or global capacity
-    /// before starting any run.
-    pub(crate) fn evaluate_admission_batch_all_or_nothing(
-        &self,
-        sop_names: &[String],
-    ) -> Vec<(String, SopAdmission)> {
-        let mut reserved_by_sop: HashMap<String, usize> = HashMap::new();
-        let mut reserved_total = 0usize;
-        let mut out = Vec::with_capacity(sop_names.len());
-
-        for sop_name in sop_names {
-            let reserved_for_sop = *reserved_by_sop.get(sop_name).unwrap_or(&0);
-            let admission =
-                self.evaluate_admission_with_reserved(sop_name, reserved_for_sop, reserved_total);
-            if matches!(admission, SopAdmission::Admit) {
-                *reserved_by_sop.entry(sop_name.clone()).or_default() += 1;
-                reserved_total += 1;
-            }
-            out.push((sop_name.clone(), admission));
-        }
-
-        out
-    }
-
     fn evaluate_admission_with_reserved(
         &self,
         sop_name: &str,
@@ -1152,6 +1130,62 @@ impl SopEngine {
                         reason: format!("SOP '{sop_name}' execution slots full (drop policy)"),
                     }
                 }
+            }
+        }
+    }
+
+    /// Return the run already started for a confirmed redelivery, unless the
+    /// publisher reused this key and made it ambiguous.
+    pub(crate) fn dispatch_dedup_lookup(&self, sop_name: &str, dedup_key: &str) -> Option<String> {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        self.dispatch_dedup
+            .iter()
+            .find(|(key, _)| *key == composite)
+            .and_then(|(_, run_id)| (!run_id.is_empty()).then(|| run_id.clone()))
+    }
+
+    /// Mark a reused key ambiguous before admission so a distinct fresh message
+    /// can never be acknowledged as a duplicate of an older run.
+    pub(crate) fn note_fresh_dispatch_key(&mut self, sop_name: &str, dedup_key: &str) {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        if let Some(entry) = self
+            .dispatch_dedup
+            .iter_mut()
+            .find(|(key, _)| *key == composite)
+        {
+            entry.1.clear();
+        }
+    }
+
+    /// Record a started run for later confirmed redelivery coalescing. The window
+    /// is bounded; eviction can cause a safe duplicate but never a silent drop.
+    pub(crate) fn record_dispatch_dedup(&mut self, sop_name: &str, dedup_key: &str, run_id: &str) {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        if let Some(entry) = self
+            .dispatch_dedup
+            .iter_mut()
+            .find(|(key, _)| *key == composite)
+        {
+            if entry.1 != run_id {
+                entry.1.clear();
+            }
+            return;
+        }
+        self.dispatch_dedup
+            .push_back((composite, run_id.to_string()));
+        while self.dispatch_dedup.len() > DISPATCH_DEDUP_CAP {
+            if let Some((_, evicted_run)) = self.dispatch_dedup.pop_front()
+                && self.active_runs.contains_key(&evicted_run)
+            {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "evicted_run_id": evicted_run,
+                            "cap": DISPATCH_DEDUP_CAP,
+                        })),
+                    "SOP dispatch: per-message dedup window evicted a still-active run key; a later redelivery may run it again"
+                );
             }
         }
     }
@@ -3894,6 +3928,69 @@ impl SopEngine {
             return Err(anyhow::Error::msg(reason.to_string()));
         }
         Ok(action)
+    }
+
+    /// Finish a run and append its gate-resolution event in one store transaction.
+    /// The active in-memory run is removed only after the durable transaction
+    /// succeeds, so neither the terminal state nor the audit record can become
+    /// visible independently.
+    pub(crate) fn finish_run_with_gate_event(
+        &mut self,
+        run_id: &str,
+        status: SopRunStatus,
+        reason: Option<String>,
+        event: &SopEventRecord,
+    ) -> Result<SopRunAction> {
+        let mut run = self
+            .active_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        run.status = status;
+        run.completed_at = Some(now_iso8601());
+        let mut persisted = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
+        persisted.revision = self.next_run_revision(run_id);
+        self.store
+            .finish_run_with_event(run_id, &persisted, event)
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "error": e.to_string(),
+                        })),
+                    "SOP engine: terminal gate resolution transaction failed; run and ledger remain unchanged"
+                );
+                anyhow::Error::msg(format!("failed to persist terminal run (fail-closed): {e}"))
+            })?;
+
+        let sop_name = run.sop_name.clone();
+        let run_id_owned = run.run_id.clone();
+        self.active_runs.remove(run_id);
+        self.metrics.record_run_complete(&run);
+        self.remove_deterministic_state_file(&run);
+        self.notify_run(&run, false);
+        self.finished_runs.push(run);
+
+        let max = self.config.max_finished_runs;
+        if max > 0 && self.finished_runs.len() > max {
+            let excess = self.finished_runs.len() - max;
+            self.finished_runs.drain(..excess);
+        }
+
+        Ok(match status {
+            SopRunStatus::Failed => SopRunAction::Failed {
+                run_id: run_id_owned,
+                sop_name,
+                reason: reason.unwrap_or_default(),
+            },
+            _ => SopRunAction::Completed {
+                run_id: run_id_owned,
+                sop_name,
+            },
+        })
     }
 
     pub(crate) fn terminal_persistence_failure(action: &SopRunAction) -> Option<&str> {
@@ -7489,8 +7586,23 @@ mod tests {
         fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
             self.inner.save_run(r)
         }
+        fn save_run_with_event(
+            &self,
+            r: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.save_run_with_event(r, e)
+        }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_terminal_runs(&self, _limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
             Ok(Vec::new())
@@ -7684,8 +7796,29 @@ mod tests {
         fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
             self.inner.save_run(r)
         }
+        fn save_run_with_event(
+            &self,
+            r: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected append failure".into()));
+            }
+            self.inner.save_run_with_event(r, e)
+        }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected append failure".into()));
+            }
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_terminal_runs(&self, _limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
             Ok(Vec::new())
@@ -7832,8 +7965,27 @@ mod tests {
                 self.inner.save_run(r)
             }
         }
+        fn save_run_with_event(
+            &self,
+            r: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            if self.fail_saves.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(StoreError::Backend("injected save_run failure".into()))
+            } else {
+                self.inner.save_run_with_event(r, e)
+            }
+        }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_terminal_runs(&self, _limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
             Ok(Vec::new())
@@ -8143,8 +8295,23 @@ mod tests {
         fn save_run(&self, _r: &PersistedRun) -> Result<(), StoreError> {
             Err(StoreError::Backend("injected save_run failure".into()))
         }
+        fn save_run_with_event(
+            &self,
+            _r: &PersistedRun,
+            _e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected save_run failure".into()))
+        }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_terminal_runs(&self, _limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
             Ok(Vec::new())
@@ -9547,6 +9714,14 @@ type = "manual"
             self.inner.save_run(run)
         }
 
+        fn save_run_with_event(
+            &self,
+            run: &PersistedRun,
+            event: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.save_run_with_event(run, event)
+        }
+
         fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
             if self
                 .fail_next_finish
@@ -9557,6 +9732,23 @@ type = "manual"
                 ));
             }
             self.inner.finish_run(run_id, terminal)
+        }
+
+        fn finish_run_with_event(
+            &self,
+            run_id: &str,
+            terminal: &PersistedRun,
+            event: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            if self
+                .fail_next_finish
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::Backend(
+                    "injected first terminal persistence failure".into(),
+                ));
+            }
+            self.inner.finish_run_with_event(run_id, terminal, event)
         }
 
         fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
@@ -9648,7 +9840,7 @@ type = "manual"
 
     #[test]
     fn intake_gate_pipeline_pipes_the_trigger_payload_through_a_step_one_checkpoint() {
-        // Marc's double-HITL shape: `checkpoint -> capability -> ...`. The
+        // This double-HITL shape is `checkpoint -> capability -> ...`. The
         // step-1 checkpoint has no prior step result, so its resume must pipe
         // the TRIGGER PAYLOAD forward (mapping identical to `step_input_value`),
         // not Null — otherwise the first work step is starved of the event.
@@ -10505,6 +10697,53 @@ type = "manual"
         assert!(
             !events.iter().any(|ev| ev.kind == "gate_resolved"),
             "a failed checkpoint deny must not write a gate_resolved row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_deny_event_failure_rolls_back_terminal_transition() {
+        let store = Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-deny-event-fail")])
+            .with_store(store.clone());
+        let first = engine
+            .start_run("cp-deny-event-fail", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to the checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Deny {
+                    reason: Some("not appropriate".into()),
+                },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect_err("the atomic terminal and event write must fail together");
+        assert!(err.to_string().contains("injected append failure"));
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint),
+            "the checkpoint must remain parked when the event cannot commit"
+        );
+        assert!(
+            engine.last_finished_run("cp-deny-event-fail").is_none(),
+            "the terminal transition must not become visible"
+        );
+        assert!(
+            store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "gate_resolved"),
+            "the resolution event must not become visible"
         );
     }
 
