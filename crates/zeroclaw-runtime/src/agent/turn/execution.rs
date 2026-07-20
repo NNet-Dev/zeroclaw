@@ -67,16 +67,16 @@ impl ResolvedModelAccess<'_> {
         // This one-shot seam does NOT run `prepare_messages_for_provider` (the
         // main iteration path does that upstream), so a tool-result
         // `[AUDIO:/path]` in the history — e.g. the max-iteration graceful
-        // summary sends the accumulated history verbatim — would otherwise reach
-        // the provider as a raw filesystem path and be hallucinated over (#9089).
-        // Sanitize the unhandled non-image media markers here so every direct
+        // summary sends the accumulated history verbatim — would otherwise
+        // reach the provider as a raw filesystem path and be hallucinated
+        // over. Strip loadable audio markers here so every direct
         // `run_model_query` caller is covered. Borrows untouched when clean.
         let ChatRequest {
             messages,
             tools,
             thinking,
         } = request;
-        let sanitized = multimodal::sanitize_unhandled_media_markers(messages);
+        let sanitized = multimodal::sanitize_audio_markers(messages);
         let request = ChatRequest {
             messages: &sanitized,
             tools,

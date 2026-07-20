@@ -396,8 +396,8 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    // #9089 regression: the graceful-summary path dispatches the accumulated
-    // history directly through `run_model_query`, which does NOT run
+    // The graceful-summary path dispatches the accumulated history directly
+    // through `run_model_query`, which does NOT run
     // `prepare_messages_for_provider`. A tool-result `[AUDIO:/path]` in that
     // history must be stripped before it reaches the provider, or the raw
     // filesystem path leaks and is hallucinated over on the max-iteration exit.

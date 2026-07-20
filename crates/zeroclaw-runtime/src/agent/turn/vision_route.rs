@@ -252,8 +252,8 @@ mod tests {
         );
     }
 
-    /// #9089: a tool-result `[AUDIO:...]` marker on the non-degrade path must
-    /// be stripped before dispatch so a raw filesystem path never reaches the
+    /// A tool-result `[AUDIO:...]` marker on the non-degrade path must be
+    /// stripped before dispatch so a raw filesystem path never reaches the
     /// provider as literal text (the silent-hallucination failure mode). This
     /// exercises the real turn-loop prep entrypoint, not just the provider-layer
     /// helper, so it covers the degrade/non-degrade branch selection.
