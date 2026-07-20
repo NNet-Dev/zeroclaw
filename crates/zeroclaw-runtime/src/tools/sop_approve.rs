@@ -72,11 +72,6 @@ impl Tool for SopApproveTool {
             anyhow::Error::msg("Missing 'run_id' parameter")
         })?;
 
-        // Lock the engine, route through the broker/chokepoint, then drop the lock.
-        // `resolve_via_broker` records ledger/metrics for approval gates and also
-        // authorizes deterministic checkpoints before delegating to the checkpoint
-        // resolver. Under `approval_mode = out_of_band_required` this returns
-        // RejectedSelfApproval (the gate stays open for a CLI/gateway approver).
         let result = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
@@ -150,6 +145,14 @@ impl Tool for SopApproveTool {
                     "Approval failed: run {run_id} is not waiting for approval."
                 )),
             }),
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::DeferredAtCapacity)) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "sop-approval-deferred-at-capacity",
+                    &[("run_id", run_id)],
+                )),
+            }),
             // A quorum can record a valid vote without clearing the gate yet.
             Ok(BrokerOutcome::PendingQuorum { have, need }) => Ok(ToolResult {
                 success: true,
@@ -181,9 +184,9 @@ impl Tool for SopApproveTool {
             Ok(BrokerOutcome::PolicyUnavailable { reason }) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!(
-                    "Approval failed: the parked step's approval policy could not be \
-                     resolved ({reason}); the gate is left waiting."
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "sop-approval-policy-unavailable",
+                    &[("reason", reason.as_str())],
                 )),
             }),
             Err(e) => Ok(ToolResult {

@@ -98,6 +98,7 @@ pub fn build_sop_engine(
     config: SopConfig,
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
+    route_adapter: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
@@ -115,9 +116,14 @@ pub fn build_sop_engine(
         Arc::new(store::InMemoryRunStore::new())
     });
     let (run_tx, _run_rx) = tokio::sync::broadcast::channel(256);
-    let approval_broker = Arc::new(approval::ApprovalBroker::with_route(Arc::new(
-        approval::NoopRouteAdapter,
-    )));
+    // EPIC G: the approval broker (membership + quorum) resolves policies/groups
+    // from the engine's live `[sop.approval]` at use-time. The route adapter
+    // delivers approval request/escalation notices to a channel; the daemon injects
+    // a real channel-delivering adapter, while CLI/standalone callers pass `None`
+    // and fall back to the no-op (log-only) adapter - unchanged behavior there.
+    let route: Arc<dyn approval::ApprovalRouteAdapter> =
+        route_adapter.unwrap_or_else(|| Arc::new(approval::NoopRouteAdapter));
+    let approval_broker = Arc::new(approval::ApprovalBroker::with_route(route));
     let mut engine = SopEngine::new(config)
         .with_store(store)
         .with_metrics(SopMetricsCollector::shared())
@@ -151,11 +157,16 @@ fn sops_dir(workspace_dir: &Path) -> PathBuf {
 }
 
 /// Resolve the SOPs directory from config, falling back to workspace default.
+///
+/// A relative `config_dir` (the common case in the documented
+/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
+/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
+/// the base entirely when the joined path is itself absolute).
 pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
         Some(dir) if !dir.is_empty() => {
             let expanded = shellexpand::tilde(dir);
-            PathBuf::from(expanded.as_ref())
+            workspace_dir.join(expanded.as_ref())
         }
         _ => sops_dir(workspace_dir),
     }
@@ -1069,6 +1080,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn resolve_sops_dir_joins_relative_config_value_to_workspace() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        let resolved = resolve_sops_dir(workspace, Some("shared/sops"));
+        assert_eq!(resolved, workspace.join("shared/sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_keeps_absolute_config_value_as_is() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        let resolved = resolve_sops_dir(workspace, Some("/srv/shared/sops"));
+        assert_eq!(resolved, Path::new("/srv/shared/sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_falls_back_to_workspace_sops_when_unset() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        assert_eq!(resolve_sops_dir(workspace, None), workspace.join("sops"));
+        assert_eq!(
+            resolve_sops_dir(workspace, Some("")),
+            workspace.join("sops")
+        );
+    }
 
     fn authoring_sop(steps: Vec<SopStep>) -> Sop {
         Sop {

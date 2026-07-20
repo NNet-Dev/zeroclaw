@@ -424,10 +424,9 @@ pub async fn handle_sop_decide(
             ) => {
                 use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
                 // Route through the broker (membership + quorum), not `resolve_gate`
-                // directly. Otherwise this authoring surface would clear a policied
-                // approval gate or deterministic checkpoint without enforcing group
-                // membership or quorum. With no `[sop.approval]` policy this is the
-                // historical transition path.
+                // directly, otherwise this authoring surface would
+                // clear a policied approval gate without enforcing group membership or
+                // quorum. With no `[sop.approval]` policy this is exactly `resolve_gate`.
                 match guard.resolve_via_broker(&run_id, decision, principal) {
                     Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
                         resumed_action = Some(*action);
@@ -456,6 +455,16 @@ pub async fn handle_sop_decide(
                         )
                             .into_response();
                     }
+                    Ok(BrokerOutcome::Resolved(ResolveOutcome::DeferredAtCapacity)) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "outcome": "deferred_at_capacity",
+                                "run_id": run_id,
+                            })),
+                        )
+                            .into_response();
+                    }
                     Ok(BrokerOutcome::NotAuthorized { required_group }) => {
                         return (
                             StatusCode::FORBIDDEN,
@@ -480,7 +489,8 @@ pub async fn handle_sop_decide(
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
-                                "error": format!("approval policy could not be resolved: {reason} (gate left waiting)")
+                                "error": "policy_unavailable",
+                                "reason": reason,
                             })),
                         )
                             .into_response();

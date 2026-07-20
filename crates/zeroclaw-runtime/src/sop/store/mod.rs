@@ -1,18 +1,4 @@
 //! Durable SOP run-state store (EPIC B) — the keystone contract.
-//!
-//! A single [`SopRunStore`] is owned by the engine singleton (EPIC A). It is the
-//! one durable home for run state, the CAS-claim admission primitive
-//! (concurrency-control), the append-only event log (audit-trail / observability),
-//! and the procedural-memory proposal namespace — so those epics ride **one**
-//! abstraction, not three.
-//!
-//! This module ships the trait + wire shapes, the in-memory default impl (which
-//! mirrors today's behaviour with persistence off), the durable
-//! [`SqliteRunStore`], and the config-driven `build_run_store` factory.
-//! `build_sop_engine` injects the selected backend and rehydrates in-flight runs
-//! at startup via `restore_runs()`. (A `Memory`-backed adapter was considered and
-//! dropped: the `Memory` trait is async while `SopRunStore` is sync.) See
-//! `epics/B-run-state-store/{03-architecture,04-implementation-plan}.md`.
 
 pub mod model;
 pub mod sqlite;
@@ -29,12 +15,6 @@ pub use model::{
 };
 pub use sqlite::SqliteRunStore;
 
-/// First-class durable run-state store. ONE per engine singleton.
-///
-/// All methods are sync and **fail-loud**: a store error is never silently
-/// swallowed (persistence is fail-closed). Implementations must be cheap to
-/// `Arc::clone` and safe to share across the daemon tick, agent tools, MQTT
-/// listener, and the gateway approve surface.
 pub trait SopRunStore: Send + Sync {
     // ── run state (persistence-resume, state-machine) ──
     /// Persist-before-mutate. Revision-guarded: a strictly-older revision is
@@ -42,11 +22,29 @@ pub trait SopRunStore: Send + Sync {
     /// byte-identical idempotent retry, else `RevisionConflict`; a newer
     /// revision wins.
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError>;
+    /// Persist an active run transition and append its audit event as one store
+    /// outcome. Implementations must make both writes visible together or neither
+    /// visible at all; callers use this for approval gate resolution so a durable
+    /// `gate_resolved` row cannot exist without the run transition it authorizes.
+    fn save_run_with_event(
+        &self,
+        run: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError>;
     /// Move a run to terminal state (kept as a terminal record, not deleted) and
     /// release any live claim. Revision-guarded exactly like `save_run`, so a
     /// stale or divergent terminal write cannot clobber newer state or release a
     /// live claim.
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError>;
+    /// Move a run to terminal state and append its audit event as one store
+    /// outcome. Claim release is part of the terminal transition and must be in
+    /// the same atomic boundary as the audit append.
+    fn finish_run_with_event(
+        &self,
+        run_id: &str,
+        terminal: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError>;
     /// Boot-rehydrate source: every non-terminal run (latest revision per id).
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError>;
     /// Boot-rehydrate source for the display retention window: terminal runs,
@@ -63,12 +61,6 @@ pub trait SopRunStore: Send + Sync {
     fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError>;
 
     // ── CAS claim primitive (concurrency-control) ──
-    /// Atomic single-winner admission honoring BOTH concurrency limits. Returns
-    /// `Some(token)` to exactly one caller iff no live claim exists for `run_id`,
-    /// the run is not terminal, the live claims for `sop_name` stay below
-    /// `per_sop_cap`, AND total live claims stay below `global_cap`. Both caps
-    /// are inclusive maxima counted under one lock (mirrors the engine
-    /// `can_start`); a cap of 0 admits nothing. Otherwise `None`.
     fn try_claim_run(
         &self,
         run_id: &str,
@@ -76,17 +68,13 @@ pub trait SopRunStore: Send + Sync {
         per_sop_cap: usize,
         global_cap: usize,
     ) -> Result<Option<ClaimToken>, StoreError>;
-    /// Re-establish the claim for an already-running run during boot rehydrate
-    /// (`restore_runs`), WITHOUT applying admission caps. These runs were admitted
-    /// before the restart, so reconstruction is not new admission: an over-cap
-    /// restored set must keep its claims (1:1 with `active_runs`) rather than be
-    /// silently dropped. Idempotent: refreshes an existing claim or inserts a fresh
-    /// one. Not for live admission - that is `try_claim_run`.
     fn renew_claim_for_restore(
         &self,
         run_id: &str,
         sop_name: &str,
     ) -> Result<ClaimToken, StoreError>;
+    fn mark_claim_retained_after_terminal_rollback(&self, run_id: &str) -> Result<(), StoreError>;
+    fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError>;
     /// Live claim counts as `(for_sop, total)`, used by read-only admission
     /// checks so status surfaces observe the same concurrency source as CAS.
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError>;
@@ -118,6 +106,8 @@ pub trait SopRunStore: Send + Sync {
     /// Backend name (for logs + the "never a silent no-op" guard).
     fn backend(&self) -> &'static str;
 }
+
+pub(crate) const RETAINED_TERMINAL_ROLLBACK_HOLDER: &str = "engine:terminal-rollback-retained";
 
 /// Errors a store may surface. Never swallowed by callers.
 #[derive(Debug)]
@@ -262,11 +252,6 @@ impl InMemoryRunStore {
     }
 }
 
-/// Revision guard shared by every write path: returns `Ok(())` only when
-/// `incoming` is safe to persist over `existing` (a first write, a strictly
-/// newer revision, or a byte-identical same-revision retry). A strictly older
-/// revision is `StaleRevision`; a divergent same-revision payload is
-/// `RevisionConflict`. Durable backends apply the same rule transactionally.
 fn revision_guard(
     existing: Option<&PersistedRun>,
     incoming: &PersistedRun,
@@ -292,12 +277,32 @@ fn revision_guard(
     Ok(())
 }
 
+fn append_event_locked(g: &mut Inner, ev: &SopEventRecord) -> u64 {
+    g.seq += 1;
+    let seq = g.seq;
+    let mut rec = ev.clone();
+    rec.seq = seq;
+    g.events.entry(ev.run_id.clone()).or_default().push(rec);
+    seq
+}
+
 impl SopRunStore for InMemoryRunStore {
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
         revision_guard(g.runs.get(run.run_id()), run)?;
         g.runs.insert(run.run_id().to_string(), run.clone());
         Ok(())
+    }
+
+    fn save_run_with_event(
+        &self,
+        run: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        revision_guard(g.runs.get(run.run_id()), run)?;
+        g.runs.insert(run.run_id().to_string(), run.clone());
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
@@ -307,6 +312,20 @@ impl SopRunStore for InMemoryRunStore {
         g.terminal.insert(run_id.to_string());
         g.claims.remove(run_id);
         Ok(())
+    }
+
+    fn finish_run_with_event(
+        &self,
+        run_id: &str,
+        terminal: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        revision_guard(g.runs.get(run_id), terminal)?;
+        g.runs.insert(run_id.to_string(), terminal.clone());
+        g.terminal.insert(run_id.to_string());
+        g.claims.remove(run_id);
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
@@ -409,6 +428,21 @@ impl SopRunStore for InMemoryRunStore {
         Ok(token)
     }
 
+    fn mark_claim_retained_after_terminal_rollback(&self, run_id: &str) -> Result<(), StoreError> {
+        let mut g = self.lock()?;
+        let claim = g.claims.get_mut(run_id).ok_or(StoreError::ClaimLost)?;
+        claim.holder = RETAINED_TERMINAL_ROLLBACK_HOLDER.to_string();
+        Ok(())
+    }
+
+    fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .lock()?
+            .claims
+            .get(run_id)
+            .is_some_and(|claim| claim.holder == RETAINED_TERMINAL_ROLLBACK_HOLDER))
+    }
+
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
         let g = self.lock()?;
         let per_sop = g.claims.values().filter(|c| c.sop_name == sop_name).count();
@@ -435,12 +469,7 @@ impl SopRunStore for InMemoryRunStore {
 
     fn append_event(&self, ev: &SopEventRecord) -> Result<u64, StoreError> {
         let mut g = self.lock()?;
-        g.seq += 1;
-        let seq = g.seq;
-        let mut rec = ev.clone();
-        rec.seq = seq;
-        g.events.entry(ev.run_id.clone()).or_default().push(rec);
-        Ok(seq)
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn list_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
@@ -474,11 +503,6 @@ impl SopRunStore for InMemoryRunStore {
         let mut g = self.lock()?;
         let mut dropped = 0usize;
 
-        // Age bound (`keep_secs`): drop terminal runs whose completion (or start,
-        // when completion is unset) time is older than the cutoff, independently
-        // of the count, so it also applies when `max_terminal` is unbounded (0).
-        // The cutoff is formatted to match `now_iso8601()` (trailing "Z") so the stored
-        // ISO-8601 UTC timestamps compare lexically.
         if let Some(keep) = policy.keep_secs {
             let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(keep as i64))
                 .format("%Y-%m-%dT%H:%M:%SZ")
