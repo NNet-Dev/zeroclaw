@@ -2714,6 +2714,8 @@ mod sop_step_reassembly_tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
             agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(SopConfig::default());
