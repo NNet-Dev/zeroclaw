@@ -418,16 +418,12 @@ pub async fn handle_sop_decide(
         };
         let status = guard.get_run(&run_id).map(|r| r.status);
         match status {
-            Some(
-                zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval
-                | zeroclaw_runtime::sop::types::SopRunStatus::PausedCheckpoint,
-            ) => {
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval) => {
                 use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
                 // Route through the broker (membership + quorum), not `resolve_gate`
-                // directly. Otherwise this authoring surface would clear a policied
-                // approval gate or deterministic checkpoint without enforcing group
-                // membership or quorum. With no `[sop.approval]` policy this is the
-                // historical transition path.
+                // directly, otherwise this authoring surface would
+                // clear a policied approval gate without enforcing group membership or
+                // quorum. With no `[sop.approval]` policy this is exactly `resolve_gate`.
                 match guard.resolve_via_broker(&run_id, decision, principal) {
                     Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
                         resumed_action = Some(*action);
@@ -472,15 +468,6 @@ pub async fn handle_sop_decide(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
                                 "error": format!("approval policy '{name}' is not configured (gate left waiting)")
-                            })),
-                        )
-                            .into_response();
-                    }
-                    Ok(BrokerOutcome::PolicyUnavailable { reason }) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({
-                                "error": format!("approval policy could not be resolved: {reason} (gate left waiting)")
                             })),
                         )
                             .into_response();

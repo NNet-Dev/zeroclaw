@@ -12,6 +12,7 @@
 //! pass-through to `resolve_gate` - unchanged behavior.
 
 pub mod broker;
+pub mod channel_route;
 pub mod decision;
 pub mod identity;
 pub mod ledger;
@@ -19,7 +20,10 @@ pub mod principal;
 pub mod resolve;
 pub mod timeout;
 
-pub use broker::{ApprovalBroker, ApprovalRouteAdapter, BrokerOutcome, NoopRouteAdapter};
+pub use broker::{
+    ApprovalBroker, ApprovalNoticeKind, ApprovalRouteAdapter, BrokerOutcome, NoopRouteAdapter,
+};
+pub use channel_route::{ApprovalRouteIssue, ChannelRouteAdapter, unresolvable_approval_routes};
 pub use decision::{ApprovalDecision, ResolveOutcome};
 pub use identity::{ApprovalIdentityResolver, LocalConfigApprovalIdentityResolver};
 pub use ledger::{GateEventKind, GateLedgerEntry};

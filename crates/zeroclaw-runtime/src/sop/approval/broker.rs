@@ -22,13 +22,37 @@ use super::identity::{ApprovalIdentityResolver, LocalConfigApprovalIdentityResol
 use super::principal::{ApprovalPrincipal, ApprovalSource};
 use crate::sop::engine::{GateState, SopEngine};
 
+/// Why an approval notice is being delivered. Route adapters render this so an
+/// on-call escalation cannot be mistaken for the initial request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalNoticeKind {
+    Request,
+    Escalation,
+}
+
+impl ApprovalNoticeKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Escalation => "escalation",
+        }
+    }
+}
+
 /// Deliver an approval notice to a named route (channel). The seam that lets
 /// approvals reach approvers beyond the originating channel (the cross-channel HITL
 /// gap) and that escalation uses to reach a distinct SECOND route on timeout.
 /// Delivery is best-effort: a route error must never clear or block a gate (the gate
 /// state is the source of truth; the route is only a notice).
 pub trait ApprovalRouteAdapter: Send + Sync {
-    fn deliver(&self, route: &str, run_id: &str, sop_name: &str, step: u32) -> anyhow::Result<()>;
+    fn deliver(
+        &self,
+        notice: ApprovalNoticeKind,
+        route: &str,
+        run_id: &str,
+        sop_name: &str,
+        step: u32,
+    ) -> anyhow::Result<()>;
 }
 
 /// A no-op route adapter: logs the delivery intent but sends nowhere. The default
@@ -37,15 +61,26 @@ pub trait ApprovalRouteAdapter: Send + Sync {
 pub struct NoopRouteAdapter;
 
 impl ApprovalRouteAdapter for NoopRouteAdapter {
-    fn deliver(&self, route: &str, run_id: &str, sop_name: &str, step: u32) -> anyhow::Result<()> {
+    fn deliver(
+        &self,
+        notice: ApprovalNoticeKind,
+        route: &str,
+        run_id: &str,
+        sop_name: &str,
+        step: u32,
+    ) -> anyhow::Result<()> {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
                 ::serde_json::json!({
-                    "route": route, "run_id": run_id, "sop_name": sop_name, "step": step
+                    "notice_kind": notice.label(), "route": route, "run_id": run_id,
+                    "sop_name": sop_name, "step": step
                 })
             ),
-            &format!("approval route delivery (noop): run {run_id} step {step} -> route '{route}'")
+            &format!(
+                "approval {} route delivery (noop): run {run_id} step {step} -> route '{route}'",
+                notice.label()
+            )
         );
         Ok(())
     }
@@ -66,10 +101,6 @@ pub enum BrokerOutcome {
     /// than treated as an unpoliced (quorum-1, no-membership) gate, so a typo can
     /// never downgrade a policied step to open approval.
     PolicyMissing { name: String },
-    /// The broker could not resolve the parked run's live SOP/step state well
-    /// enough to know whether the step is intentionally unpoliced. FAIL CLOSED:
-    /// the parked run is left untouched rather than downgraded to open approval.
-    PolicyUnavailable { reason: String },
     /// The run is not a waiting gate (unknown / already-resolved / not applicable).
     NotWaiting,
 }
@@ -89,9 +120,6 @@ impl BrokerOutcome {
             BrokerOutcome::PolicyMissing { name } => {
                 format!("policy_missing ('{name}')")
             }
-            BrokerOutcome::PolicyUnavailable { reason } => {
-                format!("policy_unavailable ({reason})")
-            }
         }
     }
 }
@@ -110,9 +138,6 @@ enum StepPolicy {
     /// The step names a policy ABSENT from config: fail closed, never treat as
     /// unpoliced.
     MissingNamed(String),
-    /// The run/SOP/current step could not be resolved from live state. Fail closed:
-    /// this is not the same as an authored step with no policy.
-    Unavailable(String),
 }
 
 /// Authorization + quorum layer over `resolve_gate`. Holds NO copy of the approval
@@ -161,7 +186,13 @@ impl ApprovalBroker {
 
     /// Deliver an escalation notice to a route (best-effort).
     pub fn deliver_escalation(&self, route: &str, run_id: &str, sop_name: &str, step: u32) {
-        if let Err(e) = self.route.deliver(route, run_id, sop_name, step) {
+        if let Err(e) = self.route.deliver(
+            ApprovalNoticeKind::Escalation,
+            route,
+            run_id,
+            sop_name,
+            step,
+        ) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -174,14 +205,45 @@ impl ApprovalBroker {
         }
     }
 
+    /// The request route for a named policy: the channel the INITIAL approval
+    /// request is delivered to when a run parks at a gate this policy governs. Read
+    /// from live config; an empty string is treated as `None` (no out-of-band
+    /// request notice), matching the config contract. This is a DISTINCT lifecycle
+    /// event from [`escalation_route`](Self::escalation_route) - the request fires on
+    /// park, the escalation only if the gate later times out.
+    pub fn request_route(&self, cfg: &SopApprovalConfig, policy_name: &str) -> Option<String> {
+        cfg.policies
+            .get(policy_name)
+            .and_then(|p| p.request_route.clone())
+            .filter(|r| !r.is_empty())
+    }
+
+    /// Deliver the initial approval-request notice to a route (best-effort). Fired
+    /// when a run parks at a policied gate; a delivery failure never blocks or clears
+    /// the gate (the gate is the source of truth, this is only a notice).
+    pub fn deliver_request(&self, route: &str, run_id: &str, sop_name: &str, step: u32) {
+        if let Err(e) =
+            self.route
+                .deliver(ApprovalNoticeKind::Request, route, run_id, sop_name, step)
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "route": route, "run_id": run_id, "error": e.to_string()
+                    })),
+                "approval request route delivery failed (gate unaffected)"
+            );
+        }
+    }
+
     /// The approval policy that applies to the run's currently-waiting step, resolved
     /// from the engine's live config. Three-state so a NAMED-but-absent policy is
     /// distinguished from no policy at all - the caller fails closed on the former.
     fn step_policy(&self, engine: &SopEngine, run_id: &str) -> StepPolicy {
-        let name = match engine.current_step_policy_lookup(run_id) {
-            Ok(Some(name)) => name,
-            Ok(None) => return StepPolicy::Unpoliced,
-            Err(e) => return StepPolicy::Unavailable(e.to_string()),
+        let Some(name) = engine.current_step_policy_name(run_id) else {
+            return StepPolicy::Unpoliced;
         };
         match engine.approval_config().policies.get(&name) {
             Some(p) => StepPolicy::Named {
@@ -189,86 +251,6 @@ impl ApprovalBroker {
                 config: p.clone(),
             },
             None => StepPolicy::MissingNamed(name),
-        }
-    }
-
-    /// Authorize a deterministic checkpoint through the same named-policy model as
-    /// approval gates. `None` means the caller may resolve the checkpoint now;
-    /// `Some(outcome)` is a terminal broker answer and the checkpoint must stay
-    /// parked. Positive approval quorum uses the existing gate-vote ledger scoped
-    /// to the current policy and step; denials are still single-authorized-member
-    /// fail-safe decisions.
-    pub(crate) fn authorize_checkpoint(
-        &self,
-        engine: &mut SopEngine,
-        run_id: &str,
-        step: u32,
-        decision: &ApprovalDecision,
-        principal: &ApprovalPrincipal,
-    ) -> anyhow::Result<Option<BrokerOutcome>> {
-        let policy: Option<(String, ApprovalPolicyConfig)> = match self.step_policy(engine, run_id)
-        {
-            StepPolicy::Unavailable(reason) => {
-                return Ok(Some(BrokerOutcome::PolicyUnavailable { reason }));
-            }
-            StepPolicy::MissingNamed(name) => {
-                return Ok(Some(BrokerOutcome::PolicyMissing { name }));
-            }
-            StepPolicy::Unpoliced => None,
-            StepPolicy::Named { name, config } => Some((name, config)),
-        };
-
-        // Unpoliced checkpoint: the broker is a pass-through to the HISTORICAL
-        // checkpoint resolver (`approve_step` / `deny_checkpoint`), which applies NO
-        // `approval_mode` gate - see the `resolve_via_broker` contract in engine.rs.
-        // Return BEFORE the membership and `approval_mode` checks so an unpoliced
-        // checkpoint under a non-default `approval_mode` (e.g. `OutOfBandRequired`)
-        // is not wrongly rejected as self-approval and stranded at PausedCheckpoint.
-        // The `approval_mode` gate below still governs every POLICIED checkpoint.
-        let Some((policy_name, cfg)) = policy.as_ref() else {
-            return Ok(None);
-        };
-
-        if let Some(group) = cfg.required_group.as_deref().filter(|g| !g.is_empty())
-            && !self
-                .resolver
-                .is_member(engine.approval_config(), principal, group)
-        {
-            return Ok(Some(BrokerOutcome::NotAuthorized {
-                required_group: group.to_string(),
-            }));
-        }
-
-        if super::resolve::is_rejected_by_approval_mode(engine.config().approval_mode, principal) {
-            return Ok(Some(BrokerOutcome::Resolved(
-                ResolveOutcome::RejectedSelfApproval,
-            )));
-        }
-
-        if matches!(decision, ApprovalDecision::Deny { .. }) {
-            return Ok(None);
-        }
-        let need = (cfg.quorum.max(1)) as usize;
-        if need <= 1 {
-            return Ok(None);
-        }
-        if engine.is_park_persist_pending(run_id) {
-            anyhow::bail!(
-                "cannot record checkpoint approval vote for run {run_id}: its parked snapshot is not yet durably persisted (retrying)"
-            );
-        }
-        engine.record_gate_vote(run_id, step, policy_name, principal)?;
-        let have = self.count_qualified_voters(
-            engine,
-            run_id,
-            step,
-            policy_name,
-            cfg.required_group.as_deref().filter(|g| !g.is_empty()),
-        )?;
-        if have >= need {
-            Ok(None)
-        } else {
-            Ok(Some(BrokerOutcome::PendingQuorum { have, need }))
         }
     }
 
@@ -294,9 +276,6 @@ impl ApprovalBroker {
         // waiting rather than falling through to an unpoliced (quorum-1) resolution.
         let policy: Option<(String, ApprovalPolicyConfig)> = match self.step_policy(engine, run_id)
         {
-            StepPolicy::Unavailable(reason) => {
-                return Ok(BrokerOutcome::PolicyUnavailable { reason });
-            }
             StepPolicy::MissingNamed(name) => return Ok(BrokerOutcome::PolicyMissing { name }),
             StepPolicy::Unpoliced => None,
             StepPolicy::Named { name, config } => Some((name, config)),
@@ -511,40 +490,6 @@ mod tests {
         }
     }
 
-    /// A deterministic SOP whose first checkpoint step names `policy`.
-    fn checkpoint_policy_sop(policy: &str) -> Sop {
-        Sop {
-            name: "checkpointed".into(),
-            description: "t".into(),
-            version: "1.0.0".into(),
-            priority: SopPriority::Normal,
-            execution_mode: SopExecutionMode::Deterministic,
-            triggers: vec![SopTrigger::Manual],
-            steps: vec![
-                SopStep {
-                    number: 1,
-                    title: "checkpoint".into(),
-                    kind: SopStepKind::Checkpoint,
-                    policy: Some(policy.into()),
-                    ..SopStep::default()
-                },
-                SopStep {
-                    number: 2,
-                    title: "go".into(),
-                    kind: SopStepKind::Execute,
-                    ..SopStep::default()
-                },
-            ],
-            cooldown_secs: 0,
-            max_concurrent: 1,
-            location: None,
-            deterministic: true,
-            admission_policy: SopAdmissionPolicy::Parallel,
-            max_pending_approvals: 0,
-            agent: None,
-        }
-    }
-
     /// approval config: group `release` with the given members, policy `prod`
     /// requiring that group and the given quorum.
     fn approval_cfg(members: &[&str], quorum: u32) -> SopApprovalConfig {
@@ -561,6 +506,7 @@ mod tests {
             ApprovalPolicyConfig {
                 required_group: Some("release".into()),
                 quorum,
+                request_route: None,
                 escalation_route: None,
             },
         );
@@ -591,45 +537,6 @@ mod tests {
         (e, id)
     }
 
-    fn checkpoint_engine_with_broker(cfg: SopApprovalConfig) -> (SopEngine, String) {
-        let broker = Arc::new(ApprovalBroker::disabled());
-        let sop_config = SopConfig {
-            approval: cfg,
-            ..SopConfig::default()
-        };
-        let mut e = SopEngine::new(sop_config).with_approval_broker(broker);
-        e.set_sops_for_test(vec![checkpoint_policy_sop("prod")]);
-        let action = e.start_run("checkpointed", manual()).unwrap();
-        let id = match action {
-            SopRunAction::CheckpointWait { run_id, .. } => run_id,
-            other => panic!("expected CheckpointWait, got {other:?}"),
-        };
-        (e, id)
-    }
-
-    /// An engine parked at an UNPOLICED deterministic checkpoint (the first step
-    /// names no policy) under the given `approval_mode` - so a test can prove the
-    /// unpoliced checkpoint path applies no `approval_mode` gate.
-    fn unpoliced_checkpoint_engine(
-        mode: zeroclaw_config::schema::ApprovalMode,
-    ) -> (SopEngine, String) {
-        let broker = Arc::new(ApprovalBroker::disabled());
-        let sop_config = SopConfig {
-            approval_mode: mode,
-            ..SopConfig::default()
-        };
-        let mut e = SopEngine::new(sop_config).with_approval_broker(broker);
-        let mut sop = checkpoint_policy_sop("prod");
-        sop.steps[0].policy = None; // unpoliced checkpoint
-        e.set_sops_for_test(vec![sop]);
-        let action = e.start_run("checkpointed", manual()).unwrap();
-        let id = match action {
-            SopRunAction::CheckpointWait { run_id, .. } => run_id,
-            other => panic!("expected CheckpointWait, got {other:?}"),
-        };
-        (e, id)
-    }
-
     #[test]
     fn non_member_is_not_authorized_and_gate_stays_open() {
         let (mut e, id) = engine_with_broker(approval_cfg(&["alice"], 1));
@@ -645,137 +552,6 @@ mod tests {
             matches!(e.gate_state(&id), GateState::Waiting { .. }),
             "an unauthorized attempt must leave the gate waiting"
         );
-    }
-
-    #[test]
-    fn checkpoint_non_member_is_not_authorized_and_stays_paused() {
-        let (mut e, id) = checkpoint_engine_with_broker(approval_cfg(&["alice"], 1));
-        let out = e
-            .resolve_via_broker(
-                &id,
-                ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("mallory".into())),
-            )
-            .unwrap();
-        assert!(
-            matches!(out, BrokerOutcome::NotAuthorized { .. }),
-            "a checkpoint must enforce named-policy group membership, got {out:?}"
-        );
-        assert_eq!(
-            e.get_run(&id).map(|r| r.status),
-            Some(SopRunStatus::PausedCheckpoint),
-            "an unauthorized checkpoint decision must leave the run parked"
-        );
-        let events = e.run_events(&id).unwrap_or_default();
-        assert!(
-            events.iter().all(|ev| ev.kind != "gate_resolved"),
-            "an unauthorized checkpoint decision must not append a resolved row: {events:?}"
-        );
-    }
-
-    #[test]
-    fn checkpoint_quorum_blocks_tail_until_second_distinct_member() {
-        let (mut e, id) = checkpoint_engine_with_broker(approval_cfg(&["alice", "bob"], 2));
-
-        let first = e
-            .resolve_via_broker(
-                &id,
-                ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("alice".into())),
-            )
-            .unwrap();
-        assert!(matches!(
-            first,
-            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
-        ));
-        assert_eq!(
-            e.get_run(&id).map(|r| r.status),
-            Some(SopRunStatus::PausedCheckpoint),
-            "one authorized checkpoint vote must not resume the run"
-        );
-
-        let second = e
-            .resolve_via_broker(
-                &id,
-                ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("bob".into())),
-            )
-            .unwrap();
-        assert!(
-            matches!(second, BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))),
-            "the second distinct authorized checkpoint vote must resolve, got {second:?}"
-        );
-        assert_ne!(
-            e.get_run(&id).map(|r| r.status),
-            Some(SopRunStatus::PausedCheckpoint),
-            "the checkpoint tail must not remain parked after quorum is met"
-        );
-    }
-
-    #[test]
-    fn unpoliced_checkpoint_is_not_gated_by_approval_mode() {
-        // Regression: an UNPOLICED deterministic checkpoint must behave exactly like
-        // the historical checkpoint resolver, which applies NO `approval_mode` gate.
-        // Previously `authorize_checkpoint` ran the `approval_mode` check ahead of the
-        // unpoliced pass-through, so a non-default mode (`OutOfBandRequired` /
-        // `AgentTool`) wrongly rejected the resolver as self-approval
-        // (`RejectedSelfApproval`) and stranded the run at `PausedCheckpoint`. The mode
-        // gate must still govern POLICIED checkpoints (the other checkpoint tests cover
-        // that); only unpoliced ones are exempt.
-        use zeroclaw_config::schema::ApprovalMode;
-
-        // Each (mode, principal) pair is one `approval_mode` WOULD reject if the gate
-        // were (wrongly) applied to an unpoliced checkpoint: the agent under
-        // `OutOfBandRequired`, an out-of-band principal under `AgentTool`. The final
-        // `Both` case is the default, where the fix must be a no-op.
-        let cases = [
-            (
-                ApprovalMode::OutOfBandRequired,
-                ApprovalPrincipal::agent("bot"),
-            ),
-            (
-                ApprovalMode::AgentTool,
-                ApprovalPrincipal::cli(Some("alice".into())),
-            ),
-            (ApprovalMode::Both, ApprovalPrincipal::agent("bot")),
-        ];
-
-        for (mode, principal) in cases {
-            // Approve resolves and leaves PausedCheckpoint.
-            let (mut e, id) = unpoliced_checkpoint_engine(mode);
-            let out = e
-                .resolve_via_broker(&id, ApprovalDecision::Approve, principal.clone())
-                .unwrap();
-            assert!(
-                matches!(out, BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))),
-                "unpoliced checkpoint approve must resolve under {mode:?}, got {out:?}"
-            );
-            assert_ne!(
-                e.get_run(&id).map(|r| r.status),
-                Some(SopRunStatus::PausedCheckpoint),
-                "unpoliced checkpoint approve must not stay parked under {mode:?}"
-            );
-
-            // Deny resolves (routes through the checkpoint's on_failure) and likewise
-            // leaves PausedCheckpoint - it is not rejected as self-approval either.
-            let (mut e, id) = unpoliced_checkpoint_engine(mode);
-            let out = e
-                .resolve_via_broker(
-                    &id,
-                    ApprovalDecision::Deny { reason: None },
-                    principal.clone(),
-                )
-                .unwrap();
-            assert!(
-                matches!(out, BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))),
-                "unpoliced checkpoint deny must resolve under {mode:?}, got {out:?}"
-            );
-            assert_ne!(
-                e.get_run(&id).map(|r| r.status),
-                Some(SopRunStatus::PausedCheckpoint),
-                "unpoliced checkpoint deny must not stay parked under {mode:?}"
-            );
-        }
     }
 
     #[test]
@@ -1391,6 +1167,7 @@ mod tests {
             ApprovalPolicyConfig {
                 required_group: Some(String::new()),
                 quorum: 1,
+                request_route: None,
                 escalation_route: None,
             },
         );
@@ -1438,6 +1215,7 @@ mod tests {
             ApprovalPolicyConfig {
                 required_group: None,
                 quorum: 1,
+                request_route: None,
                 escalation_route: Some(String::new()),
             },
         );
@@ -1450,6 +1228,49 @@ mod tests {
             broker.escalation_route(&cfg, "prod"),
             None,
             "an empty escalation_route must resolve to None, not Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn request_route_reads_the_policy_and_treats_empty_as_none() {
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                request_route: Some("discord.ops:123".to_string()),
+                escalation_route: None,
+            },
+        );
+        policies.insert(
+            "blank".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                request_route: Some(String::new()),
+                escalation_route: None,
+            },
+        );
+        let cfg = SopApprovalConfig {
+            groups: HashMap::new(),
+            policies,
+        };
+        let broker = ApprovalBroker::disabled();
+        assert_eq!(
+            broker.request_route(&cfg, "prod").as_deref(),
+            Some("discord.ops:123"),
+            "a configured request_route is returned verbatim"
+        );
+        assert_eq!(
+            broker.request_route(&cfg, "blank"),
+            None,
+            "an empty request_route resolves to None (no out-of-band notice)"
+        );
+        assert_eq!(
+            broker.request_route(&cfg, "absent"),
+            None,
+            "an unknown policy has no request_route"
         );
     }
 
@@ -1498,43 +1319,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_live_policy_state_fails_closed_for_approve_and_deny() {
-        // A parked gate that originally named a policy must not become unpoliced if
-        // its live SOP definition disappears while the run is waiting. Both approve
-        // and deny fail closed before authorization or state mutation.
-        let (mut e, id) = engine_with_broker(approval_cfg(&["alice"], 1));
-        e.set_sops_for_test(vec![]);
-
-        for decision in [
-            ApprovalDecision::Approve,
-            ApprovalDecision::Deny {
-                reason: Some("no".into()),
-            },
-        ] {
-            let out = e
-                .resolve_via_broker(
-                    &id,
-                    decision,
-                    ApprovalPrincipal::cli(Some("mallory".into())),
-                )
-                .unwrap();
-            assert!(
-                matches!(out, BrokerOutcome::PolicyUnavailable { .. }),
-                "unavailable live SOP/step state must fail closed, got {out:?}"
-            );
-            assert!(
-                matches!(e.gate_state(&id), GateState::Waiting { .. }),
-                "the waiting gate must remain parked when policy state is unavailable"
-            );
-            let events = e.run_events(&id).unwrap_or_default();
-            assert!(
-                events.iter().all(|ev| ev.kind != "gate_resolved"),
-                "policy-unavailable decisions must not append a resolved row: {events:?}"
-            );
-        }
-    }
-
-    #[test]
     fn one_gateway_credential_over_http_and_ws_cannot_meet_quorum_of_two() {
         // B1: HTTP and WS authenticate via the SAME paired token, so a single subject
         // presented over both transports is ONE canonical voter and CANNOT satisfy a
@@ -1553,6 +1337,7 @@ mod tests {
             ApprovalPolicyConfig {
                 required_group: Some("release".into()),
                 quorum: 2,
+                request_route: None,
                 escalation_route: None,
             },
         );
@@ -1608,7 +1393,8 @@ members = ["http:abc123", "cli:test_user"]
 [policies.prod]
 required_group = "release"
 quorum = 2
-escalation_route = "oncall"
+request_route = "discord.ops:111222333"
+escalation_route = "discord.oncall:444555666"
 "#;
         let cfg: SopApprovalConfig = toml::from_str(toml).expect("parse [sop.approval]");
         let group = cfg.groups.get("release").expect("release group");
@@ -1619,6 +1405,15 @@ escalation_route = "oncall"
         let policy = cfg.policies.get("prod").expect("prod policy");
         assert_eq!(policy.required_group.as_deref(), Some("release"));
         assert_eq!(policy.quorum, 2);
-        assert_eq!(policy.escalation_route.as_deref(), Some("oncall"));
+        // Route values are `channel:recipient` (what the real ChannelRouteAdapter
+        // parses), not a bare channel name.
+        assert_eq!(
+            policy.request_route.as_deref(),
+            Some("discord.ops:111222333")
+        );
+        assert_eq!(
+            policy.escalation_route.as_deref(),
+            Some("discord.oncall:444555666")
+        );
     }
 }

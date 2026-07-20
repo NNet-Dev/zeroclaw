@@ -62,6 +62,36 @@ pub struct SopEngine {
     /// `resolve_gate` chokepoint. Defaults to a pass-through (no policies) so
     /// behavior is unchanged until a `[sop.approval]` policy is configured.
     approval_broker: Arc<super::approval::ApprovalBroker>,
+    /// A2: per-message dispatch idempotency for at-least-once transports. Maps a
+    /// redelivery-stable `(sop_name, delivery key)` to the run that already started for
+    /// it, so an AMQP broker redelivery of the same message (e.g. after a partial
+    /// multi-SOP dispatch requeued the whole delivery) coalesces instead of starting a
+    /// second run. Bounded FIFO (`DISPATCH_DEDUP_CAP`); the window need only outlast a
+    /// broker redelivery, not persist forever, so it is in-memory like `finished_runs`.
+    ///
+    /// CONTRACT (best-effort): the delivery key derives from the AMQP `message-id`, so
+    /// this is exactly-once ONLY when publishers set a UNIQUE `message-id` per logical
+    /// message (the AMQP-recommended practice). That is the sole cross-redelivery-stable
+    /// identity the broker exposes: `redelivered` is set for ANY requeue and the delivery
+    /// tag changes across a redelivery, so neither can prove two deliveries are the same
+    /// message. Under `message-id` REUSE (a publisher contract violation), a redelivery of
+    /// a reused id can coalesce a genuinely distinct trigger into the wrong run and ACK it
+    /// away: at-most-once, a dropped trigger. This is an accepted, documented limitation of
+    /// keying on a publisher-controlled id; the safe direction elsewhere is always a
+    /// duplicate run, never a silent drop, and a delivery with no `message-id` is never
+    /// deduplicated. A requeue-free design (ACK every delivery, retry deferred SOPs
+    /// in-process) would remove the redelivery and thus this dependency entirely - tracked
+    /// as a follow-up, out of scope for the dedup window here.
+    dispatch_dedup: std::collections::VecDeque<(String, String)>,
+}
+
+/// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
+const DISPATCH_DEDUP_CAP: usize = 512;
+
+/// Composite dedup key: `sop_name` and the transport delivery key joined by a NUL, which
+/// cannot appear in a SOP name, so distinct pairs never collide.
+fn dispatch_dedup_composite(sop_name: &str, dedup_key: &str) -> String {
+    format!("{sop_name}\u{0}{dedup_key}")
 }
 
 /// Outcome of one [`SopEngine::run_maintenance_tick`] pass (EPIC A1), for
@@ -103,6 +133,7 @@ impl SopEngine {
             capabilities: Arc::new(SopCapabilityRegistry::with_builtins()),
             claims_pending_persist: std::collections::HashSet::new(),
             approval_broker: Arc::new(super::approval::ApprovalBroker::disabled()),
+            dispatch_dedup: std::collections::VecDeque::new(),
         }
     }
 
@@ -165,13 +196,11 @@ impl SopEngine {
         Arc::clone(&self.approval_broker)
     }
 
-    /// Resolve a gate or deterministic checkpoint THROUGH the broker (membership +
-    /// quorum), then the chokepoint/checkpoint owner.
+    /// Resolve a gate THROUGH the broker (membership + quorum), then the chokepoint.
     /// This is the entry point out-of-band surfaces (gateway / CLI / tools) should
     /// call so a `[sop.approval]` policy is enforced; with no policy it is exactly
-    /// `resolve_gate` for `WaitingApproval` and the historical checkpoint resolver
-    /// for `PausedCheckpoint`. The broker is cloned out first so it does not borrow
-    /// `self` while `self` is mutated by the chokepoint.
+    /// `resolve_gate`. The broker is cloned out first so it does not borrow `self`
+    /// while `self` is mutated by the chokepoint.
     pub fn resolve_via_broker(
         &mut self,
         run_id: &str,
@@ -179,23 +208,6 @@ impl SopEngine {
         principal: super::approval::ApprovalPrincipal,
     ) -> Result<super::approval::BrokerOutcome> {
         let broker = Arc::clone(&self.approval_broker);
-
-        if let Some(step) = self
-            .active_runs
-            .get(run_id)
-            .and_then(|r| (r.status == SopRunStatus::PausedCheckpoint).then_some(r.current_step))
-        {
-            if let Some(outcome) =
-                broker.authorize_checkpoint(self, run_id, step, &decision, &principal)?
-            {
-                return Ok(outcome);
-            }
-            let action = self.decide_checkpoint(run_id, decision)?;
-            return Ok(super::approval::BrokerOutcome::Resolved(
-                super::approval::ResolveOutcome::Resumed(Box::new(action)),
-            ));
-        }
-
         broker.resolve(self, run_id, decision, principal)
     }
     /// Reconstruct in-flight runs from the store at startup (durable backends).
@@ -419,10 +431,16 @@ impl SopEngine {
     /// would turn into a lost park while newer triggers had already admitted into
     /// the "freed" slot). The slot is held until a later persist succeeds,
     /// trading a little concurrency for no lost park.
-    fn persist_parked_snapshot_then_release_claim(&mut self, run_id: &str) {
+    /// Returns `true` when the parked snapshot was durably persisted (and the exec
+    /// claim released). `false` means the write failed and the claim was KEPT
+    /// (fail-closed), with the run tracked for a maintenance-tick retry - the caller
+    /// must NOT treat the park as durable (e.g. must not deliver an out-of-band notice
+    /// for it yet; `retry_pending_park_persists` issues that once the retry succeeds).
+    fn persist_parked_snapshot_then_release_claim(&mut self, run_id: &str) -> bool {
         if self.persist_active_checked(run_id) {
             self.claims_pending_persist.remove(run_id);
             self.release_claim_on_park(run_id);
+            true
         } else {
             // Track this run so `heartbeat_active_claims` keeps renewing its KEPT
             // claim despite the park status (see `claims_pending_persist`'s doc):
@@ -437,6 +455,7 @@ impl SopEngine {
                     .with_attrs(::serde_json::json!({"run_id": run_id})),
                 "SOP engine: parked snapshot not persisted; KEEPING the exec claim (fail closed) so the park is not lost"
             );
+            false
         }
     }
 
@@ -469,6 +488,10 @@ impl SopEngine {
                 if !holds_exec_claim(status) {
                     self.release_claim_on_park(&run_id);
                 }
+                // The park is now durable: deliver the deferred EPIC G approval-request
+                // notice that was withheld when the initial persist failed. A no-op for
+                // a park with no policy `request_route` (e.g. a deterministic checkpoint).
+                self.notify_park_request(&run_id);
             }
         }
     }
@@ -911,6 +934,80 @@ impl SopEngine {
         }
     }
 
+    /// A2 per-message idempotency: the run already started for `(sop_name, dedup_key)`, if
+    /// one is in the bounded window AND the key is not ambiguous. Used by dispatch to
+    /// coalesce a broker redelivery of the same message. Returns `None` for an AMBIGUOUS
+    /// key (empty run - one a distinct fresh delivery reused): such a key must never
+    /// coalesce, so its deliveries dispatch (a duplicate at worst, never a lost trigger).
+    pub(crate) fn dispatch_dedup_lookup(&self, sop_name: &str, dedup_key: &str) -> Option<String> {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        self.dispatch_dedup
+            .iter()
+            .find(|(k, _)| *k == composite)
+            .and_then(|(_, run_id)| (!run_id.is_empty()).then(|| run_id.clone()))
+    }
+
+    /// A2: a FRESH (non-redelivery) delivery arrived for `(sop_name, dedup_key)`. If that
+    /// key is ALREADY in the window a distinct delivery is REUSING a message-id (an AMQP
+    /// contract violation); mark it AMBIGUOUS (empty run) so neither it nor a later
+    /// redelivery ever coalesces - the safe direction is a duplicate run, never ACKing a
+    /// distinct trigger away. Called BEFORE admission, so it also covers a reused-id
+    /// delivery that then defers and is broker-redelivered.
+    pub(crate) fn note_fresh_dispatch_key(&mut self, sop_name: &str, dedup_key: &str) {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        if let Some(entry) = self
+            .dispatch_dedup
+            .iter_mut()
+            .find(|(k, _)| *k == composite)
+        {
+            entry.1.clear();
+        }
+    }
+
+    /// Record that a run started for `(sop_name, dedup_key)` so a later redelivery of the
+    /// same message coalesces. A new key records its run; an existing key that maps to a
+    /// DIFFERENT run (a reused message-id) is marked AMBIGUOUS (empty run - never
+    /// coalesce). Bounded FIFO so the window self-trims.
+    ///
+    /// BEST-EFFORT and BOUNDED, by design: the window is in-memory and capped at
+    /// `DISPATCH_DEDUP_CAP`. If a redelivery arrives after the process restarted or after
+    /// more than the cap of other starts have pushed this key out, the dedup MISSES and
+    /// the SOP may run again - this is the SAFE failure direction (an at-least-once
+    /// duplicate, never a lost message). An eviction that drops a key whose run is still
+    /// active is logged so the miss is observable rather than silent.
+    pub(crate) fn record_dispatch_dedup(&mut self, sop_name: &str, dedup_key: &str, run_id: &str) {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        if let Some(entry) = self
+            .dispatch_dedup
+            .iter_mut()
+            .find(|(k, _)| *k == composite)
+        {
+            // Reused message-id (different run, or already ambiguous): mark ambiguous.
+            if entry.1 != run_id {
+                entry.1.clear();
+            }
+            return;
+        }
+        self.dispatch_dedup
+            .push_back((composite, run_id.to_string()));
+        while self.dispatch_dedup.len() > DISPATCH_DEDUP_CAP {
+            if let Some((_, evicted_run)) = self.dispatch_dedup.pop_front()
+                && self.active_runs.contains_key(&evicted_run)
+            {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "evicted_run_id": evicted_run,
+                            "cap": DISPATCH_DEDUP_CAP,
+                        })),
+                    "SOP dispatch: per-message dedup window evicted a still-active run's \
+                     key (window full); a later redelivery of that message may re-run it"
+                );
+            }
+        }
+    }
+
     /// Start a new SOP run. Returns the first action to take.
     /// Deterministic SOPs are automatically routed to `start_deterministic_run`.
     /// Enforce the SOP's admission policy at a start entrypoint. `Admit` proceeds;
@@ -1011,18 +1108,6 @@ impl SopEngine {
         }
     }
 
-    /// Report the result of the current step and advance the run.
-    /// Returns the next action to take.
-    ///
-    /// Refuses to advance a run whose status is `WaitingApproval` or
-    /// `PausedCheckpoint`: those states mean an external gate is pending
-    /// (an approval, or a deterministic checkpoint resume) and a driver
-    /// supplying a fabricated `SopStepResult` must not be allowed to skip
-    /// the gate. The legitimate path for clearing a `WaitingApproval` gate
-    /// is `resolve_gate` / `clear_waiting_gate`; the legitimate path for
-    /// resuming a `PausedCheckpoint` is `approve_step`. Mirrors the
-    /// status check `approve_step` already performs for the checkpoint
-    /// case.
     pub fn advance_step(&mut self, run_id: &str, result: SopStepResult) -> Result<SopRunAction> {
         let (sop_name, current_step_number) = {
             let run = self.active_runs.get(run_id).ok_or_else(|| {
@@ -1503,11 +1588,42 @@ impl SopEngine {
         // the parked snapshot is durably persisted (else keep the claim, fail
         // closed).
         if parked_for_approval {
-            self.persist_parked_snapshot_then_release_claim(run_id);
+            let persisted = self.persist_parked_snapshot_then_release_claim(run_id);
+            // EPIC G route delivery: if the parked step's policy names a
+            // `request_route`, deliver the approval request out-of-band (e.g. to a
+            // Discord ops channel) so an approver can act without watching the
+            // originating surface. Best-effort - a delivery failure never affects the
+            // gate, and the approval still comes back through the normal HTTP/WS/tool
+            // -> broker path. Deliver ONLY once the parked snapshot is durable: on a
+            // failed persist the claim is kept (fail-closed) and the park retried, so a
+            // notice now could point at a gate whose snapshot is not yet durable and
+            // could be lost across a crash. `retry_pending_park_persists` re-issues the
+            // notice when the deferred park finally persists.
+            if persisted {
+                self.notify_park_request(run_id);
+            }
         } else {
             self.persist_active(run_id);
         }
         Ok(action)
+    }
+
+    /// Deliver the initial approval-request notice for a run that just parked at a
+    /// policied gate, if that policy names a `request_route`. Best-effort: a run
+    /// with no policy, a policy with no request route, or a delivery error all leave
+    /// the (already-parked, already-durable) gate untouched.
+    fn notify_park_request(&self, run_id: &str) {
+        let (sop_name, step) = match self.get_run(run_id) {
+            Some(r) => (r.sop_name.clone(), r.current_step),
+            None => return,
+        };
+        let Some(policy_name) = self.current_step_policy_name(run_id) else {
+            return;
+        };
+        let broker = self.approval_broker();
+        if let Some(route) = broker.request_route(self.approval_config(), &policy_name) {
+            broker.deliver_request(&route, run_id, &sop_name, step);
+        }
     }
 
     fn dispatch_deterministic_step(
@@ -1641,12 +1757,6 @@ impl SopEngine {
         Ok(())
     }
 
-    /// Approve a step that is waiting for approval, transitioning back to Running.
-    /// Resume a deterministic SOP run paused at a checkpoint. This owns ONLY the
-    /// `PausedCheckpoint` resume; clearing a `WaitingApproval` gate is the
-    /// out-of-band `resolve_gate` chokepoint (EPIC C) - the single audited
-    /// gate-clear path. The `sop_approve` tool routes here for checkpoints and to
-    /// `resolve_gate` for approval gates.
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
         let status = self
             .active_runs
@@ -2123,14 +2233,6 @@ impl SopEngine {
         }
     }
 
-    /// Drive a just-started headless deterministic run until it blocks or ends.
-    ///
-    /// Channel-sourced dispatch (filesystem, MQTT, peripheral, cron) has no
-    /// agent loop to execute normal `Execute` steps. Capability steps can run
-    /// through the deterministic registry here; driver-required steps fail closed
-    /// so the audit trail never reports a green step that did not execute.
-    /// A `CheckpointWait` is intentionally left paused (an operator gate, not a
-    /// stuck run).
     pub fn drive_headless_deterministic(
         &mut self,
         run_id: &str,
@@ -2675,14 +2777,6 @@ impl SopEngine {
 
     // ── Approval timeout ──────────────────────────────────────────
 
-    /// Apply the configured timeout action to every timed-out WaitingApproval run.
-    ///
-    /// FAIL-CLOSED (EPIC C): priority no longer decides fail-open vs fail-closed;
-    /// the typed `approval_timeout_action` does, uniformly. The default `Escalate`
-    /// re-surfaces the gate to the out-of-band approver and NEVER self-approves
-    /// (the old Critical/High auto-approve is gone; it is reachable only via the
-    /// explicit `AutoApprove` opt-in). Returns any actions produced (a `Cancel`
-    /// terminal action, or an `AutoApprove` resumed action); `Escalate` returns none.
     pub fn check_approval_timeouts(&mut self) -> Vec<SopRunAction> {
         let action_cfg = self.config.approval_timeout_action;
         let mut actions = Vec::new();
@@ -2696,11 +2790,6 @@ impl SopEngine {
         actions
     }
 
-    /// Run ids of `WaitingApproval` gates whose approval has timed out
-    /// (`now - waiting_since >= approval_timeout_secs`). Empty when timeouts are
-    /// disabled (`approval_timeout_secs == 0`). Shared by `check_approval_timeouts`
-    /// (which applies the timeout action to each) and the maintenance tick (which
-    /// counts them), so the overdue predicate lives in exactly one place.
     fn overdue_waiting_run_ids(&self) -> Vec<String> {
         let timeout_secs = self.config.approval_timeout_secs;
         if timeout_secs == 0 {
@@ -2719,16 +2808,6 @@ impl SopEngine {
             .collect()
     }
 
-    /// One periodic maintenance pass (EPIC A1 daemon tick). On each tick it:
-    ///   1. fires fail-closed approval timeouts (`check_approval_timeouts`),
-    ///   2. reaps concurrency-claim leases whose holder died without releasing,
-    ///   3. prunes terminal runs past the retention policy.
-    ///
-    /// A no-op when nothing is due. Returns counts for observability. The returned
-    /// `timeout_actions` are mostly self-applied (the fail-closed `Escalate`
-    /// re-stamps the gate, `Cancel` finalizes the run); an opt-in `AutoApprove`
-    /// yields a resumed `ExecuteStep` the caller logs until the live SOP executor
-    /// (EPIC A2) exists.
     pub fn run_maintenance_tick(&mut self) -> MaintenanceSummary {
         // Count overdue gates BEFORE applying the action: the fail-closed Escalate
         // default re-stamps in place and produces no action, so counting actions
@@ -2910,48 +2989,29 @@ impl SopEngine {
         &self.config.approval
     }
 
-    /// Fallible lookup for the approval policy that applies to the run's current
-    /// parked step. `Ok(None)` means the step is intentionally unpoliced; `Err`
-    /// means the live run/SOP/step state is unavailable and callers must fail
-    /// closed rather than treating it as unpoliced.
-    pub(crate) fn current_step_policy_lookup(&self, run_id: &str) -> Result<Option<String>> {
-        let run = self
-            .get_run(run_id)
-            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
-        let sop = self.get_sop(&run.sop_name).ok_or_else(|| {
-            anyhow::Error::msg(format!("SOP '{}' no longer loaded", run.sop_name))
-        })?;
+    /// The name of the approval policy that applies to the run's currently-waiting
+    /// step, if that step names one. Shared by the broker (membership/quorum) and
+    /// the approval query surfaces so the "which policy applies now" lookup lives in
+    /// exactly one place.
+    pub fn current_step_policy_name(&self, run_id: &str) -> Option<String> {
+        let run = self.get_run(run_id)?;
+        let sop = self.get_sop(&run.sop_name)?;
         // Match the step by its `number`, NOT by vec position: routed / non-contiguous
         // step numbers mean position != number, and a positional lookup would read the
         // wrong step's policy (silently unpolicing a policied gate, or vice versa).
-        let step = sop
+        let name = sop
             .steps
             .iter()
-            .find(|s| s.number == run.current_step)
-            .ok_or_else(|| {
-                anyhow::Error::msg(format!(
-                    "SOP '{}' no longer contains step {}",
-                    run.sop_name, run.current_step
-                ))
-            })?;
-        let Some(name) = step.policy.as_deref() else {
-            return Ok(None);
-        };
-        let name = name.trim();
+            .find(|s| s.number == run.current_step)?
+            .policy
+            .as_deref()?
+            .trim();
         // An empty/whitespace name means "no policy", same as the Markdown parser's
         // `policy:` bullet (mod.rs). Without this, a TOML `policy = ""` step would
         // deserialize as `Some("")` and the broker would treat it as a NAMED-but-absent
         // policy (fail closed, gate stuck waiting forever) instead of unpoliced -
         // diverging from the equivalent Markdown SOP, which normalizes to `None`.
-        Ok((!name.is_empty()).then(|| name.to_string()))
-    }
-
-    /// The name of the approval policy that applies to the run's current step, if
-    /// that step names one. Legacy query helper: unavailable live state collapses
-    /// to `None` for read surfaces, while the broker uses the fallible lookup above
-    /// to fail closed.
-    pub fn current_step_policy_name(&self, run_id: &str) -> Option<String> {
-        self.current_step_policy_lookup(run_id).ok().flatten()
+        (!name.is_empty()).then(|| name.to_string())
     }
 
     /// Classify a run's approval gate for `resolve_gate` (idempotency + typed
@@ -2975,15 +3035,6 @@ impl SopEngine {
         }
     }
 
-    /// Append an approval-ledger row via EPIC B's append-only event log. The store
-    /// assigns the monotonic seq.
-    ///
-    /// FAIL-LOUD: the `StoreError` is propagated, never swallowed, so the caller
-    /// can fail closed. The run-store gate ledger is the single audit of record
-    /// for gate resolutions (the legacy Memory approval audit was removed), so a
-    /// gate must not clear / deny / escalate / cancel unless its who/what/when row
-    /// is durably written first - matching the store's fail-loud, fail-closed
-    /// persistence contract. Callers append BEFORE mutating gate state.
     pub(crate) fn record_gate_event(
         &self,
         entry: super::approval::GateLedgerEntry,
@@ -3120,10 +3171,6 @@ impl SopEngine {
         }
     }
 
-    /// The single out-of-band gate-clearing entry point (EPIC C). All four
-    /// principals (agent tool, CLI, gateway, timeout tick) funnel through here.
-    /// Sibling of `approve_step` (which keeps the deterministic-checkpoint resume
-    /// path); the shared `WaitingApproval -> ExecuteStep` body is `clear_waiting_gate`.
     pub fn resolve_gate(
         &mut self,
         run_id: &str,
@@ -5292,11 +5339,6 @@ mod tests {
 
     #[test]
     fn cooldown_is_shared_across_engine_instances() {
-        // Two engines share ONE store. Engine A runs and finishes a run; the
-        // cooldown marker lives only in A's local `finished_runs`, but B must still
-        // honor the cooldown because it reads the last terminal completion from the
-        // shared store. Without FIX 1 (store-backed cooldown), B sees no local
-        // finished run and admits early - this test fails.
         let store = std::sync::Arc::new(InMemoryRunStore::new());
         let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
         sop.cooldown_secs = 3600; // 1 hour
@@ -5343,11 +5385,6 @@ mod tests {
 
     #[test]
     fn restore_runs_keeps_active_and_claims_aligned_over_cap() {
-        // Pre-seed the shared store with non-terminal runs OVER the per-SOP cap,
-        // then restore onto a fresh engine. FIX 2 re-establishes a claim for every
-        // restored run without applying admission caps, so `active_runs` and the
-        // live-claim total stay aligned 1:1 (the old capped path silently dropped
-        // the over-cap claim, leaving a locally active run with no store claim).
         let store = std::sync::Arc::new(InMemoryRunStore::new());
         let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
         sop.max_concurrent = 1; // cap of 1, but seed 3 already-running runs
@@ -5416,6 +5453,164 @@ mod tests {
         )]);
         let action = engine.start_run("s1", manual_event()).unwrap();
         assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+    }
+
+    /// A recorded `deliver` call: `(notice, route, run_id, sop_name, step)`.
+    type RecordedRouteCall = (
+        crate::sop::approval::ApprovalNoticeKind,
+        String,
+        String,
+        String,
+        u32,
+    );
+
+    /// A route adapter that records every `deliver` call, so a test can assert the
+    /// engine fired an out-of-band approval-request notice on park.
+    #[derive(Default)]
+    struct RecordingRouteAdapter {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedRouteCall>>>,
+    }
+
+    impl crate::sop::approval::ApprovalRouteAdapter for RecordingRouteAdapter {
+        fn deliver(
+            &self,
+            notice: crate::sop::approval::ApprovalNoticeKind,
+            route: &str,
+            run_id: &str,
+            sop_name: &str,
+            step: u32,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push((
+                notice,
+                route.to_string(),
+                run_id.to_string(),
+                sop_name.to_string(),
+                step,
+            ));
+            Ok(())
+        }
+    }
+
+    fn policied_supervised_engine(
+        request_route: Option<&str>,
+        adapter: std::sync::Arc<dyn crate::sop::approval::ApprovalRouteAdapter>,
+    ) -> SopEngine {
+        use zeroclaw_config::schema::ApprovalPolicyConfig;
+        let mut config = SopConfig::default();
+        config.approval.policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 0,
+                request_route: request_route.map(String::from),
+                escalation_route: None,
+            },
+        );
+        // A supervised SOP whose first step names the `prod` policy, so starting it
+        // parks at a policied approval gate.
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.steps[0].policy = Some("prod".to_string());
+        engine_with_config_sops(config, vec![sop]).with_approval_broker(std::sync::Arc::new(
+            crate::sop::approval::ApprovalBroker::with_route(adapter),
+        ))
+    }
+
+    #[test]
+    fn parking_at_a_policied_gate_delivers_the_request_route() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let mut engine = policied_supervised_engine(Some("discord.ops:123456789"), adapter);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "supervised policied step parks for approval"
+        );
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one out-of-band request-route delivery fired on park"
+        );
+        let (notice, route, delivered_run, sop_name, step) = &recorded[0];
+        assert_eq!(
+            *notice,
+            crate::sop::approval::ApprovalNoticeKind::Request,
+            "parking sends the initial request notice"
+        );
+        assert_eq!(route, "discord.ops:123456789", "the policy's request_route");
+        assert_eq!(delivered_run, &run_id, "carries the parked run id");
+        assert_eq!(sop_name, "s1", "carries the SOP name");
+        assert_eq!(*step, 1, "carries the parked step number");
+    }
+
+    #[test]
+    fn park_withholds_the_request_route_until_the_snapshot_is_durable() {
+        // A route notice must NOT fire for a gate whose parked snapshot is not yet
+        // durable: when save_run fails at park, the exec claim is kept (fail-closed) and
+        // the request-route delivery is withheld (retry_pending_park_persists re-issues
+        // it once a retry persists the park).
+        use zeroclaw_config::schema::ApprovalPolicyConfig;
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let mut config = SopConfig::default();
+        config.approval.policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 0,
+                request_route: Some("discord.ops:1".to_string()),
+                escalation_route: None,
+            },
+        );
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.steps[0].policy = Some("prod".to_string());
+        let store = std::sync::Arc::new(FailingSaveStore {
+            inner: InMemoryRunStore::new(),
+        });
+        let mut engine = engine_with_config_sops(config, vec![sop])
+            .with_approval_broker(std::sync::Arc::new(
+                crate::sop::approval::ApprovalBroker::with_route(adapter),
+            ))
+            .with_store(store);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "the supervised policied step parks for approval"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no request-route delivery may fire while the parked snapshot is not durable"
+        );
+        assert!(
+            engine.is_park_persist_pending(&run_id),
+            "the run is tracked for a park-persist retry (claim kept, fail-closed)"
+        );
+    }
+
+    #[test]
+    fn parking_at_a_policied_gate_without_a_request_route_delivers_nothing() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        // Same policied gate, but the policy names NO request_route.
+        let mut engine = policied_supervised_engine(None, adapter);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no request_route configured means no out-of-band delivery"
+        );
     }
 
     #[test]
@@ -5586,7 +5781,7 @@ mod tests {
         );
     }
 
-    // ── Advance step gate guard (#8678) ─────────────────
+    // ── Advance step gate guard ─────────────────
     //
     // A driver calling `sop_advance` while a run is parked at an external
     // gate (WaitingApproval or PausedCheckpoint) used to be allowed to
