@@ -62,6 +62,17 @@ pub struct SopEngine {
     /// `resolve_gate` chokepoint. Defaults to a pass-through (no policies) so
     /// behavior is unchanged until a `[sop.approval]` policy is configured.
     approval_broker: Arc<super::approval::ApprovalBroker>,
+    /// Bounded per-message idempotency window for durable transport redelivery.
+    /// Each entry maps `(SOP name, transport delivery key)` to the run started by
+    /// that message. An empty run id marks a reused, ambiguous publisher key and
+    /// deliberately disables coalescing for that key.
+    dispatch_dedup: std::collections::VecDeque<(String, String)>,
+}
+
+const DISPATCH_DEDUP_CAP: usize = 512;
+
+fn dispatch_dedup_composite(sop_name: &str, dedup_key: &str) -> String {
+    format!("{sop_name}\u{0}{dedup_key}")
 }
 
 /// Outcome of one [`SopEngine::run_maintenance_tick`] pass (EPIC A1), for
@@ -103,6 +114,7 @@ impl SopEngine {
             capabilities: Arc::new(SopCapabilityRegistry::with_builtins()),
             claims_pending_persist: std::collections::HashSet::new(),
             approval_broker: Arc::new(super::approval::ApprovalBroker::disabled()),
+            dispatch_dedup: std::collections::VecDeque::new(),
         }
     }
 
@@ -1144,6 +1156,62 @@ impl SopEngine {
                         reason: format!("SOP '{sop_name}' execution slots full (drop policy)"),
                     }
                 }
+            }
+        }
+    }
+
+    /// Return the run already started for a confirmed redelivery, unless the
+    /// publisher reused this key and made it ambiguous.
+    pub(crate) fn dispatch_dedup_lookup(&self, sop_name: &str, dedup_key: &str) -> Option<String> {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        self.dispatch_dedup
+            .iter()
+            .find(|(key, _)| *key == composite)
+            .and_then(|(_, run_id)| (!run_id.is_empty()).then(|| run_id.clone()))
+    }
+
+    /// Mark a reused key ambiguous before admission so a distinct fresh message
+    /// can never be acknowledged as a duplicate of an older run.
+    pub(crate) fn note_fresh_dispatch_key(&mut self, sop_name: &str, dedup_key: &str) {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        if let Some(entry) = self
+            .dispatch_dedup
+            .iter_mut()
+            .find(|(key, _)| *key == composite)
+        {
+            entry.1.clear();
+        }
+    }
+
+    /// Record a started run for later confirmed redelivery coalescing. The window
+    /// is bounded; eviction can cause a safe duplicate but never a silent drop.
+    pub(crate) fn record_dispatch_dedup(&mut self, sop_name: &str, dedup_key: &str, run_id: &str) {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        if let Some(entry) = self
+            .dispatch_dedup
+            .iter_mut()
+            .find(|(key, _)| *key == composite)
+        {
+            if entry.1 != run_id {
+                entry.1.clear();
+            }
+            return;
+        }
+        self.dispatch_dedup
+            .push_back((composite, run_id.to_string()));
+        while self.dispatch_dedup.len() > DISPATCH_DEDUP_CAP {
+            if let Some((_, evicted_run)) = self.dispatch_dedup.pop_front()
+                && self.active_runs.contains_key(&evicted_run)
+            {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "evicted_run_id": evicted_run,
+                            "cap": DISPATCH_DEDUP_CAP,
+                        })),
+                    "SOP dispatch: per-message dedup window evicted a still-active run key; a later redelivery may run it again"
+                );
             }
         }
     }
