@@ -932,3 +932,4 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
 cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+sop-approval-deferred-at-capacity = 执行槽位已满，无法恢复运行 {$run_id}。审批仍处于等待状态；请在槽位释放后重试。

@@ -118,35 +118,6 @@ impl MaintenanceSummary {
 }
 
 #[derive(Debug)]
-struct TerminalPersistenceRetained {
-    run_id: String,
-    source: StoreError,
-}
-
-impl std::fmt::Display for TerminalPersistenceRetained {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "terminal persistence failed for run {}; active run and admission claim remain retained: {}",
-            self.run_id, self.source
-        )
-    }
-}
-
-impl std::error::Error for TerminalPersistenceRetained {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-/// Typed marker: a resume could not re-acquire an exec slot because the SOP's
-/// per-SOP `max_concurrent` or the global `max_concurrent_total` is already
-/// saturated. This is routine BACKPRESSURE, not a fault - kept distinct from a
-/// store error so callers surface it as "at capacity, retry" (leaving the run
-/// parked and re-resolvable) instead of logging it as a failure. It is the
-/// signal that enforces the documented concurrency caps on the resume path: a
-/// resume that would exceed them is refused rather than oversubscribed.
-#[derive(Debug)]
 struct ResumeAtCapacity {
     run_id: String,
     sop_name: String,
@@ -156,7 +127,7 @@ impl std::fmt::Display for ResumeAtCapacity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "run {} ({}) cannot resume yet: execution slots are full; it stays parked and re-resolvable once a slot frees",
+            "run {} ({}) cannot resume yet: execution slots are full",
             self.run_id, self.sop_name
         )
     }
@@ -164,70 +135,8 @@ impl std::fmt::Display for ResumeAtCapacity {
 
 impl std::error::Error for ResumeAtCapacity {}
 
-/// True when `err` is the typed [`ResumeAtCapacity`] backpressure marker (an
-/// over-cap resume was refused), as opposed to a store fault. Lets a caller in
-/// another module or crate (e.g. `resolve_gate`, or the gateway resume endpoint)
-/// render it as backpressure (HTTP 503) rather than a fault without depending on
-/// the private struct.
-pub fn err_is_resume_at_capacity(err: &anyhow::Error) -> bool {
+pub(crate) fn err_is_resume_at_capacity(err: &anyhow::Error) -> bool {
     err.is::<ResumeAtCapacity>()
-}
-
-enum ActivePersistOutcome {
-    Saved,
-    CapacityFull,
-    Failed,
-}
-
-enum ParkPersistOutcome {
-    Released,
-    CapacityFull,
-    PersistFailed,
-}
-
-enum GateClearTransition {
-    Active {
-        // Boxed: `SopRunAction` is large; keeping it inline makes this the
-        // dominant variant (clippy::large_enum_variant).
-        action: Box<SopRunAction>,
-        follow_up: Option<GateResolutionFollowUp>,
-    },
-    Terminal {
-        status: SopRunStatus,
-        reason: Option<String>,
-        follow_up: Option<GateResolutionFollowUp>,
-    },
-}
-
-enum GateResolutionFollowUp {
-    StepSchemaReject {
-        step: u32,
-        phase: &'static str,
-        reason: String,
-    },
-    StepSkipped {
-        sop_name: String,
-        step: u32,
-        reason: String,
-    },
-}
-
-/// A held execution-slot reservation from phase 1 of a start (`reserve_run_slot`),
-/// awaiting phase 2 (`activate_reserved_run`) or release (`release_reservation`).
-/// Carries the CAS claim that keeps the slot held so the AMQP multi-match batch path
-/// can reserve every matched SOP before activating any of them.
-pub(crate) struct StartReservation {
-    run_id: String,
-    claim: ClaimToken,
-    sop: Sop,
-    deterministic: bool,
-}
-
-impl StartReservation {
-    /// The SOP this reservation holds a slot for.
-    pub(crate) fn sop_name(&self) -> &str {
-        &self.sop.name
-    }
 }
 
 impl SopEngine {
@@ -358,7 +267,33 @@ impl SopEngine {
                         // (a) block a same-SOP admission via `claim_counts`, nor (b) get
                         // its stale lease extended forever by `heartbeat_active_claims`.
                         // Its slot is re-acquired only when it resumes. Best-effort.
-                        self.release_claim_best_effort(&Self::claim_handle_for_run(&pr.run));
+                        match self
+                            .store
+                            .has_retained_terminal_rollback_claim(&pr.run.run_id)
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                self.release_claim_best_effort(&Self::claim_handle_for_run(&pr.run))
+                            }
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "run_id": pr.run.run_id.as_str(),
+                                            "error": e.to_string(),
+                                        })
+                                    ),
+                                    "SOP engine: dropping restored parked run because its retained-claim state could not be read"
+                                );
+                                continue;
+                            }
+                        }
                     } else if let Err(e) = self
                         .store
                         .renew_claim_for_restore(&pr.run.run_id, &pr.run.sop_name)
@@ -524,15 +459,27 @@ impl SopEngine {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"run_id": run_id})),
-                    "SOP engine: parked snapshot not persisted; KEEPING the exec claim (fail closed) so the park is not lost"
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"run_id": run_id, "error": e.to_string()})
+                        ),
+                    "SOP engine: failed to persist run"
                 );
                 false
             }
         };
         self.notify_run(run, true);
         saved
+    }
+
+    fn active_snapshot_matches_store(&self, run_id: &str) -> Result<bool> {
+        let Some(run) = self.active_runs.get(run_id) else {
+            return Ok(true);
+        };
+        let Some(stored) = self.store.load_run(run_id)? else {
+            return Ok(false);
+        };
+        Ok(serde_json::to_value(&stored.run)? == serde_json::to_value(run)?)
     }
 
     /// Park a run (WaitingApproval / PausedCheckpoint) and free its exec slot, but
@@ -692,7 +639,30 @@ impl SopEngine {
         // called just before this each tick - so its kept claim's lease never goes
         // un-renewed even while parked.
         for run in self.active_runs.values() {
-            if holds_exec_claim(run.status) {
+            let retained_parked = if holds_exec_claim(run.status) {
+                false
+            } else {
+                match self.store.has_retained_terminal_rollback_claim(&run.run_id) {
+                    Ok(retained) => retained,
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run.run_id.as_str(),
+                                "error": e.to_string(),
+                            })),
+                            "SOP engine: retained-claim state unreadable; heartbeating fail-closed"
+                        );
+                        true
+                    }
+                }
+            };
+            if holds_exec_claim(run.status) || retained_parked {
                 self.heartbeat_claim_for_run(run);
             }
         }
@@ -712,40 +682,56 @@ impl SopEngine {
         }
     }
 
-    /// A1: re-establish a resumed run's exec claim. Uses the uncapped restore
-    /// path: the run was admitted once already, so resuming it after an approval
-    /// is a continuation, not new admission, and must never be blocked by the
-    /// concurrency cap (an approved run always resumes). This can transiently push
-    /// executing runs above `max_concurrent` when many approvals resolve at once;
-    /// that overshoot is bounded and self-corrects (new triggers see the higher
-    /// count and wait). Strict serialization is the `Hold` admission policy, not this.
-    /// Fail-CLOSED: returns `Err` if the claim cannot be re-established, so the
-    /// caller aborts the resume BEFORE flipping the run to `Running` and leaves it
-    /// parked (re-resolvable). Executing without a claim would under-count
-    /// concurrency and oversubscribe. A missing run is a no-op `Ok` (the caller
-    /// already validated the run exists).
+    fn release_claim_checked(&self, run_id: &str) -> Result<(), StoreError> {
+        match self.active_runs.get(run_id) {
+            Some(run) => self.store.release_claim(&Self::claim_handle_for_run(run)),
+            None => Ok(()),
+        }
+    }
+
+    /// Re-admit a parked run through the same authoritative store CAS and hard
+    /// caps used by a fresh start. A terminal-rollback marker already owns a slot,
+    /// so that claim is renewed in place instead of counted twice.
     pub(crate) fn reacquire_claim_on_resume(&self, run_id: &str) -> Result<()> {
         let Some(run) = self.active_runs.get(run_id) else {
             return Ok(());
         };
+        if self
+            .store
+            .has_retained_terminal_rollback_claim(&run.run_id)?
+        {
+            self.store
+                .renew_claim_for_restore(&run.run_id, &run.sop_name)?;
+            return Ok(());
+        }
+        let per_sop_cap = self
+            .get_sop(&run.sop_name)
+            .map(|sop| sop.max_concurrent as usize)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!("SOP '{}' no longer loaded", run.sop_name))
+            })?;
+        match self.store.try_claim_run(
+            &run.run_id,
+            &run.sop_name,
+            per_sop_cap,
+            self.config.max_concurrent_total,
+        ) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(anyhow::Error::new(ResumeAtCapacity {
+                run_id: run.run_id.clone(),
+                sop_name: run.sop_name.clone(),
+            })),
+            Err(e) => Err(anyhow::Error::new(e)),
+        }
+    }
+
+    fn reacquire_claim_uncapped(&self, run_id: &str) -> Result<()> {
+        let Some(run) = self.active_runs.get(run_id) else {
+            return Ok(());
+        };
         self.store
-            .renew_claim_for_restore(&run.run_id, &run.sop_name)
-            .map(|_| ())
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "run_id": run.run_id.as_str(),
-                            "error": e.to_string(),
-                        })),
-                    "SOP engine: resume aborted, could not re-acquire the run admission claim (fail-closed)"
-                );
-                anyhow::Error::msg(format!(
-                    "failed to re-acquire exec claim on resume for run {run_id}: {e}"
-                ))
-            })
+            .renew_claim_for_restore(&run.run_id, &run.sop_name)?;
+        Ok(())
     }
 
     /// Persist a run that has reached a terminal state and release its claim atomically.
@@ -1149,82 +1135,6 @@ impl SopEngine {
         {
             return self.start_deterministic_run(sop_name, event);
         }
-    }
-
-    fn rollback_failed_start(
-        &mut self,
-        run_id: &str,
-        claim: &ClaimToken,
-        err: anyhow::Error,
-    ) -> anyhow::Error {
-        if err.is::<TerminalPersistenceRetained>() {
-            return err;
-        }
-        self.active_runs.remove(run_id);
-        self.release_claim_best_effort(claim);
-        err
-    }
-
-    /// Undo a SUCCESSFUL `activate_reserved_run` that must be reversed because a LATER
-    /// sibling in the same all-or-nothing AMQP multi-match batch failed to activate.
-    /// Activation runs no irreversible side effect (deterministic execution and the LLM
-    /// agent loop both run LATER, in `record_started_run` / the driver), so the run is
-    /// safe to reverse. Two cases:
-    /// - A still-EXECUTING sibling (`holds_exec_claim` true) never durably persisted during
-    ///   activation: drop it in-memory and release its exec claim.
-    /// - A sibling that PARKED at a step-1 approval/checkpoint gate DID durably persist its
-    ///   parked snapshot (and already released its claim). Dropping it only in-memory would
-    ///   ORPHAN that durable row: after a restart, `restore_runs` would reconstruct it,
-    ///   duplicating a run whose whole delivery was deferred + requeued. Durably supersede it
-    ///   with a terminal `Cancelled` (a higher revision the store's guard accepts) so restore
-    ///   skips it. Best-effort: a store failure here only leaves the bounded orphan back
-    ///   (logged), never a double execution — the sibling never ran.
-    pub(crate) fn rollback_activated_run(&mut self, run_id: &str) {
-        let Some(mut run) = self.active_runs.remove(run_id) else {
-            return;
-        };
-        if holds_exec_claim(run.status) {
-            self.release_claim_best_effort(&Self::claim_handle_for_run(&run));
-            return;
-        }
-        // Parked sibling: its durable snapshot must not survive the rollback.
-        run.status = SopRunStatus::Cancelled;
-        run.completed_at = Some(now_iso8601());
-        if let Err(e) = self.persist_terminal(&run) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "run_id": run.run_id.as_str(),
-                        "error": e.to_string(),
-                    })),
-                "SOP dispatch: could not durably cancel a rolled-back parked AMQP sibling; a stale parked row may be reconstructed on restart"
-            );
-        }
-    }
-
-    pub fn start_run(&mut self, sop_name: &str, event: SopEvent) -> Result<SopRunAction> {
-        // A start is a two-phase operation: reserve the exec slot through the
-        // authoritative store CAS (no side effect yet), then activate the reserved
-        // slot into a live run and dispatch its first step. The phases are split so the
-        // AMQP multi-match path can reserve the WHOLE matched batch before activating
-        // any of it (see `dispatch`). A single start runs both phases back-to-back.
-        let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event)
-    }
-
-    /// Phase 1 of a start: reserve `sop_name`'s exec slot through the authoritative
-    /// store CAS WITHOUT creating an active run or dispatching any step — so no SOP
-    /// side effect occurs yet. The returned `StartReservation` holds a live claim; the
-    /// caller MUST either `activate_reserved_run` it or `release_reservation` it, or
-    /// the slot leaks. This is the primitive behind the AMQP multi-match all-or-defer-
-    /// all reservation: every matched SOP's capacity is held atomically before ANY of
-    /// them produces a side effect, so a sibling engine grabbing a slot mid-batch can
-    /// never leave a partial start (it makes one reservation fail → release-all +
-    /// defer-all), only a safe requeue.
-    pub(crate) fn reserve_run_slot(&mut self, sop_name: &str) -> Result<StartReservation> {
-        self.enforce_admission(sop_name)?;
 
         self.enforce_admission(sop_name)?;
 
@@ -1253,100 +1163,48 @@ impl SopEngine {
             bail!("SOP '{}' has no steps defined", sop_name);
         }
 
-        let deterministic = sop.execution_mode == SopExecutionMode::Deterministic;
         self.run_counter += 1;
         let dur = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         let epoch_ns = dur.as_nanos();
-        let prefix = if deterministic { "det" } else { "run" };
-        let run_id = format!("{prefix}-{epoch_ns}-{:04}", self.run_counter);
-        let claim = self.claim_admission(&run_id, &sop)?;
-        Ok(StartReservation {
-            run_id,
-            claim,
-            sop,
-            deterministic,
-        })
-    }
-
-    /// Release a reservation that will NOT be activated (a batch that could not fully
-    /// reserve), freeing its exec slot for admission. Best-effort + logged, exactly
-    /// like a park release: a swallowed failure only lets the reaper collect the claim
-    /// later — no run was ever created, so there is no side effect to unwind.
-    pub(crate) fn release_reservation(&self, reservation: StartReservation) {
-        self.release_claim_best_effort(&reservation.claim);
-    }
-
-    /// Phase 2 of a start: convert a held reservation into a live run — build the run
-    /// record, insert it, and dispatch its first step, rolling the reservation back
-    /// (release the claim, drop the run) if that dispatch fails.
-    pub(crate) fn activate_reserved_run(
-        &mut self,
-        reservation: StartReservation,
-        event: SopEvent,
-    ) -> Result<SopRunAction> {
-        let StartReservation {
-            run_id,
-            claim,
-            sop,
-            deterministic,
-        } = reservation;
+        let run_id = format!("run-{epoch_ns}-{:04}", self.run_counter);
+        let now = now_iso8601();
 
         let run = SopRun {
             run_id: run_id.clone(),
-            sop_name: sop.name.clone(),
+            sop_name: sop_name.to_string(),
             trigger_event: event,
             frame_marker_id: new_marker_id(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: u32::try_from(sop.steps.len()).unwrap_or(u32::MAX),
-            started_at: now_iso8601(),
+            started_at: now,
             completed_at: None,
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
         };
+
+        let claim = self.claim_admission(&run_id, &sop)?;
         self.active_runs.insert(run_id.clone(), run);
 
-        if deterministic {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Deterministic SOP run {} started for '{}'",
-                    run_id, sop.name
-                )
-            );
-            match self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null) {
-                Ok(action) => Ok(action),
-                Err(e) => Err(self.rollback_failed_start(&run_id, &claim, e)),
-            }
-        } else {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!("SOP run {} started for '{}'", run_id, sop.name)
-            );
-            match self.dispatch_llm_step(&run_id, &sop, 1, None) {
-                Ok(action) => Ok(action),
-                Err(e) => Err(self.rollback_failed_start(&run_id, &claim, e)),
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("SOP run {} started for '{}'", run_id, sop_name)
+        );
+
+        match self.dispatch_llm_step(&run_id, &sop, 1, None) {
+            Ok(action) => Ok(action),
+            Err(e) => {
+                self.active_runs.remove(&run_id);
+                self.release_claim_best_effort(&claim);
+                Err(e)
             }
         }
     }
 
-    /// Report the result of the current step and advance the run.
-    /// Returns the next action to take.
-    ///
-    /// Refuses to advance a run whose status is `WaitingApproval` or
-    /// `PausedCheckpoint`: those states mean an external gate is pending
-    /// (an approval, or a deterministic checkpoint resume) and a driver
-    /// supplying a fabricated `SopStepResult` must not be allowed to skip
-    /// the gate. The legitimate path for clearing a `WaitingApproval` gate
-    /// is `resolve_gate` / `clear_waiting_gate`; the legitimate path for
-    /// resuming a `PausedCheckpoint` is `approve_step`. Mirrors the
-    /// status check `approve_step` already performs for the checkpoint
-    /// case.
     pub fn advance_step(&mut self, run_id: &str, result: SopStepResult) -> Result<SopRunAction> {
         let (sop_name, current_step_number) = {
             let run = self.active_runs.get(run_id).ok_or_else(|| {
@@ -1418,30 +1276,6 @@ impl SopEngine {
                     "SOP '{sop_name}' step {current_step_number} no longer exists (definition changed mid-run)"
                 ))
             })?;
-
-        if self
-            .active_runs
-            .get(run_id)
-            .is_some_and(|run| run.status == SopRunStatus::Pending)
-            && pending_step_blocks_direct_advance(&sop, &current_step)
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "run_id": run_id,
-                        "step": current_step.number,
-                        "step_kind": current_step.kind.to_string(),
-                    })),
-                "SOP engine: advance_step rejected - pending run is blocked at a human gate"
-            );
-            bail!(
-                "Run {run_id} is pending at gated step {}; wait for pending approval/checkpoint \
-                 capacity and resolve the gate before advancing with sop_advance",
-                current_step.number
-            );
-        }
 
         // Deterministic runs are driven through the dedicated piping path so the
         // same `sop_advance` tool advances every execution mode.
@@ -1588,28 +1422,6 @@ impl SopEngine {
             "SOP step schema validation failed"
         );
         self.finish_run(run_id, SopRunStatus::Failed, Some(reason))
-    }
-
-    fn gate_schema_failure_transition(
-        &self,
-        run_id: &str,
-        step_number: u32,
-        phase: &'static str,
-        reason: String,
-    ) -> Result<GateClearTransition> {
-        self.active_runs
-            .get(run_id)
-            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
-        let reason = format!("Step {step_number} {phase} schema validation failed: {reason}");
-        Ok(GateClearTransition::Terminal {
-            status: SopRunStatus::Failed,
-            reason: Some(reason.clone()),
-            follow_up: Some(GateResolutionFollowUp::StepSchemaReject {
-                step: step_number,
-                phase,
-                reason,
-            }),
-        })
     }
 
     fn record_step_result(&mut self, run_id: &str, result: SopStepResult) -> Result<()> {
@@ -1961,17 +1773,6 @@ impl SopEngine {
         step_number: u32,
         reason: String,
     ) -> SopRunAction {
-        self.mark_step_pending_with_persist(run_id, sop, step_number, reason, true)
-    }
-
-    fn mark_step_pending_with_persist(
-        &mut self,
-        run_id: &str,
-        sop: &Sop,
-        step_number: u32,
-        reason: String,
-        persist: bool,
-    ) -> SopRunAction {
         let now = now_iso8601();
         if let Some(run) = self.active_runs.get_mut(run_id) {
             run.current_step = step_number;
@@ -2012,9 +1813,7 @@ impl SopEngine {
                 "status": "pending",
             }),
         );
-        if persist {
-            self.persist_active(run_id);
-        }
+        self.persist_active(run_id);
         SopRunAction::Pending {
             run_id: run_id.to_string(),
             sop_name: sop.name.clone(),
@@ -2055,12 +1854,6 @@ impl SopEngine {
         Ok(())
     }
 
-    /// Approve a step that is waiting for approval, transitioning back to Running.
-    /// Resume a deterministic SOP run paused at a checkpoint. This owns ONLY the
-    /// `PausedCheckpoint` resume; clearing a `WaitingApproval` gate is the
-    /// out-of-band `resolve_gate` chokepoint (EPIC C) - the single audited
-    /// gate-clear path. The `sop_approve` tool routes here for checkpoints and to
-    /// `resolve_gate` for approval gates.
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
         let status = self
             .active_runs
@@ -2253,7 +2046,37 @@ impl SopEngine {
             .get(run_id)
             .cloned()
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
-        self.reacquire_claim_on_resume(run_id)?;
+        let retries_consumed = prior_run
+            .step_results
+            .iter()
+            .filter(|result| {
+                result.step_number == current_step.number && result.status == SopStepStatus::Failed
+            })
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX);
+        let terminates = matches!(
+            route::failure::route_failure(
+                &current_step.on_failure,
+                retries_consumed,
+                self.config.max_step_retries,
+            ),
+            NextStep::Fail(_)
+        );
+        if terminates {
+            self.reacquire_claim_uncapped(run_id)?;
+            if let Err(e) = self
+                .store
+                .mark_claim_retained_after_terminal_rollback(run_id)
+            {
+                self.release_claim_on_park(run_id);
+                return Err(anyhow::Error::msg(format!(
+                    "failed to persist terminal-rollback claim marker for run {run_id}: {e}"
+                )));
+            }
+        } else {
+            self.reacquire_claim_on_resume(run_id)?;
+        }
 
         let detail = reason.unwrap_or_else(|| "checkpoint denied by operator".to_string());
         let now = now_iso8601();
@@ -2273,6 +2096,39 @@ impl SopEngine {
             Some(now),
         ) {
             Ok(action) => {
+                if self.is_park_persist_pending(run_id) {
+                    self.active_runs.insert(run_id.to_string(), prior_run);
+                    self.claims_pending_persist.remove(run_id);
+                    self.release_claim_checked(run_id).map_err(|release_err| {
+                        anyhow::Error::msg(format!(
+                            "checkpoint denial could not persist its continued park and the claim release also failed for run {run_id}: {release_err}"
+                        ))
+                    })?;
+                    bail!("failed to persist checkpoint denial transition for run {run_id}");
+                }
+                if self.active_runs.get(run_id).is_some_and(|run| {
+                    matches!(run.status, SopRunStatus::Running | SopRunStatus::Pending)
+                }) {
+                    match self.active_snapshot_matches_store(run_id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.active_runs.insert(run_id.to_string(), prior_run);
+                            self.release_claim_checked(run_id).map_err(|release_err| {
+                                anyhow::Error::msg(format!(
+                                    "checkpoint denial persistence and claim release both failed for run {run_id}: {release_err}"
+                                ))
+                            })?;
+                            bail!(
+                                "failed to persist checkpoint denial transition for run {run_id}"
+                            );
+                        }
+                        Err(verify_err) => {
+                            return Err(anyhow::Error::msg(format!(
+                                "could not verify the durable checkpoint denial transition for run {run_id}; the live state and claim remain retained: {verify_err}"
+                            )));
+                        }
+                    }
+                }
                 self.record_transition_event(
                     run_id,
                     "checkpoint_denied",
@@ -2286,17 +2142,22 @@ impl SopEngine {
             }
             Err(e) => {
                 self.active_runs.insert(run_id.to_string(), prior_run);
-                // The terminal write was rejected, so the durable store may still
-                // restore this parked run. Keep the claim acquired for this decision
-                // attempt to prevent another trigger from taking its execution slot.
+                if !terminates {
+                    self.release_claim_checked(run_id).map_err(|release_err| {
+                        anyhow::Error::msg(format!(
+                            "checkpoint denial failed and its continuing claim could not be released for run {run_id}: {release_err}; original error: {e}"
+                        ))
+                    })?;
+                }
                 Err(e)
             }
         }
     }
 
-    /// Prepare a `WaitingApproval` gate clear: mutate the in-memory run to the
-    /// target state and describe how the wrapper must commit it with the gate
-    /// ledger row. The wrapper owns persistence and post-commit secondary events.
+    /// Clear a `WaitingApproval` gate: flip to Running, build the ExecuteStep
+    /// action for the current step, and persist. Shared by `approve_step` (the
+    /// agent path) and `resolve_gate` (the out-of-band path) so the transition
+    /// lives in exactly one place. Caller guarantees the run is `WaitingApproval`.
     ///
     /// All-or-nothing: the SOP definition and current step are resolved (and
     /// bounds-checked) BEFORE any in-memory mutation, so a definition removed or
@@ -2344,12 +2205,12 @@ impl SopEngine {
             RunData::from_step_results(&run.step_results)
         };
         if !route::eligible(&step, &run_data) {
-            return self.gate_step_pending_transition(
+            return Ok(self.mark_step_pending(
                 run_id,
                 &sop,
                 step.number,
                 format!("step {} dependencies not satisfied", step.number),
-            );
+            ));
         }
 
         let input = {
@@ -2381,13 +2242,11 @@ impl SopEngine {
             .effective_agent(sop.agent.as_deref())
             .map(str::to_string);
 
-        Ok(GateClearTransition::Active {
-            action: Box::new(SopRunAction::ExecuteStep {
-                run_id: run_id.to_string(),
-                step,
-                context,
-            }),
-            follow_up: None,
+        self.persist_active(run_id);
+        Ok(SopRunAction::ExecuteStep {
+            run_id: run_id.to_string(),
+            step,
+            context,
         })
     }
 
@@ -2474,19 +2333,6 @@ impl SopEngine {
             })?
             .clone();
 
-        let sop = self.get_sop(sop_name).ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"sop_name": sop_name})),
-                "SOP engine: sop not found"
-            );
-            anyhow::Error::msg(format!("SOP not found: {sop_name}"))
-        })?;
-
-        // Reject a non-deterministic SOP BEFORE reserving a slot, so a wrong-mode direct
-        // call cannot claim (and then have to roll back) an execution slot.
         if sop.execution_mode != SopExecutionMode::Deterministic {
             bail!(
                 "SOP '{}' is not in deterministic mode (mode: {})",
@@ -2495,20 +2341,62 @@ impl SopEngine {
             );
         }
 
-        // Reserve + activate through the shared two-phase start path (identical run_id
-        // prefix, logging, and dispatch to the pre-refactor inline body).
-        let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event)
+        if !self.can_start(sop_name) {
+            bail!(
+                "Cannot start SOP '{}': cooldown or concurrency limit reached",
+                sop_name
+            );
+        }
+
+        if sop.steps.is_empty() {
+            bail!("SOP '{}' has no steps defined", sop_name);
+        }
+
+        self.run_counter += 1;
+        let dur = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let epoch_ns = dur.as_nanos();
+        let run_id = format!("det-{epoch_ns}-{:04}", self.run_counter);
+        let now = now_iso8601();
+
+        let total_steps = u32::try_from(sop.steps.len()).unwrap_or(u32::MAX);
+        let run = SopRun {
+            run_id: run_id.clone(),
+            sop_name: sop_name.to_string(),
+            trigger_event: event,
+            frame_marker_id: new_marker_id(),
+            status: SopRunStatus::Running,
+            current_step: 1,
+            total_steps,
+            started_at: now,
+            completed_at: None,
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+        };
+
+        let claim = self.claim_admission(&run_id, &sop)?;
+        self.active_runs.insert(run_id.clone(), run);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Deterministic SOP run {} started for '{}'",
+                run_id, sop_name
+            )
+        );
+
+        match self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null) {
+            Ok(action) => Ok(action),
+            Err(e) => {
+                self.active_runs.remove(&run_id);
+                self.release_claim_best_effort(&claim);
+                Err(e)
+            }
+        }
     }
 
-    /// Drive a just-started headless deterministic run until it blocks or ends.
-    ///
-    /// Channel-sourced dispatch (filesystem, MQTT, peripheral, cron) has no
-    /// agent loop to execute normal `Execute` steps. Capability steps can run
-    /// through the deterministic registry here; driver-required steps fail closed
-    /// so the audit trail never reports a green step that did not execute.
-    /// A `CheckpointWait` is intentionally left paused (an operator gate, not a
-    /// stuck run).
     pub fn drive_headless_deterministic(
         &mut self,
         run_id: &str,
@@ -2950,21 +2838,13 @@ impl SopEngine {
 
         match step.kind {
             SopStepKind::Checkpoint => {
-                if let Some(reason) = self.pending_pool_full_reason(sop) {
-                    Self::log_pending_capacity_full(run_id, &reason);
-                    return Ok(self.mark_step_pending(run_id, sop, step.number, reason));
-                }
-
-                // Persist the checkpoint state before flipping the run status. If
-                // the state-file write fails, the run remains Running with its
-                // execution claim still heartbeat-eligible.
-                let state_file = self.persist_deterministic_state(run_id, sop, true)?;
-
                 // Pause at checkpoint - persist state and wait for approval
                 if let Some(run) = self.active_runs.get_mut(run_id) {
                     run.status = SopRunStatus::PausedCheckpoint;
                     run.waiting_since = Some(now_iso8601());
                 }
+
+                let state_file = self.persist_deterministic_state(run_id, sop)?;
 
                 ::zeroclaw_log::record!(
                     INFO,
@@ -3007,12 +2887,7 @@ impl SopEngine {
     }
 
     /// Persist the current deterministic run state to a JSON file.
-    fn persist_deterministic_state(
-        &self,
-        run_id: &str,
-        sop: &Sop,
-        paused_at_checkpoint: bool,
-    ) -> Result<PathBuf> {
+    fn persist_deterministic_state(&self, run_id: &str, sop: &Sop) -> Result<PathBuf> {
         let run = self.active_runs.get(run_id).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -3044,7 +2919,7 @@ impl SopEngine {
             step_outputs,
             persisted_at: now_iso8601(),
             llm_calls_saved: run.llm_calls_saved,
-            paused_at_checkpoint,
+            paused_at_checkpoint: run.status == SopRunStatus::PausedCheckpoint,
         };
 
         // Write to SOP location directory, or system temp dir
@@ -3066,14 +2941,6 @@ impl SopEngine {
 
     // ── Approval timeout ──────────────────────────────────────────
 
-    /// Apply the configured timeout action to every timed-out WaitingApproval run.
-    ///
-    /// FAIL-CLOSED (EPIC C): priority no longer decides fail-open vs fail-closed;
-    /// the typed `approval_timeout_action` does, uniformly. The default `Escalate`
-    /// re-surfaces the gate to the out-of-band approver and NEVER self-approves
-    /// (the old Critical/High auto-approve is gone; it is reachable only via the
-    /// explicit `AutoApprove` opt-in). Returns any actions produced (a `Cancel`
-    /// terminal action, or an `AutoApprove` resumed action); `Escalate` returns none.
     pub fn check_approval_timeouts(&mut self) -> Vec<SopRunAction> {
         let action_cfg = self.config.approval_timeout_action;
         let mut actions = Vec::new();
@@ -3087,11 +2954,6 @@ impl SopEngine {
         actions
     }
 
-    /// Run ids of `WaitingApproval` gates whose approval has timed out
-    /// (`now - waiting_since >= approval_timeout_secs`). Empty when timeouts are
-    /// disabled (`approval_timeout_secs == 0`). Shared by `check_approval_timeouts`
-    /// (which applies the timeout action to each) and the maintenance tick (which
-    /// counts them), so the overdue predicate lives in exactly one place.
     fn overdue_waiting_run_ids(&self) -> Vec<String> {
         let timeout_secs = self.config.approval_timeout_secs;
         if timeout_secs == 0 {
@@ -3101,7 +2963,6 @@ impl SopEngine {
         self.active_runs
             .values()
             .filter(|r| r.status == SopRunStatus::WaitingApproval)
-            .filter(|r| !self.is_park_persist_pending(&r.run_id))
             .filter(|r| {
                 r.waiting_since
                     .as_deref()
@@ -3111,16 +2972,6 @@ impl SopEngine {
             .collect()
     }
 
-    /// One periodic maintenance pass (EPIC A1 daemon tick). On each tick it:
-    ///   1. fires fail-closed approval timeouts (`check_approval_timeouts`),
-    ///   2. reaps concurrency-claim leases whose holder died without releasing,
-    ///   3. prunes terminal runs past the retention policy.
-    ///
-    /// A no-op when nothing is due. Returns counts for observability. The returned
-    /// `timeout_actions` are mostly self-applied (the fail-closed `Escalate`
-    /// re-stamps the gate, `Cancel` finalizes the run); an opt-in `AutoApprove`
-    /// yields a resumed `ExecuteStep` the caller logs until the live SOP executor
-    /// (EPIC A2) exists.
     pub fn run_maintenance_tick(&mut self) -> MaintenanceSummary {
         // Count overdue gates BEFORE applying the action: the fail-closed Escalate
         // default re-stamps in place and produces no action, so counting actions
@@ -3197,29 +3048,19 @@ impl SopEngine {
 
     /// Re-stamp a run's `waiting_since` to now (timeout escalation: the gate stays
     /// open but the clock resets so it re-surfaces, not self-approves).
-    pub(crate) fn restamp_waiting_with_gate_event(
-        &mut self,
-        run_id: &str,
-        event: &SopEventRecord,
-    ) -> Result<()> {
-        let previous = match self.active_runs.get_mut(run_id) {
+    pub(crate) fn restamp_waiting(&mut self, run_id: &str) {
+        let restamped = match self.active_runs.get_mut(run_id) {
             Some(run) => {
-                let previous = run.waiting_since.clone();
                 run.waiting_since = Some(now_iso8601());
-                previous
+                true
             }
-            None => return Ok(()),
+            None => false,
         };
-        // Persist the re-stamped clock with the escalation event as one durable
-        // outcome; otherwise history could say the gate escalated while the
-        // timeout clock still points at the old overdue instant.
-        if let Err(e) = self.persist_active_with_gate_event(run_id, event) {
-            if let Some(run) = self.active_runs.get_mut(run_id) {
-                run.waiting_since = previous;
-            }
-            return Err(e);
+        // Persist so the re-stamped clock survives a restart; otherwise an
+        // escalated gate would re-time-out immediately on the next boot.
+        if restamped {
+            self.persist_active(run_id);
         }
-        Ok(())
     }
 
     /// The current step number of an active run (0 if absent). For ledger rows.
@@ -3358,6 +3199,15 @@ impl SopEngine {
         }
     }
 
+    pub(crate) fn record_gate_event(
+        &self,
+        entry: super::approval::GateLedgerEntry,
+    ) -> Result<(), StoreError> {
+        self.store
+            .append_event(&entry.into_event_record())
+            .map(|_| ())
+    }
+
     /// Ordered event/ledger history for a run (from the durable store).
     pub fn run_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
         self.store.list_events(run_id)
@@ -3485,10 +3335,6 @@ impl SopEngine {
         }
     }
 
-    /// The single out-of-band gate-clearing entry point (EPIC C). All four
-    /// principals (agent tool, CLI, gateway, timeout tick) funnel through here.
-    /// Sibling of `approve_step` (which keeps the deterministic-checkpoint resume
-    /// path); the shared `WaitingApproval -> ExecuteStep` body is `clear_waiting_gate`.
     pub fn resolve_gate(
         &mut self,
         run_id: &str,
@@ -3697,20 +3543,6 @@ fn execution_mode_needs_approval(mode: SopExecutionMode, sop: &Sop, step: &SopSt
     }
 }
 
-fn step_requires_approval_gate(sop: &Sop, step: &SopStep) -> bool {
-    if step.requires_confirmation {
-        return true;
-    }
-
-    let effective_mode = step.mode.unwrap_or(sop.execution_mode);
-    execution_mode_needs_approval(sop.execution_mode, sop, step)
-        || execution_mode_needs_approval(effective_mode, sop, step)
-}
-
-fn pending_step_blocks_direct_advance(sop: &Sop, step: &SopStep) -> bool {
-    step.kind == SopStepKind::Checkpoint || step_requires_approval_gate(sop, step)
-}
-
 /// Determine the action for a step based on the effective execution mode.
 fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: String) -> SopRunAction {
     let mut step = step.clone();
@@ -3719,7 +3551,21 @@ fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: Strin
         .map(str::to_string);
     let step = &step;
 
-    if step_requires_approval_gate(sop, step) {
+    // Steps with requires_confirmation always need approval
+    if step.requires_confirmation {
+        return SopRunAction::WaitApproval {
+            run_id,
+            step: step.clone(),
+            context,
+        };
+    }
+
+    let effective_mode = step.mode.unwrap_or(sop.execution_mode);
+    let sop_needs_approval = execution_mode_needs_approval(sop.execution_mode, sop, step);
+    let step_needs_approval = execution_mode_needs_approval(effective_mode, sop, step);
+    let needs_approval = sop_needs_approval || step_needs_approval;
+
+    if needs_approval {
         SopRunAction::WaitApproval {
             run_id,
             step: step.clone(),
@@ -4843,94 +4689,6 @@ mod tests {
     }
 
     #[test]
-    fn start_run_terminal_persist_failure_retains_run_and_claim() {
-        let store = std::sync::Arc::new(FailingAppendStore {
-            inner: InMemoryRunStore::new(),
-            fail: std::sync::atomic::AtomicBool::new(false),
-            fail_save: std::sync::atomic::AtomicBool::new(false),
-            fail_finish: std::sync::atomic::AtomicBool::new(true),
-        });
-        let mut sop = test_sop(
-            "schema-start-finish-fail",
-            SopExecutionMode::Auto,
-            SopPriority::Normal,
-        );
-        sop.steps[0].schema = Some(StepSchema {
-            input: Some(required_object_schema("ok")),
-            output: None,
-        });
-        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
-
-        let err = engine
-            .start_run(
-                "schema-start-finish-fail",
-                SopEvent {
-                    source: SopTriggerSource::Manual,
-                    topic: None,
-                    payload: Some("{}".into()),
-                    timestamp: now_iso8601(),
-                },
-            )
-            .expect_err("terminal persistence failure must reject start");
-
-        assert!(err.is::<TerminalPersistenceRetained>());
-        assert!(err.to_string().contains("injected finish failure"));
-        let run_id = first_active_run_id(&engine);
-        assert_eq!(
-            engine.get_run(&run_id).unwrap().status,
-            SopRunStatus::Running,
-            "failed terminal persistence must leave the start-path run active"
-        );
-        assert_eq!(
-            store.claim_counts("schema-start-finish-fail").unwrap(),
-            (1, 1),
-            "failed terminal persistence must keep the admission claim"
-        );
-        assert!(
-            engine.finished_runs(None).is_empty(),
-            "the run must not move to terminal cache until terminal persistence succeeds"
-        );
-    }
-
-    #[test]
-    fn start_deterministic_terminal_persist_failure_retains_run_and_claim() {
-        let store = std::sync::Arc::new(FailingAppendStore {
-            inner: InMemoryRunStore::new(),
-            fail: std::sync::atomic::AtomicBool::new(false),
-            fail_save: std::sync::atomic::AtomicBool::new(false),
-            fail_finish: std::sync::atomic::AtomicBool::new(true),
-        });
-        let mut sop = deterministic_sop_all_execute("det-schema-start-finish-fail");
-        sop.steps[0].schema = Some(StepSchema {
-            input: Some(required_object_schema("ok")),
-            output: None,
-        });
-        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
-
-        let err = engine
-            .start_deterministic_run("det-schema-start-finish-fail", manual_event())
-            .expect_err("terminal persistence failure must reject deterministic start");
-
-        assert!(err.is::<TerminalPersistenceRetained>());
-        assert!(err.to_string().contains("injected finish failure"));
-        let run_id = first_active_run_id(&engine);
-        assert_eq!(
-            engine.get_run(&run_id).unwrap().status,
-            SopRunStatus::Running,
-            "failed terminal persistence must leave the deterministic run active"
-        );
-        assert_eq!(
-            store.claim_counts("det-schema-start-finish-fail").unwrap(),
-            (1, 1),
-            "failed terminal persistence must keep the deterministic admission claim"
-        );
-        assert!(
-            engine.finished_runs(None).is_empty(),
-            "the deterministic run must not move to terminal cache until persistence succeeds"
-        );
-    }
-
-    #[test]
     fn schema_output_failure_fails_run_before_next_step() {
         let mut sop = test_sop("schema-out", SopExecutionMode::Auto, SopPriority::Normal);
         sop.steps[0].schema = Some(StepSchema {
@@ -5745,11 +5503,6 @@ mod tests {
 
     #[test]
     fn cooldown_is_shared_across_engine_instances() {
-        // Two engines share ONE store. Engine A runs and finishes a run; the
-        // cooldown marker lives only in A's local `finished_runs`, but B must still
-        // honor the cooldown because it reads the last terminal completion from the
-        // shared store. Without FIX 1 (store-backed cooldown), B sees no local
-        // finished run and admits early - this test fails.
         let store = std::sync::Arc::new(InMemoryRunStore::new());
         let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
         sop.cooldown_secs = 3600; // 1 hour
@@ -5796,11 +5549,6 @@ mod tests {
 
     #[test]
     fn restore_runs_keeps_active_and_claims_aligned_over_cap() {
-        // Pre-seed the shared store with non-terminal runs OVER the per-SOP cap,
-        // then restore onto a fresh engine. FIX 2 re-establishes a claim for every
-        // restored run without applying admission caps, so `active_runs` and the
-        // live-claim total stay aligned 1:1 (the old capped path silently dropped
-        // the over-cap claim, leaving a locally active run with no store claim).
         let store = std::sync::Arc::new(InMemoryRunStore::new());
         let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
         sop.max_concurrent = 1; // cap of 1, but seed 3 already-running runs
@@ -6197,7 +5945,7 @@ mod tests {
         );
     }
 
-    // ── Advance step gate guard ─────────────────────────────
+    // ── Advance step gate guard ─────────────────
     //
     // A driver calling `sop_advance` while a run is parked at an external
     // gate (WaitingApproval or PausedCheckpoint) used to be allowed to
@@ -6557,106 +6305,6 @@ mod tests {
     }
 
     #[test]
-    fn timeout_cancel_terminal_failure_does_not_write_timeout_event() {
-        let store = std::sync::Arc::new(FailingAppendStore {
-            inner: InMemoryRunStore::new(),
-            fail: std::sync::atomic::AtomicBool::new(false),
-            fail_save: std::sync::atomic::AtomicBool::new(false),
-            fail_finish: std::sync::atomic::AtomicBool::new(false),
-        });
-        let mut engine = SopEngine::new(SopConfig {
-            approval_timeout_secs: 1,
-            approval_timeout_action: zeroclaw_config::schema::ApprovalTimeoutAction::Cancel,
-            ..SopConfig::default()
-        })
-        .with_store(store.clone());
-        engine.set_sops_for_test(vec![test_sop(
-            "s1",
-            SopExecutionMode::Supervised,
-            SopPriority::Normal,
-        )]);
-        let action = engine.start_run("s1", manual_event()).unwrap();
-        let run_id = extract_run_id(&action).to_string();
-        engine.active_runs.get_mut(&run_id).unwrap().waiting_since =
-            Some("2020-01-01T00:00:00Z".into());
-
-        store
-            .fail_finish
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let actions = engine.check_approval_timeouts();
-
-        assert!(
-            actions.is_empty(),
-            "failed cancel persistence retries later"
-        );
-        assert_eq!(
-            engine.get_run(&run_id).unwrap().status,
-            SopRunStatus::WaitingApproval,
-            "the gate stays waiting when terminal persistence fails"
-        );
-        assert!(
-            !engine
-                .run_events(&run_id)
-                .unwrap()
-                .iter()
-                .any(|ev| ev.kind == "gate_timed_out"),
-            "timeout cancel must not write a ledger row without terminal state"
-        );
-    }
-
-    #[test]
-    fn timeout_escalate_save_failure_does_not_write_escalation_event() {
-        let store = std::sync::Arc::new(FailingAppendStore {
-            inner: InMemoryRunStore::new(),
-            fail: std::sync::atomic::AtomicBool::new(false),
-            fail_save: std::sync::atomic::AtomicBool::new(false),
-            fail_finish: std::sync::atomic::AtomicBool::new(false),
-        });
-        let mut engine = SopEngine::new(SopConfig {
-            approval_timeout_secs: 1,
-            ..SopConfig::default()
-        })
-        .with_store(store.clone());
-        engine.set_sops_for_test(vec![test_sop(
-            "s1",
-            SopExecutionMode::Supervised,
-            SopPriority::Normal,
-        )]);
-        let action = engine.start_run("s1", manual_event()).unwrap();
-        let run_id = extract_run_id(&action).to_string();
-        let overdue = "2020-01-01T00:00:00Z".to_string();
-        engine.active_runs.get_mut(&run_id).unwrap().waiting_since = Some(overdue.clone());
-
-        store
-            .fail_save
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let actions = engine.check_approval_timeouts();
-
-        assert!(
-            actions.is_empty(),
-            "failed escalation persistence retries later"
-        );
-        assert_eq!(
-            engine.get_run(&run_id).unwrap().status,
-            SopRunStatus::WaitingApproval,
-            "the gate stays waiting when restamp persistence fails"
-        );
-        assert_eq!(
-            engine.get_run(&run_id).unwrap().waiting_since.as_deref(),
-            Some(overdue.as_str()),
-            "failed escalation persistence rolls back the in-memory restamp"
-        );
-        assert!(
-            !engine
-                .run_events(&run_id)
-                .unwrap()
-                .iter()
-                .any(|ev| ev.kind == "gate_escalated"),
-            "timeout escalate must not write a ledger row without the restamp"
-        );
-    }
-
-    #[test]
     fn timeout_auto_approve_legacy_resumes() {
         // The legacy fail-open behavior is reachable ONLY via the explicit opt-in.
         let mut engine = SopEngine::new(SopConfig {
@@ -6948,10 +6596,11 @@ mod tests {
         );
     }
 
-    /// Delegates to an in-memory store but fails every `renew_claim_for_restore`,
-    /// to prove resume fails CLOSED when the claim store errors.
+    /// Delegates initial admission, then can fail the capped resume CAS to prove
+    /// resume fails CLOSED when the claim store errors.
     struct FailingReacquireStore {
         inner: InMemoryRunStore,
+        fail_claim: std::sync::atomic::AtomicBool,
     }
     impl SopRunStore for FailingReacquireStore {
         fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
@@ -6982,10 +6631,19 @@ mod tests {
             p: usize,
             g: usize,
         ) -> Result<Option<ClaimToken>, StoreError> {
+            if self.fail_claim.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected claim failure".into()));
+            }
             self.inner.try_claim_run(id, s, p, g)
         }
         fn renew_claim_for_restore(&self, _id: &str, _s: &str) -> Result<ClaimToken, StoreError> {
             Err(StoreError::Backend("injected renew failure".into()))
+        }
+        fn mark_claim_retained_after_terminal_rollback(&self, id: &str) -> Result<(), StoreError> {
+            self.inner.mark_claim_retained_after_terminal_rollback(id)
+        }
+        fn has_retained_terminal_rollback_claim(&self, id: &str) -> Result<bool, StoreError> {
+            self.inner.has_retained_terminal_rollback_claim(id)
         }
         fn claim_counts(&self, s: &str) -> Result<(usize, usize), StoreError> {
             self.inner.claim_counts(s)
@@ -7034,11 +6692,15 @@ mod tests {
         // uncounted: the resume aborts (Err) and the gate stays WaitingApproval.
         let store = std::sync::Arc::new(FailingReacquireStore {
             inner: InMemoryRunStore::new(),
+            fail_claim: std::sync::atomic::AtomicBool::new(false),
         });
         let sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
-        let mut engine = engine_with_sops(vec![sop]).with_store(store);
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
         let a = engine.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&a).to_string();
+        store
+            .fail_claim
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             engine.get_run(&run_id).unwrap().status,
             SopRunStatus::WaitingApproval
@@ -7072,10 +6734,14 @@ mod tests {
     struct FailingAppendStore {
         inner: InMemoryRunStore,
         fail: std::sync::atomic::AtomicBool,
+        fail_save: std::sync::atomic::AtomicBool,
         fail_finish: std::sync::atomic::AtomicBool,
     }
     impl SopRunStore for FailingAppendStore {
         fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
+            if self.fail_save.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError::Backend("injected save failure".into()));
+            }
             self.inner.save_run(r)
         }
         fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
@@ -7110,6 +6776,12 @@ mod tests {
         }
         fn renew_claim_for_restore(&self, id: &str, s: &str) -> Result<ClaimToken, StoreError> {
             self.inner.renew_claim_for_restore(id, s)
+        }
+        fn mark_claim_retained_after_terminal_rollback(&self, id: &str) -> Result<(), StoreError> {
+            self.inner.mark_claim_retained_after_terminal_rollback(id)
+        }
+        fn has_retained_terminal_rollback_claim(&self, id: &str) -> Result<bool, StoreError> {
+            self.inner.has_retained_terminal_rollback_claim(id)
         }
         fn claim_counts(&self, s: &str) -> Result<(usize, usize), StoreError> {
             self.inner.claim_counts(s)
@@ -7164,6 +6836,7 @@ mod tests {
         let store = std::sync::Arc::new(FailingAppendStore {
             inner: InMemoryRunStore::new(),
             fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
             fail_finish: std::sync::atomic::AtomicBool::new(false),
         });
         let sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
@@ -7237,6 +6910,12 @@ mod tests {
         }
         fn renew_claim_for_restore(&self, id: &str, s: &str) -> Result<ClaimToken, StoreError> {
             self.inner.renew_claim_for_restore(id, s)
+        }
+        fn mark_claim_retained_after_terminal_rollback(&self, id: &str) -> Result<(), StoreError> {
+            self.inner.mark_claim_retained_after_terminal_rollback(id)
+        }
+        fn has_retained_terminal_rollback_claim(&self, id: &str) -> Result<bool, StoreError> {
+            self.inner.has_retained_terminal_rollback_claim(id)
         }
         fn claim_counts(&self, s: &str) -> Result<(usize, usize), StoreError> {
             self.inner.claim_counts(s)
@@ -7563,6 +7242,25 @@ mod tests {
                 .unwrap()
                 .insert(run_id.to_string(), token.clone());
             Ok(token)
+        }
+        fn mark_claim_retained_after_terminal_rollback(
+            &self,
+            run_id: &str,
+        ) -> Result<(), StoreError> {
+            if let Some(claim) = self.claims.lock().unwrap().get_mut(run_id) {
+                claim.holder = crate::sop::store::RETAINED_TERMINAL_ROLLBACK_HOLDER.to_string();
+            }
+            Ok(())
+        }
+        fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError> {
+            Ok(self
+                .claims
+                .lock()
+                .unwrap()
+                .get(run_id)
+                .is_some_and(|claim| {
+                    claim.holder == crate::sop::store::RETAINED_TERMINAL_ROLLBACK_HOLDER
+                }))
         }
         fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
             let claims = self.claims.lock().unwrap();
@@ -8739,6 +8437,83 @@ type = "manual"
     }
 
     #[test]
+    fn deny_checkpoint_goto_continuation_respects_per_sop_cap() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut sop = deterministic_sop("det-cp-cap");
+        sop.max_concurrent = 1;
+        sop.steps[1].on_failure = StepFailure::Goto { step: 3 };
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+
+        let first = engine.start_run("det-cp-cap", manual_event()).unwrap();
+        let first_id = extract_run_id(&first).to_string();
+        engine
+            .advance_deterministic_step(&first_id, serde_json::json!("first"), None)
+            .unwrap();
+        let second = engine.start_run("det-cp-cap", manual_event()).unwrap();
+        let second_id = extract_run_id(&second).to_string();
+        engine
+            .advance_deterministic_step(&second_id, serde_json::json!("second"), None)
+            .unwrap();
+
+        engine.approve_step(&first_id).unwrap();
+        let err = engine
+            .decide_checkpoint(
+                &second_id,
+                ApprovalDecision::Deny {
+                    reason: Some("declined".into()),
+                },
+            )
+            .expect_err("a continuing denial must honor the per-SOP cap");
+        assert!(err_is_resume_at_capacity(&err), "unexpected error: {err}");
+        assert_eq!(
+            engine.get_run(&second_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+        assert_eq!(store.claim_counts("det-cp-cap").unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn denied_checkpoint_continuation_rolls_back_when_persistence_fails() {
+        let store = std::sync::Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut sop = deterministic_sop("det-cp-save-fail");
+        sop.steps[1].on_failure = StepFailure::Goto { step: 3 };
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let action = engine
+            .start_run("det-cp-save-fail", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!("step-one"), None)
+            .unwrap();
+
+        store
+            .fail_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = engine
+            .decide_checkpoint(
+                &run_id,
+                ApprovalDecision::Deny {
+                    reason: Some("declined".into()),
+                },
+            )
+            .expect_err("the continuation must not run from an unpersisted transition");
+        assert!(
+            err.to_string()
+                .contains("failed to persist checkpoint denial")
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+        assert_eq!(store.claim_counts("det-cp-save-fail").unwrap(), (0, 0));
+    }
+
+    #[test]
     fn deny_checkpoint_routes_through_on_failure_goto() {
         // A denied checkpoint takes the failure path: the checkpoint step is
         // recorded Failed and routed through its `on_failure`. With a Goto, the
@@ -8819,6 +8594,7 @@ type = "manual"
         let store = std::sync::Arc::new(FailingAppendStore {
             inner: InMemoryRunStore::new(),
             fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
             fail_finish: std::sync::atomic::AtomicBool::new(false),
         });
         let mut sop = deterministic_sop("det-cp-deny-finish-fail");
@@ -8859,6 +8635,20 @@ type = "manual"
             store.claim_counts("det-cp-deny-finish-fail").unwrap(),
             (1, 1),
             "a failed terminal write keeps the reacquired claim fail-closed"
+        );
+        assert!(
+            store.has_retained_terminal_rollback_claim(&run_id).unwrap(),
+            "the retained claim must be durably distinguishable from a stale parked claim"
+        );
+
+        let mut restarted = engine_with_sops(vec![deterministic_sop("det-cp-deny-finish-fail")])
+            .with_store(store.clone());
+        restarted.restore_runs();
+        assert!(restarted.active_runs().contains_key(&run_id));
+        assert_eq!(
+            store.claim_counts("det-cp-deny-finish-fail").unwrap(),
+            (1, 1),
+            "restart must retain the intentional terminal-rollback claim"
         );
     }
 

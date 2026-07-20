@@ -498,15 +498,10 @@ pub async fn handle_sop_decide(
                     resumed_action = Some(action);
                 }
                 Err(e) => {
-                    // A checkpoint resume refused at capacity is transient backpressure, not a
-                    // bad request: return 503 to match the approval resume path's
-                    // `DeferredAtCapacity`. A genuine error stays 400.
-                    let status = if zeroclaw_runtime::sop::err_is_resume_at_capacity(&e) {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    } else {
-                        StatusCode::BAD_REQUEST
-                    };
-                    return (status, Json(serde_json::json!({ "error": e.to_string() })))
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
                         .into_response();
                 }
             },

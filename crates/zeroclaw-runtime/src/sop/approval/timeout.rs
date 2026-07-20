@@ -22,8 +22,8 @@ pub fn apply_timeout_action(
         // Audit-first: don't re-surface unless the escalation row is durably
         // recorded; on a store failure skip this run (it retries next tick).
         ApprovalTimeoutAction::Escalate => {
-            let event = system_entry(engine, run_id, GateEventKind::Escalated).into_event_record();
-            if let Err(e) = engine.restamp_waiting_with_gate_event(run_id, &event) {
+            let entry = system_entry(engine, run_id, GateEventKind::Escalated);
+            if let Err(e) = engine.record_gate_event(entry) {
                 log_audit_skip(run_id, "escalate", &e);
                 return None;
             }

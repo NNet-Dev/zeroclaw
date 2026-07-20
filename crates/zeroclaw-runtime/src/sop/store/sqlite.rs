@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::model::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SopEventRecord,
 };
-use super::{RETAINED_TERMINAL_ROLLBACK_HOLDER, SopRunStore, StoreError, pending_capacity_member};
+use super::{RETAINED_TERMINAL_ROLLBACK_HOLDER, SopRunStore, StoreError};
 
 /// Default claim lease. The concurrency tick (EPIC A1) renews via `heartbeat_claim`;
 /// the reaper reclaims claims past this without a heartbeat.
@@ -151,106 +151,6 @@ impl SopRunStore for SqliteRunStore {
         Ok(())
     }
 
-    fn save_run_with_pending_capacity(
-        &self,
-        run: &PersistedRun,
-        max_pending: usize,
-    ) -> Result<bool, StoreError> {
-        let mut g = self.lock()?;
-        let id = run.run_id();
-        let json = serde_json::to_string(run)?;
-        let tx = g.transaction().map_err(sql_err)?;
-
-        if max_pending > 0 {
-            let pending = {
-                let mut stmt = tx
-                    .prepare("SELECT json FROM sop_runs WHERE terminal=0")
-                    .map_err(sql_err)?;
-                let mut rows = stmt.query([]).map_err(sql_err)?;
-                let mut pending = 0usize;
-                while let Some(row) = rows.next().map_err(sql_err)? {
-                    let raw: String = row.get(0).map_err(sql_err)?;
-                    let existing: PersistedRun = serde_json::from_str(&raw)?;
-                    if pending_capacity_member(&existing, run) {
-                        pending += 1;
-                    }
-                }
-                pending
-            };
-            if pending >= max_pending {
-                return Ok(false);
-            }
-        }
-
-        let existing: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT revision, json FROM sop_runs WHERE run_id=?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_err)?;
-        if let Some((rev, existing_json)) = existing {
-            guard_revision(id, rev as u64, &existing_json, run.revision, &json)?;
-        }
-        tx.execute(
-            "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
-             VALUES (?1, ?2, 0, ?3, ?4)
-             ON CONFLICT(run_id) DO UPDATE SET
-                 revision=excluded.revision,
-                 terminal=excluded.terminal,
-                 last_progress_at=excluded.last_progress_at,
-                 json=excluded.json",
-            params![id, run.revision as i64, run.last_progress_at, json],
-        )
-        .map_err(sql_err)?;
-        tx.commit().map_err(sql_err)?;
-        Ok(true)
-    }
-
-    fn save_run_with_event(
-        &self,
-        run: &PersistedRun,
-        ev: &SopEventRecord,
-    ) -> Result<u64, StoreError> {
-        let mut g = self.lock()?;
-        let id = run.run_id();
-        let json = serde_json::to_string(run)?;
-        let payload = serde_json::to_string(&ev.payload)?;
-        let tx = g.transaction().map_err(sql_err)?;
-        let existing: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT revision, json FROM sop_runs WHERE run_id=?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_err)?;
-        if let Some((rev, existing_json)) = existing {
-            guard_revision(id, rev as u64, &existing_json, run.revision, &json)?;
-        }
-        tx.execute(
-            "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
-             VALUES (?1, ?2, 0, ?3, ?4)
-             ON CONFLICT(run_id) DO UPDATE SET
-                 revision=excluded.revision,
-                 terminal=excluded.terminal,
-                 last_progress_at=excluded.last_progress_at,
-                 json=excluded.json",
-            params![id, run.revision as i64, run.last_progress_at, json],
-        )
-        .map_err(sql_err)?;
-        tx.execute(
-            "INSERT INTO sop_events (run_id, ts, kind, actor, reason, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![ev.run_id, ev.ts, ev.kind, ev.actor, ev.reason, payload],
-        )
-        .map_err(sql_err)?;
-        let seq = tx.last_insert_rowid() as u64;
-        tx.commit().map_err(sql_err)?;
-        Ok(seq)
-    }
-
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
         let json = serde_json::to_string(terminal)?;
@@ -286,56 +186,6 @@ impl SopRunStore for SqliteRunStore {
             .map_err(sql_err)?;
         tx.commit().map_err(sql_err)?;
         Ok(())
-    }
-
-    fn finish_run_with_event(
-        &self,
-        run_id: &str,
-        terminal: &PersistedRun,
-        ev: &SopEventRecord,
-    ) -> Result<u64, StoreError> {
-        let mut g = self.lock()?;
-        let json = serde_json::to_string(terminal)?;
-        let payload = serde_json::to_string(&ev.payload)?;
-        let tx = g.transaction().map_err(sql_err)?;
-        let existing: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT revision, json FROM sop_runs WHERE run_id=?1",
-                params![run_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_err)?;
-        if let Some((rev, existing_json)) = existing {
-            guard_revision(run_id, rev as u64, &existing_json, terminal.revision, &json)?;
-        }
-        tx.execute(
-            "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
-             VALUES (?1, ?2, 1, ?3, ?4)
-             ON CONFLICT(run_id) DO UPDATE SET
-                 revision=excluded.revision,
-                 terminal=1,
-                 last_progress_at=excluded.last_progress_at,
-                 json=excluded.json",
-            params![
-                run_id,
-                terminal.revision as i64,
-                terminal.last_progress_at,
-                json
-            ],
-        )
-        .map_err(sql_err)?;
-        tx.execute("DELETE FROM sop_claims WHERE run_id=?1", params![run_id])
-            .map_err(sql_err)?;
-        tx.execute(
-            "INSERT INTO sop_events (run_id, ts, kind, actor, reason, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![ev.run_id, ev.ts, ev.kind, ev.actor, ev.reason, payload],
-        )
-        .map_err(sql_err)?;
-        let seq = tx.last_insert_rowid() as u64;
-        tx.commit().map_err(sql_err)?;
-        Ok(seq)
     }
 
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
@@ -520,12 +370,12 @@ impl SopRunStore for SqliteRunStore {
             .query_row(
                 "SELECT json FROM sop_claims WHERE run_id=?1",
                 params![run_id],
-                |r| r.get(0),
+                |row| row.get(0),
             )
             .optional()
             .map_err(sql_err)?;
         let Some(raw) = raw else {
-            return Ok(());
+            return Err(StoreError::ClaimLost);
         };
         let mut token: ClaimToken = serde_json::from_str(&raw)?;
         token.holder = RETAINED_TERMINAL_ROLLBACK_HOLDER.to_string();
@@ -543,7 +393,7 @@ impl SopRunStore for SqliteRunStore {
             .query_row(
                 "SELECT json FROM sop_claims WHERE run_id=?1",
                 params![run_id],
-                |r| r.get(0),
+                |row| row.get(0),
             )
             .optional()
             .map_err(sql_err)?;
@@ -982,6 +832,29 @@ mod tests {
         // Global cap = 3 is reached across all SOPs; a fourth distinct SOP
         // is refused even though its own per-SOP slot is free.
         assert!(s.try_claim_run("d1", "d", 1, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn retained_terminal_rollback_marker_roundtrips_in_claim_row() {
+        let store = SqliteRunStore::open_in_memory().unwrap();
+        store
+            .try_claim_run("r-retained", "deploy", 1, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !store
+                .has_retained_terminal_rollback_claim("r-retained")
+                .unwrap()
+        );
+        store
+            .mark_claim_retained_after_terminal_rollback("r-retained")
+            .unwrap();
+        assert!(
+            store
+                .has_retained_terminal_rollback_claim("r-retained")
+                .unwrap()
+        );
+        assert_eq!(store.claim_counts("deploy").unwrap(), (1, 1));
     }
 
     #[test]

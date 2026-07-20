@@ -164,6 +164,14 @@ impl Tool for SopApproveTool {
                     "Approval failed: run {run_id} is not waiting for approval."
                 )),
             }),
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::DeferredAtCapacity)) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "sop-approval-deferred-at-capacity",
+                    &[("run_id", run_id)],
+                )),
+            }),
             // A quorum can record a valid vote without clearing the gate yet.
             Ok(BrokerOutcome::PendingQuorum { have, need }) => Ok(ToolResult {
                 success: true,

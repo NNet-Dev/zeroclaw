@@ -933,3 +933,4 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込み
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
 cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
+sop-approval-deferred-at-capacity = 実行スロットが満杯のため、実行 {$run_id} を再開できませんでした。承認は待機状態のままです。スロットが空いてから再試行してください。
