@@ -1,51 +1,4 @@
 //! The agent turn engine, decomposed into single-purpose step modules.
-//!
-//! Public paths are unchanged: external code keeps importing via
-//! `crate::agent::loop_::*` (re-export block there). Full contract manifest:
-//! `/opt/notes/work/zeroclaw/unification_modular/RUN_SHEET.md` (condensed
-//! copy below) during the #7415 migration.
-//!
-//! # Run sheet (condensed)
-//!
-//! [`run_tool_call_loop`] is the orchestrator: loop control only, no step
-//! logic. [`TurnCtx`] carries shared refs ONLY; every `&mut` the loop owns
-//! (history, loop detector, `seen_tool_signatures` — reset per iteration —
-//! identical-output counters, accumulated display text, malformed-retry
-//! counter) stays a loop local passed as an explicit argument.
-//!
-//! Per-iteration step sequence:
-//!
-//! ```text
-//! preflight_history_maintenance(&mut history)            history_window.rs
-//! → [model-switch check — inline]
-//! → build_iteration_tool_specs(..)                       tool_specs.rs
-//! → resolve_vision_provider(..)                          vision_route.rs
-//! → [active triple derivation — inline]
-//! → prepare_messages_for_iteration(..)                   vision_route.rs
-//! → announce_llm_request(ctx, ..) -> Instant             provider_call.rs
-//! → enforce_tool_loop_budget()                           provider_call.rs
-//! → call_provider(ctx, ..) -> ProviderCallOutcome        provider_call.rs
-//!     [streaming: consume_provider_streaming_response]   stream_consume.rs
-//!     [cancel asymmetry: see ProviderCallOutcome docs]
-//! → Ok:  interpret_chat_response(ctx, ..)                parse_response.rs
-//!   Err: record_llm_failure(..);                         context_recovery.rs
-//!        try_recover_context_overflow(..) -> bool (true ⇒ continue)
-//! → resolve_display_text / [malformed-retry — inline]
-//!   / [no-tool exit — inline, stream_text_posthoc_chunks → events.rs]
-//! → prepare_tool_calls(ctx, &mut seen, ..)               call_prep.rs
-//!     [approval via gate_tool_approval]                  approval_gate.rs
-//! → [execute dispatch — inline → tool_execution::execute_tools_{parallel,sequential}]
-//! → record_executed_outcomes(ctx, .., &mut ordered)      post_exec.rs
-//! → collect_tool_results(..) -> CollectedResults         results_collect.rs
-//! → check_identical_output_abort(.., &mut counters)      results_collect.rs
-//! → append_tool_round_to_history(&mut history, ..)       history_append.rs
-//! [loop exhausted] → finish_after_max_iterations(..)     max_iter.rs
-//! ```
-//!
-//! Leaf/type modules: `context` (TurnCtx), `events` (StreamDelta/DraftEvent,
-//! pacing consts, post-hoc chunker), `outcome` (ToolLoopCancelled,
-//! ModelSwitchRequested), `redact` (scrub_credentials), `stream_guard` +
-//! `protocol_detect` (streaming protocol suppression), `delivery_defaults`.
 
 pub(crate) mod approval_gate;
 pub(crate) mod call_prep;
@@ -133,39 +86,6 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
-// ── Agent Tool-Call Loop ──────────────────────────────────────────────────
-// Core agentic iteration: send conversation to the LLM, parse any tool
-// calls from the response, execute them, append results to history, and
-// repeat until the LLM produces a final text-only answer.
-//
-// Loop invariant: at the start of each iteration, `history` contains the
-// full conversation so far (system prompt + user messages + prior tool
-// results). The loop exits when:
-//   • the LLM returns no tool calls (final answer), or
-//   • max_iterations is reached (runaway safety), or
-//   • the cancellation token fires (external abort).
-
-/// Execute a single turn of the agent loop: send messages, parse tool calls,
-/// execute tools, and loop until the LLM produces a final text response.
-///
-/// `new_messages_out` is an append-log: every message the loop adds to
-/// `history` is mirrored into it at push time (a clone taken before any
-/// later in-loop history maintenance), so it is populated on **every** exit
-/// — success, error, and cancellation — and never derived from history
-/// indices, which in-loop pruning can invalidate. Loop-detection system
-/// notes are the one exception (merged into the existing system message;
-/// only reachable when pattern loop detection is enabled, which no
-/// `new_messages_out` consumer turns on).
-/// All parameters of [`run_tool_call_loop`], bundled into one borrowed struct.
-///
-/// Field names and types mirror the loop's former positional arguments
-/// one-for-one (the loop borrows everything for the duration of the turn,
-/// including the `&mut` working sets `history`, `steering`, `new_messages_out`,
-/// and `image_cache`). [`LoopKnobs`] stays a nested sub-bundle in `knobs`.
-///
-/// Callers build this struct literal and pass it by value; the loop
-/// destructures it once at entry, so the body reads exactly as it did when
-/// these were positional parameters.
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
     /// registry, approval, observability, and resolved runtime knobs. Stable
@@ -184,12 +104,6 @@ pub struct ToolLoop<'a> {
     pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
     pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
-    /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
-    /// with the turn into the engine, where the universal SOP policy layer
-    /// dispositions it at P1 (turn entry) and P2 (each steering injection).
-    /// Phase-1 callers stamp a per-origin envelope; real per-transport
-    /// stamping is phase 2. Owned (not borrowed) — the envelope is small and
-    /// consumed by the policy front door for the turn's lifetime.
     pub ingress: IngressContext,
     /// The per-turn memory half for unified memory-context injection: the
     /// handle, raw recall query, session scopes, and spawn-site suppression.
@@ -204,7 +118,7 @@ pub struct ToolLoop<'a> {
     /// context when the step delegates to a different agent (see
     /// [`SopStepReassembly`]). `None` on every path that cannot reach `Config`
     /// or that never drives nested SOP steps; when `None`, a cross-agent step
-    /// falls back to the parent context (today's behavior).
+    /// fails closed because its effective policy cannot be assembled.
     pub sop_reassembly: Option<SopStepReassembly<'a>>,
 }
 
@@ -301,13 +215,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
-    // ── Ingress policy · P1 (turn entry) ────────────────────────────────────
-    // RFC #6971: every inbound turn passes the universal SOP policy layer before
-    // a model sees it. The default policy dispositions to `Loop` (run the agent,
-    // today's behavior); the layer is always on, never skipped. `ingress` is
-    // consumed here (passed to `ingress_policy`) so it is never dead code under
-    // `-D warnings`. The text dispositioned at P1 is the trailing user turn —
-    // the most recently appended `user` history message, when present.
     let ingress_policy_cfg = IngressPolicy::default();
     let p1_text = history
         .iter()
@@ -335,13 +242,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
-    // ── Memory-context injection (unified) ──────────────────────────────────
-    // The ONE injection point for the memory preamble, replacing the per-path
-    // inline renderers. The decision is keyed on the ingress origin (sub-turns
-    // never inject; scheduled origins exclude Conversation entries); the
-    // pipeline and its documented uniform behavior live in
-    // `agent::memory_inject`. Injection prepends to the trailing user message
-    // AFTER the P1 policy scan, so policy always sees the caller's own text.
     if let Some(turn_memory) = &memory {
         let has_session = turn_memory.sessions.iter().any(Option::is_some);
         if let crate::agent::memory_inject::InjectPolicy::Inject {
@@ -427,14 +327,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     };
 
     for iteration in 0..max_iterations {
-        // Steering: fold caller-pushed mid-turn messages into history before
-        // this iteration's provider request.
-        //
-        // ── Ingress policy · P2 (steering drain) ────────────────────────────
-        // RFC #6971: each mid-turn injection passes the same universal policy
-        // layer as P1. The default policy dispositions to `Loop` → append as
-        // today. The envelope (`ingress`) carries the turn's provenance to the
-        // policy for each drained message.
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
@@ -488,14 +380,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         preflight_history_maintenance(history);
 
         if iteration == 0 && context_token_budget > 0 {
-            // The system prompt + inlined tool definitions form an irreducible
-            // floor whole-turn trimming can never drop. When that floor alone
-            // meets or exceeds the budget, trimming conversation history can
-            // never bring the request under budget — surface the actionable
-            // root cause once per turn (this block is gated on iteration == 0)
-            // so the misconfiguration is not silent (#5808). Whole-turn
-            // trimming below still runs and is harmless (it keeps the most
-            // recent turn); the model call / reactive recovery proceeds.
             let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
             if system_floor >= context_token_budget {
                 let __zc_floor_span = ::zeroclaw_log::info_span!(
@@ -640,12 +524,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ..
         } = iteration_tool_specs;
 
-        // ── Per-turn system prompt anchor refresh (#8054 Surface 3) ──
-        // The system prompt in `history[0]` was built by
-        // `Agent::build_system_prompt()` against the base provider, and
-        // may not reflect this iteration's `active_model_provider` after
-        // vision routing.  Swap the TASK_FRAMING anchor so the prompt's
-        // tool-availability claim matches the actual `request_tools`.
         refresh_prompt_anchor(history, use_native_tools);
 
         let prepared_messages = prepare_messages_for_iteration(
@@ -942,12 +820,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             return Ok(accumulated_display_text);
         }
 
-        // Do not accumulate intermediate-turn display text into the final
-        // channel response. Native tool-call providers may emit narration or
-        // scratchpad-like text alongside tool calls; draft-capable channels
-        // can still see it live through `on_delta` below, but the final
-        // delivered response must only contain the final assistant turn.
-
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
@@ -1199,6 +1071,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 new_messages_out.as_deref_mut(),
                 image_cache.as_deref_mut(),
                 agent_alias,
+                turn_id,
                 sop_reassembly,
             ))
             .await?;
@@ -1343,22 +1216,22 @@ pub struct SopStepReassembly<'a> {
     /// actually running with — the re-assembly baseline. At a top-level entry
     /// this equals `agent_alias`; once a cross-agent step re-assembles a
     /// different agent in a parent frame, the nested loop carries THAT agent
-    /// here (see [`advance_nested_reassembly`]). It is deliberately distinct
-    /// from `agent_alias`, which stays pinned to the outer agent for
-    /// attribution (Observer/receipt/OTel) and must not be overloaded: at
-    /// depth >= 2 the two diverge, and the re-assembly gate must compare a
-    /// step's alias against the effective baseline, not the attribution alias,
-    /// or a step naming the outer agent from inside a re-assembled child would
-    /// skip re-assembly and inherit the child's broader scope (escalation).
+    /// here (see [`advance_nested_reassembly`]). The re-assembly gate must
+    /// compare a step's alias against this effective baseline, not incidental
+    /// observer metadata: at depth >= 2 an outer alias can differ, and using it
+    /// for the gate would let a step inherit the wrong authority. In contrast,
+    /// the live driver stamps observer metadata with the effective step agent
+    /// while retaining the root turn id as separate correlation.
+    ///
+    /// Comparing against an outer alias would let a nested step naming that
+    /// outer agent skip re-assembly and inherit the child's broader scope.
     pub baseline_alias: Option<&'a str>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when it
 /// names an agent different from the one the current loop is running as. The
-/// baseline is the EFFECTIVE alias (the re-assembly baseline), never the
-/// attribution `agent_alias`, which at depth >= 2 lags behind a re-assembled
-/// child. A step with no explicit agent inherits the current one and never
-/// re-assembles.
+/// baseline is the EFFECTIVE alias carried by the re-assembly handle. A step
+/// with no explicit agent inherits the current one and never re-assembles.
 fn step_needs_reassembly(baseline_alias: Option<&str>, step_alias: Option<&str>) -> bool {
     matches!(step_alias, Some(s) if baseline_alias != Some(s))
 }
@@ -1386,19 +1259,70 @@ fn advance_nested_reassembly<'a>(
 
 /// A nested SOP step's owned per-agent execution surface, assembled for a step
 /// that delegates to a different agent. Owns exactly the fields of
-/// [`ResolvedAgentExecution`] that constitute per-agent isolation — provider
-/// binding, gated tool registry, approval policy, and the deferred-MCP
-/// activation set. The remaining turn knobs (iteration caps, pacing, budgets,
-/// multimodal, hooks) stay parent-threaded by design: the boundary re-assembled
-/// here is per-agent isolation of tools/policy/MCP/provider, not a full
-/// per-agent turn-config swap.
+/// [`ResolvedAgentExecution`] that vary by agent: provider binding, gated tool
+/// registry, approval policy, deferred-MCP activation, prompt inputs, and the
+/// resolved runtime profile. It is a per-drain materialized view of live
+/// [`zeroclaw_config::schema::Config`], not persistent state.
 pub(crate) struct OwnedAgentExecution {
     model_provider: Box<dyn ModelProvider>,
     provider_name: String,
     model: String,
+    temperature: Option<f64>,
     pub(crate) tools_registry: Vec<Box<dyn crate::tools::Tool>>,
     approval: crate::approval::ApprovalManager,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    mcp_tool_names: HashSet<String>,
+    runtime: zeroclaw_config::schema::ResolvedRuntime,
+    risk_profile: zeroclaw_config::schema::RiskProfileConfig,
+    agent_workspace: std::path::PathBuf,
+    skills: Vec<crate::skills::Skill>,
+    identity: zeroclaw_config::schema::IdentityConfig,
+    mcp_prompt_section: String,
+    show_tool_calls: bool,
+    receipt_generator: Option<crate::agent::tool_receipts::ReceiptGenerator>,
+}
+
+impl OwnedAgentExecution {
+    fn child_history(
+        &self,
+        context: String,
+        excluded_tools: &[String],
+    ) -> Result<Vec<ChatMessage>> {
+        let tool_descs = self
+            .tools_registry
+            .iter()
+            .map(|tool| (tool.name(), tool.description()))
+            .collect::<Vec<_>>();
+        let bootstrap_max_chars = self.runtime.compact_context.then_some(6000);
+        let mut system_prompt = crate::agent::loop_::build_system_prompt_for_turn(
+            &self.agent_workspace,
+            &self.model,
+            &tool_descs,
+            &self.mcp_prompt_section,
+            &self.skills,
+            Some(&self.identity),
+            bootstrap_max_chars,
+            &self.risk_profile,
+            self.model_provider.as_ref(),
+            &self.tools_registry,
+            excluded_tools,
+            self.activated_tools.as_ref(),
+            self.runtime.strict_tool_parsing,
+            self.runtime.prompt_injection_mode,
+            self.runtime.compact_context,
+            self.runtime.max_system_prompt_chars,
+            true,
+            self.show_tool_calls,
+            None,
+        )?;
+        if self.runtime.tool_receipts.enabled && self.runtime.tool_receipts.inject_system_prompt {
+            system_prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+        }
+        Ok(vec![
+            ChatMessage::system(system_prompt),
+            ChatMessage::user(context),
+        ])
+    }
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -1414,7 +1338,12 @@ pub(crate) async fn assemble_owned_execution(
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    origin_approval: Option<&crate::approval::ApprovalManager>,
+    origin_receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
 ) -> Result<OwnedAgentExecution> {
+    let agent = config
+        .resolved_agent_config(alias)
+        .ok_or_else(|| anyhow::Error::msg(format!("SOP step agent '{alias}' is not configured")))?;
     let security = Arc::new(crate::security::SecurityPolicy::for_agent(config, alias)?);
     let risk_profile = config
         .risk_profile_for_agent(alias)
@@ -1459,7 +1388,7 @@ pub(crate) async fn assemble_owned_execution(
         &config.browser,
         &config.http_request,
         &config.web_fetch,
-        &config.data_dir,
+        &security.workspace_dir,
         &config.agents,
         api_key.as_deref(),
         config,
@@ -1490,11 +1419,14 @@ pub(crate) async fn assemble_owned_execution(
             exclude_memory: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
+            mcp_registry: None,
         })
         .await;
+    let mcp_prompt_section = assembled.combined_mcp_prompt_section();
     let crate::tools::scoped::ScopedAssembled {
         registry,
         activated_handle,
+        mcp_tool_names,
         ..
     } = assembled;
     let tools_registry = registry.into_inner();
@@ -1510,15 +1442,35 @@ pub(crate) async fn assemble_owned_execution(
     let (model_provider, provider_name, model) =
         crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
 
-    let approval = crate::approval::ApprovalManager::for_non_interactive(&risk_profile);
+    let approval = origin_approval.map_or_else(
+        || crate::approval::ApprovalManager::for_non_interactive(&risk_profile),
+        |manager| manager.rebind_risk_profile(&risk_profile),
+    );
+    let receipt_generator = if agent.resolved.tool_receipts.enabled {
+        Some(origin_receipt_generator.cloned().unwrap_or_default())
+    } else {
+        None
+    };
 
     Ok(OwnedAgentExecution {
         model_provider,
         provider_name,
         model,
+        temperature: config
+            .resolved_model_provider_for_agent(alias)
+            .and_then(|(_, _, provider)| provider.temperature),
         tools_registry,
         approval,
         activated_tools: activated_handle,
+        mcp_tool_names,
+        runtime: agent.resolved,
+        risk_profile,
+        agent_workspace: config.agent_workspace_dir(alias),
+        skills,
+        identity: agent.identity,
+        mcp_prompt_section,
+        show_tool_calls: config.channels.show_tool_calls,
+        receipt_generator,
     })
 }
 
@@ -1559,6 +1511,7 @@ async fn drive_live_sop_actions(
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
     agent_alias: Option<&str>,
+    parent_turn_id: &str,
     sop_reassembly: Option<SopStepReassembly<'_>>,
 ) -> Result<()> {
     let mut pending = std::collections::VecDeque::from(queued_actions);
@@ -1578,11 +1531,6 @@ async fn drive_live_sop_actions(
                     context,
                 } => {
                     let started_at = crate::sop::engine::now_iso8601();
-                    let user_message = ChatMessage::user(context.clone());
-                    history.push(user_message.clone());
-                    if let Some(out) = new_messages_out.as_deref_mut() {
-                        out.push(user_message);
-                    }
 
                     // A step that delegates to a different agent must run AS that
                     // agent — with that agent's own gated tools, policy, and MCP
@@ -1592,8 +1540,7 @@ async fn drive_live_sop_actions(
                     // same-agent steps keep the parent context unchanged.
                     let step_alias = step.agent.as_deref();
                     // Compare against the EFFECTIVE re-assembly baseline (the agent
-                    // this loop is actually running as), not `agent_alias` (which
-                    // stays pinned to the outer agent for attribution). At depth
+                    // this loop is actually running as), not `agent_alias`. At depth
                     // >= 2 a re-assembled child carries its step agent as the
                     // baseline; comparing against `agent_alias` there would skip
                     // re-assembling a step that names the outer agent and let it
@@ -1612,6 +1559,8 @@ async fn drive_live_sop_actions(
                                     alias,
                                     Arc::clone(&queued.engine),
                                     queued.audit.clone(),
+                                    approval,
+                                    receipt_generator,
                                 )
                                 .await
                                 {
@@ -1650,7 +1599,11 @@ async fn drive_live_sop_actions(
                         }
                     }
 
-                    let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
+                    // Keep the root turn id in the nested id so observer backends can
+                    // parent the child span while the effective agent alias records
+                    // which authority actually executed the step.
+                    let nested_turn_id =
+                        format!("{parent_turn_id}:sop:{run_id}:step:{}", step.number);
                     let step_call_sink = crate::sop::executor::new_step_call_sink();
                     let step_output = if let Some(err) = assembly_error {
                         // Fail closed: never run a delegated step with the parent
@@ -1680,36 +1633,116 @@ async fn drive_live_sop_actions(
                             eff_model_provider,
                             eff_provider_name,
                             eff_model,
+                            eff_temperature,
                             eff_registry,
                             eff_approval,
                             eff_activated,
+                            eff_max_tool_iterations,
+                            eff_dedup_exempt_tools,
+                            eff_strict_tool_parsing,
+                            eff_parallel_tools,
+                            eff_max_tool_result_chars,
+                            eff_context_token_budget,
+                            eff_receipt_generator,
+                            eff_model_switch_callback,
+                            eff_agent_alias,
                         ) = match owned {
                             Some(o) => (
                                 o.model_provider.as_ref(),
                                 o.provider_name.as_str(),
                                 o.model.as_str(),
+                                o.temperature,
                                 o.tools_registry.as_slice(),
                                 Some(&o.approval),
                                 o.activated_tools.as_ref(),
+                                o.runtime.max_tool_iterations,
+                                o.runtime.tool_call_dedup_exempt.as_slice(),
+                                o.runtime.strict_tool_parsing,
+                                o.runtime.parallel_tools,
+                                o.runtime.max_tool_result_chars,
+                                o.runtime.effective_context_budget(),
+                                o.receipt_generator.as_ref(),
+                                None,
+                                step_alias,
                             ),
                             None => (
                                 model_provider,
                                 provider_name,
                                 model,
+                                temperature,
                                 tools_registry,
                                 approval,
                                 activated_tools,
+                                max_tool_iterations,
+                                dedup_exempt_tools,
+                                strict_tool_parsing,
+                                parallel_tools,
+                                max_tool_result_chars,
+                                context_token_budget,
+                                receipt_generator,
+                                model_switch_callback.clone(),
+                                agent_alias,
                             ),
                         };
 
+                        let base_excluded_tools = owned.map_or_else(
+                            || excluded_tools.to_vec(),
+                            |o| {
+                                crate::agent::loop_::compute_excluded_mcp_tools(
+                                    &o.tools_registry,
+                                    &o.runtime.tool_filter_groups,
+                                    &context,
+                                    &o.mcp_tool_names,
+                                )
+                            },
+                        );
                         let sop_excluded_tools = sop_step_excluded_tools(
                             &queued,
                             &run_id,
                             &step,
                             eff_registry,
                             eff_activated,
-                            excluded_tools,
+                            &base_excluded_tools,
                         );
+
+                        // Cross-agent steps get an isolated transcript assembled
+                        // from the child's own system context plus the explicit SOP
+                        // input. Same-agent steps retain the existing shared-history
+                        // behavior.
+                        let mut child_history = match owned {
+                            Some(o) => o.child_history(context.clone(), &sop_excluded_tools)?,
+                            None => Vec::new(),
+                        };
+                        if owned.is_none() {
+                            let user_message = ChatMessage::user(context.clone());
+                            history.push(user_message.clone());
+                            if let Some(out) = new_messages_out.as_deref_mut() {
+                                out.push(user_message);
+                            }
+                        }
+                        let eff_history = if owned.is_some() {
+                            &mut child_history
+                        } else {
+                            &mut *history
+                        };
+                        let eff_new_messages_out = if owned.is_some() {
+                            None
+                        } else {
+                            new_messages_out.as_deref_mut()
+                        };
+                        let mut child_image_cache =
+                            zeroclaw_providers::multimodal::LocalImageCache::new();
+                        let eff_image_cache = if owned.is_some() {
+                            Some(&mut child_image_cache)
+                        } else {
+                            image_cache.as_deref_mut()
+                        };
+                        let effective_attribution = eff_agent_alias
+                            .map(crate::agent::AgentAttribution)
+                            .unwrap_or(crate::agent::AgentAttribution(""));
+                        let attribution_span =
+                            ::zeroclaw_log::attribution_span!(&effective_attribution);
+                        use ::zeroclaw_log::Instrument as _;
 
                         crate::sop::executor::scope_step_call_sink(
                             step_call_sink.clone(),
@@ -1719,7 +1752,7 @@ async fn drive_live_sop_actions(
                                         model_provider: eff_model_provider,
                                         provider_name: eff_provider_name,
                                         model: eff_model,
-                                        temperature,
+                                        temperature: eff_temperature,
                                     },
                                     ResolvedIo {
                                         tools_registry: eff_registry,
@@ -1729,22 +1762,22 @@ async fn drive_live_sop_actions(
                                         multimodal_config,
                                         hooks,
                                         activated_tools: eff_activated,
-                                        model_switch_callback: model_switch_callback.clone(),
-                                        receipt_generator,
+                                        model_switch_callback: eff_model_switch_callback,
+                                        receipt_generator: eff_receipt_generator,
                                     },
                                     ResolvedRuntimeKnobs {
-                                        max_tool_iterations,
+                                        max_tool_iterations: eff_max_tool_iterations,
                                         excluded_tools: &sop_excluded_tools,
-                                        dedup_exempt_tools,
+                                        dedup_exempt_tools: eff_dedup_exempt_tools,
                                         pacing,
-                                        strict_tool_parsing,
-                                        parallel_tools,
-                                        max_tool_result_chars,
-                                        context_token_budget,
+                                        strict_tool_parsing: eff_strict_tool_parsing,
+                                        parallel_tools: eff_parallel_tools,
+                                        max_tool_result_chars: eff_max_tool_result_chars,
+                                        context_token_budget: eff_context_token_budget,
                                         knobs,
                                     },
                                 ),
-                                history,
+                                history: eff_history,
                                 channel_name,
                                 channel_reply_target,
                                 cancellation_token: cancellation_token.clone(),
@@ -1754,17 +1787,15 @@ async fn drive_live_sop_actions(
                                 collected_receipts,
                                 event_tx: event_tx.clone(),
                                 steering: None,
-                                new_messages_out: new_messages_out.as_deref_mut(),
-                                image_cache: image_cache.as_deref_mut(),
+                                new_messages_out: eff_new_messages_out,
+                                image_cache: eff_image_cache,
                                 memory: None,
                                 ingress: IngressContext::sub_turn(),
-                                // Attribution stays on the OUTER agent (Observer/
-                                // receipts/OTel); the re-assembly baseline rides in
-                                // `sop_reassembly` instead. See `advance_nested_reassembly`.
-                                agent_alias,
+                                agent_alias: eff_agent_alias,
                                 turn_id: &nested_turn_id,
                                 sop_reassembly: nested_sop_reassembly,
-                            })),
+                            }))
+                            .instrument(attribution_span),
                         )
                         .await
                     };
@@ -1894,17 +1925,6 @@ async fn drive_live_sop_actions(
     Ok(())
 }
 
-/// Per-turn system prompt TASK_FRAMING anchor refresh (#8054 Surface 3).
-///
-/// The system prompt in `history[0]` was built by
-/// `Agent::build_system_prompt()` against the base provider, and may not
-/// reflect the iteration's `active_model_provider` after vision routing.
-/// This function surgically swaps the `NATIVE_TOOLS_TASK_FRAMING` /
-/// `NO_TOOLS_TASK_FRAMING` anchor so the prompt's tool-availability claim
-/// matches the actual `request_tools` for this iteration.
-///
-/// When neither anchor is present (custom `system_prompt_prefix`), the
-/// function is a no-op — same as the pre-existing behavior.
 fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
     if let Some(first) = history.first_mut()
         && (first.content.contains(NATIVE_TOOLS_TASK_FRAMING)
@@ -2240,12 +2260,14 @@ mod sop_step_reassembly_tests {
             SopConfig::default(),
         )));
 
-        let reader = assemble_owned_execution(&config, "reader", Arc::clone(&engine), None)
-            .await
-            .expect("reader assembles");
-        let writer = assemble_owned_execution(&config, "writer", Arc::clone(&engine), None)
-            .await
-            .expect("writer assembles");
+        let reader =
+            assemble_owned_execution(&config, "reader", Arc::clone(&engine), None, None, None)
+                .await
+                .expect("reader assembles");
+        let writer =
+            assemble_owned_execution(&config, "writer", Arc::clone(&engine), None, None, None)
+                .await
+                .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
 
@@ -2262,6 +2284,208 @@ mod sop_step_reassembly_tests {
         // The gate re-assembles when a step names the other agent, so a
         // cross-agent step lands in the named agent's scope, not the baseline's.
         assert!(step_needs_reassembly(Some("reader"), Some("writer")));
+    }
+
+    #[tokio::test]
+    async fn cross_agent_step_isolates_history_and_uses_child_runtime_and_attribution() {
+        use axum::{Json, Router, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_api::observability_traits::{ObserverEvent, ObserverMetric};
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        #[derive(Default)]
+        struct CapturingObserver(std::sync::Mutex<Vec<ObserverEvent>>);
+        impl crate::observability::Observer for CapturingObserver {
+            fn record_event(&self, event: &ObserverEvent) {
+                self.0.lock().expect("observer lock").push(event.clone());
+            }
+            fn record_metric(&self, _metric: &ObserverMetric) {}
+            fn name(&self) -> &str {
+                "sop-child-capture"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured_for_route = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_for_route);
+                async move {
+                    captured.lock().expect("request lock").push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "child completed"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("mock address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve mock");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "child")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".into());
+        provider.model = Some("child-model".into());
+        provider.uri = Some(format!("http://{addr}"));
+        config
+            .risk_profiles
+            .insert("child-risk".into(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "child-runtime".into(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 2,
+                strict_tool_parsing: true,
+                parallel_tools: Some(true),
+                max_tool_result_chars: Some(777),
+                max_context_tokens: Some(1_234),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "child".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.child".into(),
+                risk_profile: "child-risk".into(),
+                runtime_profile: "child-runtime".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::None,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let (engine, run_id, action) = start_single_cross_agent_step("child");
+        let approval = crate::approval::ApprovalManager::for_non_interactive_backchannel(
+            config.risk_profiles.get("child-risk").expect("child risk"),
+        );
+        let observer = CapturingObserver::default();
+        let parent_provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let queued = crate::sop::executor::QueuedSopAction {
+            engine: Arc::clone(&engine),
+            audit: None,
+            action,
+        };
+        let mut parent_history = vec![
+            ChatMessage::system("parent-only system"),
+            ChatMessage::user("PARENT_PRIVATE_TRANSCRIPT"),
+        ];
+
+        drive_live_sop_actions(
+            vec![queued],
+            &mut parent_history,
+            &parent_provider,
+            "parent-provider",
+            "parent-model",
+            None,
+            &parent_tools,
+            &observer,
+            true,
+            Some(&approval),
+            &config.multimodal,
+            9,
+            None,
+            &["parent-only-exclusion".into()],
+            &["parent-only-dedup".into()],
+            None,
+            None,
+            &config.pacing,
+            false,
+            false,
+            99_999,
+            99_999,
+            None,
+            &LoopKnobs::default(),
+            "test",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("parent"),
+            "root-turn",
+            Some(SopStepReassembly {
+                config: &config,
+                baseline_alias: Some("parent"),
+            }),
+        )
+        .await
+        .expect("cross-agent drive");
+
+        {
+            let bodies = captured.lock().expect("request lock");
+            assert_eq!(bodies.len(), 1, "child provider receives one request");
+            let body = bodies[0].to_string();
+            assert!(!body.contains("PARENT_PRIVATE_TRANSCRIPT"), "{body}");
+            assert!(!body.contains("parent-only system"), "{body}");
+            assert!(
+                body.contains("child-model") || body.contains("delegate"),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            parent_history
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["parent-only system", "PARENT_PRIVATE_TRANSCRIPT"],
+            "the isolated child transcript must not mutate parent history"
+        );
+
+        {
+            let events = observer.0.lock().expect("observer lock");
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ObserverEvent::LlmRequest { agent_alias: Some(alias), turn_id: Some(turn), .. }
+                    if alias == "child"
+                        && turn.starts_with(&format!("root-turn:sop:{run_id}:step:"))
+            )));
+        }
+
+        let assembled = assemble_owned_execution(
+            &config,
+            "child",
+            Arc::clone(&engine),
+            None,
+            Some(&approval),
+            None,
+        )
+        .await
+        .expect("child execution assembles");
+        assert_eq!(assembled.runtime.max_tool_iterations, 2);
+        assert!(assembled.runtime.strict_tool_parsing);
+        assert!(assembled.runtime.parallel_tools);
+        assert_eq!(assembled.runtime.max_tool_result_chars, 777);
+        assert_eq!(assembled.runtime.effective_context_budget(), 1_234);
+        assert!(
+            assembled.approval.needs_approval("shell"),
+            "the originator's approval backchannel must survive child-policy rebinding"
+        );
+
+        server.abort();
     }
 
     // ── Defect 2: no-handle cross-agent step fails closed ────────────────────
@@ -2423,6 +2647,8 @@ mod sop_step_reassembly_tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::default(),
+            max_pending_approvals: 0,
             agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(SopConfig::default());
@@ -2505,6 +2731,7 @@ mod sop_step_reassembly_tests {
             None,
             None,
             agent_alias,
+            "parent-turn",
             sop_reassembly,
         )
         .await
@@ -2593,6 +2820,8 @@ mod sop_step_reassembly_tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::default(),
+            max_pending_approvals: 0,
             agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(SopConfig::default());
@@ -2672,6 +2901,7 @@ mod sop_step_reassembly_tests {
             // The bounded-delegate loop runs AS "delegate"; the step names a
             // different agent, and this path carries NO re-assembly handle.
             Some("delegate"),
+            "parent-turn",
             None,
         )
         .await
