@@ -91,7 +91,7 @@ escalation_route = "oncall"
 `[sop.approval.groups.*]` members are approval identities, not account names.
 Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
 `agent:<alias>`) to grant approval rights on one transport only, or bare
-(`alice`) to grant any source carrying that identity. HTTP and WebSocket
+(`ZeroClawOperator`) to grant any source carrying that identity. HTTP and WebSocket
 approval surfaces use the paired-token subject; the current CLI approval path
 (`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
 membership yet.
