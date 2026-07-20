@@ -88,8 +88,13 @@ pub fn resolve_gate(
     //     It also guarantees the run holds its claim before ANY transition out of
     //     WaitingApproval - including the `Pending` (route-ineligible) branch inside
     //     clear_waiting_gate - so a live non-terminal run is never claimless.
-    if matches!(decision, ApprovalDecision::Approve) {
-        engine.reacquire_claim_on_resume(run_id)?;
+    if matches!(decision, ApprovalDecision::Approve)
+        && let Err(e) = engine.reacquire_claim_on_resume(run_id)
+    {
+        if crate::sop::engine::err_is_resume_at_capacity(&e) {
+            return Ok(ResolveOutcome::DeferredAtCapacity);
+        }
+        return Err(e);
     }
 
     // 3. Audit FIRST, fail-closed. Durably append the immutable ledger row
@@ -222,6 +227,16 @@ mod tests {
             sop_name: &str,
         ) -> Result<ClaimToken, StoreError> {
             self.inner.renew_claim_for_restore(run_id, sop_name)
+        }
+        fn mark_claim_retained_after_terminal_rollback(
+            &self,
+            run_id: &str,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .mark_claim_retained_after_terminal_rollback(run_id)
+        }
+        fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError> {
+            self.inner.has_retained_terminal_rollback_claim(run_id)
         }
         fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
             self.inner.claim_counts(sop_name)
@@ -367,6 +382,40 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(again, ResolveOutcome::AlreadyResolved));
+    }
+
+    #[test]
+    fn approval_at_capacity_stays_waiting_without_a_ledger_row() {
+        let mut engine = engine_with(ApprovalMode::Both);
+        let first = start_waiting(&mut engine);
+        let second = start_waiting(&mut engine);
+        resolve_gate(
+            &mut engine,
+            &first,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+        )
+        .unwrap();
+
+        let outcome = resolve_gate(
+            &mut engine,
+            &second,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(Some("ZeroClawMaintainer".into())),
+        )
+        .unwrap();
+        assert!(matches!(outcome, ResolveOutcome::DeferredAtCapacity));
+        assert_eq!(
+            engine.get_run(&second).unwrap().status,
+            crate::sop::types::SopRunStatus::WaitingApproval
+        );
+        assert!(
+            !engine
+                .run_events(&second)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "gate_resolved")
+        );
     }
 
     #[test]

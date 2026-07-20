@@ -780,6 +780,18 @@ mod tests {
         ) -> Result<crate::sop::store::ClaimToken, crate::sop::store::StoreError> {
             self.inner.renew_claim_for_restore(id, s)
         }
+        fn mark_claim_retained_after_terminal_rollback(
+            &self,
+            id: &str,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.mark_claim_retained_after_terminal_rollback(id)
+        }
+        fn has_retained_terminal_rollback_claim(
+            &self,
+            id: &str,
+        ) -> Result<bool, crate::sop::store::StoreError> {
+            self.inner.has_retained_terminal_rollback_claim(id)
+        }
         fn claim_counts(&self, s: &str) -> Result<(usize, usize), crate::sop::store::StoreError> {
             self.inner.claim_counts(s)
         }
@@ -907,6 +919,18 @@ mod tests {
             s: &str,
         ) -> Result<crate::sop::store::ClaimToken, crate::sop::store::StoreError> {
             self.inner.renew_claim_for_restore(id, s)
+        }
+        fn mark_claim_retained_after_terminal_rollback(
+            &self,
+            id: &str,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.mark_claim_retained_after_terminal_rollback(id)
+        }
+        fn has_retained_terminal_rollback_claim(
+            &self,
+            id: &str,
+        ) -> Result<bool, crate::sop::store::StoreError> {
+            self.inner.has_retained_terminal_rollback_claim(id)
         }
         fn claim_counts(&self, s: &str) -> Result<(usize, usize), crate::sop::store::StoreError> {
             self.inner.claim_counts(s)

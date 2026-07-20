@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::model::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SopEventRecord,
 };
-use super::{SopRunStore, StoreError};
+use super::{RETAINED_TERMINAL_ROLLBACK_HOLDER, SopRunStore, StoreError};
 
 /// Default claim lease. The concurrency tick (EPIC A1) renews via `heartbeat_claim`;
 /// the reaper reclaims claims past this without a heartbeat.
@@ -362,6 +362,46 @@ impl SopRunStore for SqliteRunStore {
         )
         .map_err(sql_err)?;
         Ok(token)
+    }
+
+    fn mark_claim_retained_after_terminal_rollback(&self, run_id: &str) -> Result<(), StoreError> {
+        let g = self.lock()?;
+        let raw: Option<String> = g
+            .query_row(
+                "SELECT json FROM sop_claims WHERE run_id=?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let Some(raw) = raw else {
+            return Err(StoreError::ClaimLost);
+        };
+        let mut token: ClaimToken = serde_json::from_str(&raw)?;
+        token.holder = RETAINED_TERMINAL_ROLLBACK_HOLDER.to_string();
+        g.execute(
+            "UPDATE sop_claims SET json=?1 WHERE run_id=?2",
+            params![serde_json::to_string(&token)?, run_id],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError> {
+        let g = self.lock()?;
+        let raw: Option<String> = g
+            .query_row(
+                "SELECT json FROM sop_claims WHERE run_id=?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let Some(raw) = raw else {
+            return Ok(false);
+        };
+        let token: ClaimToken = serde_json::from_str(&raw)?;
+        Ok(token.holder == RETAINED_TERMINAL_ROLLBACK_HOLDER)
     }
 
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
@@ -792,6 +832,29 @@ mod tests {
         // Global cap = 3 is reached across all SOPs; a fourth distinct SOP
         // is refused even though its own per-SOP slot is free.
         assert!(s.try_claim_run("d1", "d", 1, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn retained_terminal_rollback_marker_roundtrips_in_claim_row() {
+        let store = SqliteRunStore::open_in_memory().unwrap();
+        store
+            .try_claim_run("r-retained", "deploy", 1, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !store
+                .has_retained_terminal_rollback_claim("r-retained")
+                .unwrap()
+        );
+        store
+            .mark_claim_retained_after_terminal_rollback("r-retained")
+            .unwrap();
+        assert!(
+            store
+                .has_retained_terminal_rollback_claim("r-retained")
+                .unwrap()
+        );
+        assert_eq!(store.claim_counts("deploy").unwrap(), (1, 1));
     }
 
     #[test]

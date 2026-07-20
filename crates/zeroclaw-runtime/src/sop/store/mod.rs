@@ -55,6 +55,8 @@ pub trait SopRunStore: Send + Sync {
         run_id: &str,
         sop_name: &str,
     ) -> Result<ClaimToken, StoreError>;
+    fn mark_claim_retained_after_terminal_rollback(&self, run_id: &str) -> Result<(), StoreError>;
+    fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError>;
     /// Live claim counts as `(for_sop, total)`, used by read-only admission
     /// checks so status surfaces observe the same concurrency source as CAS.
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError>;
@@ -86,6 +88,8 @@ pub trait SopRunStore: Send + Sync {
     /// Backend name (for logs + the "never a silent no-op" guard).
     fn backend(&self) -> &'static str;
 }
+
+pub(crate) const RETAINED_TERMINAL_ROLLBACK_HOLDER: &str = "engine:terminal-rollback-retained";
 
 /// Errors a store may surface. Never swallowed by callers.
 #[derive(Debug)]
@@ -370,6 +374,21 @@ impl SopRunStore for InMemoryRunStore {
         };
         g.claims.insert(run_id.to_string(), token.clone());
         Ok(token)
+    }
+
+    fn mark_claim_retained_after_terminal_rollback(&self, run_id: &str) -> Result<(), StoreError> {
+        let mut g = self.lock()?;
+        let claim = g.claims.get_mut(run_id).ok_or(StoreError::ClaimLost)?;
+        claim.holder = RETAINED_TERMINAL_ROLLBACK_HOLDER.to_string();
+        Ok(())
+    }
+
+    fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .lock()?
+            .claims
+            .get(run_id)
+            .is_some_and(|claim| claim.holder == RETAINED_TERMINAL_ROLLBACK_HOLDER))
     }
 
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
