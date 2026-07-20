@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::sop::types::SopRunStatus;
 use zeroclaw_config::schema::{SopConfig, SopRunStoreBackend};
 
 pub use model::{
@@ -23,28 +22,6 @@ pub trait SopRunStore: Send + Sync {
     /// byte-identical idempotent retry, else `RevisionConflict`; a newer
     /// revision wins.
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError>;
-    /// Persist a parked approval/checkpoint run only if this SOP still has room
-    /// in its pending pool. Returns `Ok(false)` without saving when the pool is
-    /// full. Store implementations should make the count and save one atomic
-    /// critical section; the default preserves compatibility for test wrappers.
-    fn save_run_with_pending_capacity(
-        &self,
-        run: &PersistedRun,
-        max_pending: usize,
-    ) -> Result<bool, StoreError> {
-        if max_pending > 0 {
-            let pending = self
-                .load_active_runs()?
-                .into_iter()
-                .filter(|existing| pending_capacity_member(existing, run))
-                .count();
-            if pending >= max_pending {
-                return Ok(false);
-            }
-        }
-        self.save_run(run)?;
-        Ok(true)
-    }
     /// Persist an active run transition and append its audit event as one store
     /// outcome. Implementations must make both writes visible together or neither
     /// visible at all; callers use this for approval gate resolution so a durable
@@ -96,17 +73,8 @@ pub trait SopRunStore: Send + Sync {
         run_id: &str,
         sop_name: &str,
     ) -> Result<ClaimToken, StoreError>;
-    /// Mark an existing live claim as intentionally retained while a failed
-    /// terminal checkpoint decision is retried. No-op if the claim is already
-    /// gone; the caller is already failing closed on the original transition.
-    fn mark_claim_retained_after_terminal_rollback(&self, _run_id: &str) -> Result<(), StoreError> {
-        Ok(())
-    }
-    /// Whether the live claim for `run_id` is an intentional terminal-rollback
-    /// retention marker rather than a stale parked claim from old behavior.
-    fn has_retained_terminal_rollback_claim(&self, _run_id: &str) -> Result<bool, StoreError> {
-        Ok(false)
-    }
+    fn mark_claim_retained_after_terminal_rollback(&self, run_id: &str) -> Result<(), StoreError>;
+    fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError>;
     /// Live claim counts as `(for_sop, total)`, used by read-only admission
     /// checks so status surfaces observe the same concurrency source as CAS.
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError>;
@@ -140,15 +108,6 @@ pub trait SopRunStore: Send + Sync {
 }
 
 pub(crate) const RETAINED_TERMINAL_ROLLBACK_HOLDER: &str = "engine:terminal-rollback-retained";
-
-pub(super) fn pending_capacity_member(existing: &PersistedRun, incoming: &PersistedRun) -> bool {
-    existing.run_id() != incoming.run_id()
-        && existing.run.sop_name == incoming.run.sop_name
-        && matches!(
-            existing.run.status,
-            SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
-        )
-}
 
 /// Errors a store may surface. Never swallowed by callers.
 #[derive(Debug)]
@@ -335,28 +294,6 @@ impl SopRunStore for InMemoryRunStore {
         Ok(())
     }
 
-    fn save_run_with_pending_capacity(
-        &self,
-        run: &PersistedRun,
-        max_pending: usize,
-    ) -> Result<bool, StoreError> {
-        let mut g = self.lock()?;
-        if max_pending > 0 {
-            let pending = g
-                .runs
-                .values()
-                .filter(|existing| !g.terminal.contains(existing.run_id()))
-                .filter(|existing| pending_capacity_member(existing, run))
-                .count();
-            if pending >= max_pending {
-                return Ok(false);
-            }
-        }
-        revision_guard(g.runs.get(run.run_id()), run)?;
-        g.runs.insert(run.run_id().to_string(), run.clone());
-        Ok(true)
-    }
-
     fn save_run_with_event(
         &self,
         run: &PersistedRun,
@@ -493,15 +430,15 @@ impl SopRunStore for InMemoryRunStore {
 
     fn mark_claim_retained_after_terminal_rollback(&self, run_id: &str) -> Result<(), StoreError> {
         let mut g = self.lock()?;
-        if let Some(claim) = g.claims.get_mut(run_id) {
-            claim.holder = RETAINED_TERMINAL_ROLLBACK_HOLDER.to_string();
-        }
+        let claim = g.claims.get_mut(run_id).ok_or(StoreError::ClaimLost)?;
+        claim.holder = RETAINED_TERMINAL_ROLLBACK_HOLDER.to_string();
         Ok(())
     }
 
     fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError> {
-        let g = self.lock()?;
-        Ok(g.claims
+        Ok(self
+            .lock()?
+            .claims
             .get(run_id)
             .is_some_and(|claim| claim.holder == RETAINED_TERMINAL_ROLLBACK_HOLDER))
     }
