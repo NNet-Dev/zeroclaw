@@ -229,8 +229,23 @@ mod tests {
         fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
             self.inner.save_run(run)
         }
+        fn save_run_with_event(
+            &self,
+            _run: &PersistedRun,
+            _event: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected append failure".into()))
+        }
         fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(run_id, terminal)
+        }
+        fn finish_run_with_event(
+            &self,
+            _run_id: &str,
+            _terminal: &PersistedRun,
+            _event: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected append failure".into()))
         }
         fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
             self.inner.load_active_runs()
