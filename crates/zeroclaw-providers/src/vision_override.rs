@@ -41,6 +41,12 @@ impl ModelProvider for VisionOverrideProvider {
         capabilities
     }
 
+    fn capabilities_for_model(&self, model: &str) -> super::traits::ProviderCapabilities {
+        let mut capabilities = self.inner.capabilities_for_model(model);
+        capabilities.vision = self.supports_vision;
+        capabilities
+    }
+
     fn default_temperature(&self) -> f64 {
         self.inner.default_temperature()
     }

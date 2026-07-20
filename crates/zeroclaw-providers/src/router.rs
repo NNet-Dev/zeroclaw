@@ -35,14 +35,6 @@ pub struct Route {
     pub model: String,
 }
 
-/// Multi-model router — routes requests to different model_provider+model combos
-/// based on a task hint encoded in the model parameter.
-///
-/// The model parameter can be:
-/// - A regular model name (e.g. "anthropic/claude-sonnet-4") → uses default model_provider
-/// - A hint-prefixed string (e.g. "hint:reasoning") → resolves via route table
-///
-/// This wraps multiple pre-created model_providers and selects the right one per request.
 pub struct RouterModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
@@ -54,7 +46,6 @@ pub struct RouterModelProvider {
 
 impl RouterModelProvider {
     /// Create a new router with a default model_provider and optional routes.
-    ///
     /// `model_providers` is a list of (name, model_provider) pairs. The first one is the default.
     /// `routes` maps hint names to Route structs containing provider_name and model.
     pub fn new(
@@ -93,14 +84,6 @@ impl RouterModelProvider {
             default_model,
         }
     }
-    /// Resolve a model parameter to the cheapest qualifying route based on pricing.
-    ///
-    /// If the model starts with `"hint:cost-optimized"` or `"hint:cheapest"`, this
-    /// method scores each route by `input_price + output_price` (a simple proxy for
-    /// total cost), optionally filtering by capability requirements, and returns the
-    /// cheapest qualifying route.
-    ///
-    /// Falls back to the default route when no pricing data matches.
     pub fn resolve_cost_optimized(
         &self,
         model: &str,
@@ -156,11 +139,6 @@ impl RouterModelProvider {
         (self.default_index, self.default_model.clone())
     }
 
-    /// Resolve a model parameter to a (model_provider, actual_model) pair.
-    ///
-    /// If the model starts with "hint:", look up the hint in the route table.
-    /// Otherwise, use the default model_provider with the given model name.
-    /// Resolve a model parameter to a (provider_index, actual_model) pair.
     fn resolve(&self, model: &str) -> (usize, String) {
         if let Some(hint) = model.strip_prefix("hint:") {
             if let Some((idx, resolved_model)) = self.routes.get(hint) {
@@ -180,13 +158,6 @@ impl RouterModelProvider {
     }
 }
 
-/// A cost-optimized routing strategy that selects the cheapest qualifying
-/// model_provider from the route table based on per-provider pricing maps.
-///
-/// Pricing is keyed by model_provider name (the alias under
-/// `[providers.models.<model_provider>.<alias>]`); each model_provider's pricing map
-/// holds user-defined keys (model identifiers, optionally suffixed with
-/// `.input` / `.output`) mapped to USD-per-1M-token rates.
 #[derive(Debug, Clone)]
 pub struct CostOptimizedStrategy {
     /// Per-provider pricing data (model_provider name → user-keyed pricing map).
@@ -366,6 +337,14 @@ impl ModelProvider for RouterModelProvider {
         self.model_providers
             .get(self.default_index)
             .map(|(_, p)| p.capabilities())
+            .unwrap_or_default()
+    }
+
+    fn capabilities_for_model(&self, model: &str) -> crate::traits::ProviderCapabilities {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .map(|(_, provider)| provider.capabilities_for_model(&resolved_model))
             .unwrap_or_default()
     }
 
@@ -1361,7 +1340,7 @@ mod tests {
         assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
     }
 
-    // Regression for #6589: supports_vision() must reflect the default provider,
+    // supports_vision() must reflect the default provider,
     // not .any() across all sub-providers. Otherwise the multimodal.vision_provider
     // fallback in run_tool_call_loop and the image-marker stripping in the context
     // compressor are silently bypassed in mixed-provider configurations.
@@ -1411,6 +1390,52 @@ mod tests {
         );
 
         assert!(router.supports_vision());
+    }
+
+    #[tokio::test]
+    async fn model_capability_matches_the_route_that_receives_dispatch() {
+        let default = Arc::new(MockModelProvider::new("default").with_vision(true));
+        let text_route = Arc::new(MockModelProvider::new("text").with_vision(false));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(Arc::clone(&default)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text".into(),
+                    Box::new(Arc::clone(&text_route)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "text".into(),
+                Route {
+                    provider_name: "text".into(),
+                    model: "text-model".into(),
+                },
+            )],
+            "vision-model".into(),
+        );
+
+        assert!(
+            router.capabilities_for_model("vision-model").vision,
+            "an unhinted request dispatches to the vision-capable default"
+        );
+        assert!(
+            !router.capabilities_for_model("hint:text").vision,
+            "the hinted request must report the selected text route"
+        );
+        assert_eq!(
+            router
+                .chat_with_system(None, "hello", "hint:text", None)
+                .await
+                .expect("text route succeeds"),
+            "text"
+        );
+        assert_eq!(default.call_count(), 0);
+        assert_eq!(text_route.call_count(), 1);
+        assert_eq!(text_route.last_model(), "text-model");
     }
 
     #[test]

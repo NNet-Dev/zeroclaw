@@ -67,6 +67,33 @@ When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama
 
 The `__` is the path separator; the example above sets `providers.models.ollama.home.uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
 
+## Per-model vision capability
+
+Use `vision` when a provider family can serve both multimodal and text-only
+models. The value belongs to the provider alias, so routing and fallback paths
+resolve it together with that alias's endpoint, credentials, and model:
+
+```toml
+[providers.models.openai.vision]
+model = "gpt-4o"
+wire_api = "responses"
+vision = true
+
+[providers.models.llamacpp.text]
+model = "qwen3-4b"
+vision = false
+```
+
+Leaving `vision` unset preserves the provider family's built-in default. For
+OpenAI Responses aliases, set `vision = true` for models that accept image
+input; this opt-in keeps text-only Responses models from receiving image
+payloads accidentally.
+
+When `[multimodal] vision_model_provider` names a dotted provider alias, its
+`model` is used automatically. An explicit `[multimodal] vision_model` takes
+precedence over the alias model; if neither is set, the primary turn model is
+used for backward compatibility.
+
 ## Per-family knobs: worked examples
 
 ### Ollama
