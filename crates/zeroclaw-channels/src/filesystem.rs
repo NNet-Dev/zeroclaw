@@ -164,6 +164,7 @@ impl FilesystemChannel {
                 SopTriggerSource::Filesystem,
                 Some(&path_str),
                 Some(&payload.to_string()),
+                None,
             )
             .await;
         }
