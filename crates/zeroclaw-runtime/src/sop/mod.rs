@@ -98,6 +98,7 @@ pub fn build_sop_engine(
     config: SopConfig,
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
+    route_adapter: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
@@ -115,10 +116,19 @@ pub fn build_sop_engine(
         Arc::new(store::InMemoryRunStore::new())
     });
     let (run_tx, _run_rx) = tokio::sync::broadcast::channel(256);
+    // EPIC G: the approval broker (membership + quorum) resolves policies/groups
+    // from the engine's live `[sop.approval]` at use-time. The route adapter
+    // delivers approval request/escalation notices to a channel; the daemon injects
+    // a real channel-delivering adapter, while CLI/standalone callers pass `None`
+    // and fall back to the no-op (log-only) adapter - unchanged behavior there.
+    let route: Arc<dyn approval::ApprovalRouteAdapter> =
+        route_adapter.unwrap_or_else(|| Arc::new(approval::NoopRouteAdapter));
+    let approval_broker = Arc::new(approval::ApprovalBroker::with_route(route));
     let mut engine = SopEngine::new(config)
         .with_store(store)
         .with_metrics(SopMetricsCollector::shared())
-        .with_run_notifier(run_tx);
+        .with_run_notifier(run_tx)
+        .with_approval_broker(approval_broker);
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -147,11 +157,16 @@ fn sops_dir(workspace_dir: &Path) -> PathBuf {
 }
 
 /// Resolve the SOPs directory from config, falling back to workspace default.
+///
+/// A relative `config_dir` (the common case in the documented
+/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
+/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
+/// the base entirely when the joined path is itself absolute).
 pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
         Some(dir) if !dir.is_empty() => {
             let expanded = shellexpand::tilde(dir);
-            PathBuf::from(expanded.as_ref())
+            workspace_dir.join(expanded.as_ref())
         }
         _ => sops_dir(workspace_dir),
     }
@@ -566,6 +581,13 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
                     current.calls.push(call);
                 }
+            } else if let Some(val) = bullet.strip_prefix("policy:") {
+                let val = val.trim();
+                current.policy = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {
@@ -608,6 +630,7 @@ struct StepParseState {
     mode: Option<SopExecutionMode>,
     calls: Vec<PlannedToolCall>,
     agent: Option<String>,
+    policy: Option<String>,
 }
 
 impl StepParseState {
@@ -639,6 +662,7 @@ impl StepParseState {
             calls: std::mem::take(&mut self.calls),
             pos: None,
             agent: self.agent.take(),
+            policy: self.policy.take(),
         });
         *self = Self::default();
     }
@@ -1056,6 +1080,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn resolve_sops_dir_joins_relative_config_value_to_workspace() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        let resolved = resolve_sops_dir(workspace, Some("shared/sops"));
+        assert_eq!(resolved, workspace.join("shared/sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_keeps_absolute_config_value_as_is() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        let resolved = resolve_sops_dir(workspace, Some("/srv/shared/sops"));
+        assert_eq!(resolved, Path::new("/srv/shared/sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_falls_back_to_workspace_sops_when_unset() {
+        let workspace = Path::new("/home/user/.zoder/data");
+        assert_eq!(resolve_sops_dir(workspace, None), workspace.join("sops"));
+        assert_eq!(
+            resolve_sops_dir(workspace, Some("")),
+            workspace.join("sops")
+        );
+    }
 
     fn authoring_sop(steps: Vec<SopStep>) -> Sop {
         Sop {
@@ -1519,6 +1567,23 @@ mod tests {
         assert_eq!(
             sop.steps[2].calls[0].args,
             json!({"command": "{{steps.1.out}} then {{steps.2.ok}}"})
+        );
+    }
+
+    #[test]
+    fn parse_steps_reads_policy_bullet() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Gate** - Requires the release group.
+   - policy: prod
+2. **Go** - Unpoliced.
+"#,
+        );
+        assert_eq!(steps[0].policy.as_deref(), Some("prod"));
+        assert_eq!(
+            steps[1].policy, None,
+            "a step with no policy bullet stays None"
         );
     }
 
