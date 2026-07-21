@@ -143,6 +143,12 @@ impl AmqpChannel {
         &self,
         routing_key: &str,
         data: &[u8],
+        // The delivery's AMQP `message_id` (replayed unchanged on a redelivery), used as
+        // the per-message SOP idempotency key. `None` when the publisher set none.
+        message_id: Option<&str>,
+        // The broker's `redelivered` flag: only a confirmed redelivery coalesces, so a
+        // FRESH delivery reusing a message-id is never coalesced/ACKed away.
+        redelivered: bool,
         tx: &mpsc::Sender<ChannelMessage>,
     ) -> DeliveryOutcome {
         let routes_sop = matches!(
@@ -183,12 +189,30 @@ impl AmqpChannel {
         }
 
         if routes_sop && let (Some(engine), Some(audit)) = (&self.engine, &self.audit) {
+            // A2 per-message idempotency: key on the delivery's `message_id` - the only
+            // cross-redelivery-stable identity the broker exposes - SCOPED to this channel
+            // alias (so two aliases reusing an id do not collide). Only a CONFIRMED
+            // redelivery (`redelivered`) coalesces (a redelivery of the same message, e.g.
+            // one requeued because a sibling SOP deferred); a FRESH delivery always
+            // dispatches, and a fresh reuse of a live key marks it ambiguous downstream. A
+            // delivery with NO / a BLANK message-id is not deduplicated at all (we never
+            // ACK a message away on a guess).
+            //
+            // Best-effort under the AMQP unique-`message_id` contract: publishers MUST set
+            // a unique, stable `message_id` per logical message for exactly-once. Under id
+            // REUSE (a contract violation) a redelivery of a reused id can still coalesce a
+            // distinct trigger - an accepted, documented at-most-once edge. See the full
+            // contract on `SopEngine::dispatch_dedup` (sop/engine.rs).
+            let dedup = message_id
+                .filter(|id| !id.is_empty())
+                .map(|id| (format!("amqp:{}:{id}", self.alias), redelivered));
             let results = dispatch_untrusted_fan_in(
                 engine,
                 audit,
                 SopTriggerSource::Amqp,
                 Some(routing_key),
                 Some(&String::from_utf8_lossy(data)),
+                dedup,
             )
             .await;
             if results_need_redelivery(&results) {
@@ -410,6 +434,13 @@ impl Channel for AmqpChannel {
         Ok(())
     }
 
+    fn supports_outbound_send(&self) -> bool {
+        // `send` above is a deliberate no-op: AMQP is inbound-only here. A surface
+        // that must actually deliver (e.g. the SOP approval route adapter) must not
+        // route to it and mistake the no-op `Ok` for a successful send.
+        false
+    }
+
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let (_conn, mut consumer) = self.establish_consumer().await?;
 
@@ -422,7 +453,22 @@ impl Channel for AmqpChannel {
             };
 
             let routing_key = delivery.routing_key.as_str().to_string();
-            match self.route_delivery(&routing_key, &delivery.data, &tx).await {
+            let message_id = delivery
+                .properties
+                .message_id()
+                .as_ref()
+                .map(|id| id.to_string());
+            let redelivered = delivery.redelivered;
+            match self
+                .route_delivery(
+                    &routing_key,
+                    &delivery.data,
+                    message_id.as_deref(),
+                    redelivered,
+                    &tx,
+                )
+                .await
+            {
                 DeliveryOutcome::Processed => {
                     if self.durable_ack {
                         delivery.acker.ack(BasicAckOptions::default()).await?;
@@ -753,7 +799,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         drop(rx);
 
         let outcome = ch
-            .route_delivery("anitya.update", br#"{"name":"curl"}"#, &tx)
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, None, false, &tx)
             .await;
 
         assert_eq!(
@@ -778,7 +824,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
 
         let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
         let outcome = ch
-            .route_delivery("anitya.update", br#"{"name":"curl"}"#, &tx)
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, None, false, &tx)
             .await;
 
         assert_eq!(outcome, DeliveryOutcome::Processed);
@@ -803,7 +849,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         // report Deferred so the listener nacks/requeues it, rather than acking the
         // trigger away under durable_ack.
         let outcome = ch
-            .route_delivery("anitya.update", br#"{"name":"curl"}"#, &tx)
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, None, false, &tx)
             .await;
         assert_eq!(
             outcome,
@@ -867,6 +913,161 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         (engine, audit)
     }
 
+    fn sop_handles_with_parallel_amqp_sop() -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+        use zeroclaw_runtime::sop::SopStepKind;
+        use zeroclaw_runtime::sop::types::{
+            Sop, SopAdmissionPolicy, SopExecutionMode, SopPriority, SopStep, SopTrigger,
+        };
+        let (engine, audit) = sop_handles();
+        {
+            let mut eng = engine.lock().unwrap();
+            eng.set_sops_for_test(vec![Sop {
+                name: "amqp-sop".into(),
+                description: "test".into(),
+                version: "1.0.0".into(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Auto,
+                triggers: vec![SopTrigger::Amqp {
+                    routing_key: "anitya.update".into(),
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 8,
+                location: None,
+                deterministic: false,
+                admission_policy: SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: None,
+            }]);
+        }
+        (engine, audit)
+    }
+
+    #[tokio::test]
+    async fn route_delivery_coalesces_only_a_redelivery_of_the_same_message_id() {
+        // Only a CONFIRMED redelivery (`redelivered = true`) of the same message-id
+        // coalesces; a distinct message-id starts its own run. `amqp-sop` is Parallel with
+        // ample concurrency, so without the dedup the redelivery would start a second run.
+        let (engine, audit) = sop_handles_with_parallel_amqp_sop();
+        let ch = try_channel_with(
+            "{name}",
+            "name",
+            SopDispatch::Sop,
+            Some(engine.clone()),
+            Some(audit),
+        )
+        .expect("sop channel constructs");
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(4);
+        let body = br#"{"name":"curl"}"#;
+
+        // Fresh m1 starts a run.
+        assert_eq!(
+            ch.route_delivery("anitya.update", body, Some("m1"), false, &tx)
+                .await,
+            DeliveryOutcome::Processed
+        );
+        // A REDELIVERY of m1 coalesces (no second run).
+        assert_eq!(
+            ch.route_delivery("anitya.update", body, Some("m1"), true, &tx)
+                .await,
+            DeliveryOutcome::Processed
+        );
+        assert_eq!(
+            engine.lock().unwrap().active_runs().len(),
+            1,
+            "a redelivery of the same message-id must not start a second run"
+        );
+        // A distinct message-id starts its own run.
+        assert_eq!(
+            ch.route_delivery("anitya.update", body, Some("m2"), false, &tx)
+                .await,
+            DeliveryOutcome::Processed
+        );
+        assert_eq!(
+            engine.lock().unwrap().active_runs().len(),
+            2,
+            "a distinct message-id must start its own run"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_delivery_fresh_deliveries_reusing_a_message_id_both_start() {
+        // The loss case a message-id-only dedup would reintroduce: TWO distinct FRESH
+        // deliveries that reuse the same message-id must BOTH start - never coalesce/ACK
+        // one away - because only a confirmed redelivery (not a fresh delivery) coalesces.
+        let (engine, audit) = sop_handles_with_parallel_amqp_sop();
+        let ch = try_channel_with(
+            "{name}",
+            "name",
+            SopDispatch::Sop,
+            Some(engine.clone()),
+            Some(audit),
+        )
+        .expect("sop channel constructs");
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(8);
+        let body = br#"{"name":"curl"}"#;
+
+        // Same id, both FRESH (redelivered = false) -> both start.
+        for _ in 0..2 {
+            assert_eq!(
+                ch.route_delivery("anitya.update", body, Some("reused"), false, &tx)
+                    .await,
+                DeliveryOutcome::Processed
+            );
+        }
+        assert_eq!(
+            engine.lock().unwrap().active_runs().len(),
+            2,
+            "distinct fresh deliveries reusing a message-id must both start, never coalesce"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_delivery_without_or_blank_message_id_does_not_dedup() {
+        // No message-id (`None`) and a BLANK message-id (`""`) both mean "no per-message
+        // identity": deliveries must NOT be coalesced (never ACK a distinct message away
+        // on a guess). Each starts its own run, even when flagged as a redelivery.
+        let (engine, audit) = sop_handles_with_parallel_amqp_sop();
+        let ch = try_channel_with(
+            "{name}",
+            "name",
+            SopDispatch::Sop,
+            Some(engine.clone()),
+            Some(audit),
+        )
+        .expect("sop channel constructs");
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(8);
+        let body = br#"{"name":"curl"}"#;
+
+        for (mid, redelivered) in [
+            (None, false),
+            (None, true),
+            (Some(""), false),
+            (Some(""), true),
+        ] {
+            assert_eq!(
+                ch.route_delivery("anitya.update", body, mid, redelivered, &tx)
+                    .await,
+                DeliveryOutcome::Processed
+            );
+        }
+        assert_eq!(
+            engine.lock().unwrap().active_runs().len(),
+            4,
+            "absent and blank message-ids must never coalesce distinct deliveries"
+        );
+    }
+
     #[tokio::test]
     async fn combined_mode_acks_sop_overflow_and_agent_gets_exactly_one_message() {
         // Blocker regression: in combined `sop_and_agent_loop` the agent loop already
@@ -885,7 +1086,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         let (tx, mut rx) = mpsc::channel::<ChannelMessage>(4);
 
         let outcome = ch
-            .route_delivery("anitya.update", br#"{"name":"curl"}"#, &tx)
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, None, false, &tx)
             .await;
         assert_eq!(
             outcome,

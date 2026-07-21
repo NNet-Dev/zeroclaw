@@ -74,6 +74,28 @@ max_pending_approvals = 8
 type = "manual"
 ```
 
+Approval broker groups and policies live in the main ZeroClaw config, not in
+per-SOP `SOP.toml` files. A step can reference a configured policy by name with
+`- policy: prod` in `SOP.md`:
+
+```toml
+[sop.approval.groups.release]
+members = ["http:<paired-token-subject>", "agent:release-bot"]
+
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+escalation_route = "oncall"
+```
+
+`[sop.approval.groups.*]` members are approval identities, not account names.
+Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
+`agent:<alias>`) to grant approval rights on one transport only, or bare
+(`alice`) to grant any source carrying that identity. HTTP and WebSocket
+approval surfaces use the paired-token subject; the current CLI approval path
+(`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
+membership yet.
+
 ## 3. `SOP.md` Step Format
 
 Steps are parsed from the `## Steps` section.
@@ -87,6 +109,7 @@ Steps are parsed from the `## Steps` section.
 2. **Deploy** — Run deployment command.
    - tools: shell
    - requires_confirmation: true
+   - policy: prod
    - input: {"type":"object","required":["version"],"properties":{"version":{"type":"string"}}}
    - output: {"type":"object","required":["digest"],"properties":{"digest":{"type":"string"}}}
    - next: 3
@@ -142,6 +165,35 @@ Parser behavior:
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
+- `- policy:` names an approval-broker policy (a key in `[sop.approval].policies`)
+  that gates this step's approval with required-group membership and quorum. Omit
+  it for an unpoliced gate. A step that names a policy absent from
+  `[sop.approval].policies` fails closed (the gate stays waiting) rather than
+  clearing on a single approval.
+
+### `[sop.approval]` policies and route delivery
+
+A policy may also route its approval out of band to a channel, so an approver can
+act without watching the surface that started the run:
+
+```toml
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+# Delivered when a run PARKS at a gate this policy governs.
+request_route = "discord.ops:123456789012345678"
+# Delivered only if that gate later TIMES OUT (a distinct second route).
+escalation_route = "discord.oncall:987654321098765432"
+```
+
+Both routes are `channel:recipient`: `channel` is a configured channel's map key
+(`<channel>.<alias>`, or bare `<channel>` for a singleton) and `recipient` is that
+channel's addressee (a Discord channel id, a chat id, ...). Delivery is best-effort
+and never blocks or clears the gate - the approval itself still comes back through
+the normal approve/deny surfaces (`zeroclaw sop approve|deny`, the gateway
+approve/deny route, or the `sop_approve` agent tool). Routes fire only in the daemon
+(where channels are configured); leave them unset (or empty) to notify only the
+originating surface, which is the default.
 
 ### Step Contract Enforcement
 
