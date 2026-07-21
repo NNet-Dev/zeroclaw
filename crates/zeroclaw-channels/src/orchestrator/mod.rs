@@ -9749,6 +9749,12 @@ async fn assemble_channel_agent_tools(
                         // is off, matching `run`/`process_message`.
                         list_deferred_mcp_specs: false,
                         emit_assembly_logs: true,
+                        // Channel tools are assembled once at daemon startup and
+                        // retain their registry-backed wrappers for the listener
+                        // lifetime, so there is no per-turn reconnect to avoid here.
+                        // The heartbeat worker remains the only caller that supplies
+                        // a pre-built registry for reuse across repeated assemblies.
+                        mcp_registry: None,
                     },
                 )
                 .await
