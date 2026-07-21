@@ -733,12 +733,29 @@ mod tests {
                 "injected save_run failure".into(),
             ))
         }
+        fn save_run_with_event(
+            &self,
+            _r: &crate::sop::store::PersistedRun,
+            _e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            Err(crate::sop::store::StoreError::Backend(
+                "injected save_run failure".into(),
+            ))
+        }
         fn finish_run(
             &self,
             id: &str,
             t: &crate::sop::store::PersistedRun,
         ) -> Result<(), crate::sop::store::StoreError> {
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &crate::sop::store::PersistedRun,
+            e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_active_runs(
             &self,
@@ -861,12 +878,27 @@ mod tests {
         ) -> Result<(), crate::sop::store::StoreError> {
             self.inner.save_run(r)
         }
+        fn save_run_with_event(
+            &self,
+            r: &crate::sop::store::PersistedRun,
+            e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            self.inner.save_run_with_event(r, e)
+        }
         fn finish_run(
             &self,
             id: &str,
             t: &crate::sop::store::PersistedRun,
         ) -> Result<(), crate::sop::store::StoreError> {
             self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &crate::sop::store::PersistedRun,
+            e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_terminal_runs(
             &self,
@@ -1035,8 +1067,12 @@ mod tests {
         e.set_sops_for_test(vec![policy_sop("prod")]);
         let action = e.start_run("deploy", manual()).unwrap();
         let id = match action {
-            SopRunAction::WaitApproval { run_id, .. } => run_id,
-            other => panic!("expected WaitApproval, got {other:?}"),
+            SopRunAction::Pending { run_id, reason, .. }
+                if reason.contains("park snapshot not yet durably persisted") =>
+            {
+                run_id
+            }
+            other => panic!("expected park-persist backpressure, got {other:?}"),
         };
         assert_eq!(
             store.claim_counts("deploy").unwrap(),

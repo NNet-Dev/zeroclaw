@@ -452,6 +452,18 @@ pub async fn handle_sop_decide(
                         )
                             .into_response();
                     }
+                    Ok(BrokerOutcome::Resolved(ResolveOutcome::DeferredAtCapacity)) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": format!(
+                                    "Run {run_id} is approved but execution slots are full; \
+                                     it stays waiting and resumes when a slot frees. Retry shortly."
+                                )
+                            })),
+                        )
+                            .into_response();
+                    }
                     Ok(BrokerOutcome::NotAuthorized { required_group }) => {
                         return (
                             StatusCode::FORBIDDEN,
@@ -498,10 +510,15 @@ pub async fn handle_sop_decide(
                     resumed_action = Some(action);
                 }
                 Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": e.to_string() })),
-                    )
+                    // A checkpoint resume refused at capacity is transient backpressure, not a
+                    // bad request: return 503 to match the approval resume path's
+                    // `DeferredAtCapacity`. A genuine error stays 400.
+                    let status = if zeroclaw_runtime::sop::err_is_resume_at_capacity(&e) {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    return (status, Json(serde_json::json!({ "error": e.to_string() })))
                         .into_response();
                 }
             },
