@@ -8602,7 +8602,7 @@ mod tests {
             .resolve_gate(
                 &run_id,
                 ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("alice".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             )
             .expect_err("active transition persistence failure must reject approval");
         assert!(err.to_string().contains("injected save_run failure"));
@@ -8667,7 +8667,7 @@ mod tests {
             .resolve_gate(
                 &run_id,
                 ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("alice".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             )
             .expect_err("terminal schema-reject commit failure must reject approval");
         assert!(err.to_string().contains("injected finish failure"));
@@ -8733,7 +8733,7 @@ mod tests {
             .resolve_gate(
                 &run_id,
                 ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("alice".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             )
             .expect_err("route-ineligible active commit failure must reject approval");
         assert!(err.to_string().contains("injected save_run failure"));
