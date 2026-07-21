@@ -44,6 +44,7 @@ import {
   approvalLevelCaveat,
   effectiveApprovalState,
   effectiveAuthState,
+  filterPermissionCatalogEntries,
   isApprovalOnlyWildcard,
   isAlwaysAskWildcardLocked,
   isMcpAutoAdmitted,
@@ -144,11 +145,23 @@ export default function ToolPermissionGrid({
   const autoApproveSet = useMemo(() => new Set(value.autoApprove), [value.autoApprove]);
   const alwaysAskSet = useMemo(() => new Set(value.alwaysAsk), [value.alwaysAsk]);
 
+  // The shared catalog includes executables discovered on PATH for callers
+  // such as SOP editors. Risk-profile permission arrays are evaluated against
+  // agent tool names, so keep those CLI-only entries out of this grid.
+  const permissionCatalog = useMemo(
+    () => filterPermissionCatalogEntries(catalog ?? []),
+    [catalog],
+  );
+  const permissionWarnings = useMemo(
+    () => warnings.filter((warning) => warning.source === 'agent'),
+    [warnings],
+  );
+
   const byName = useMemo(() => {
     const map = new Map<string, CatalogEntry>();
-    for (const e of catalog ?? []) map.set(e.name, e);
+    for (const e of permissionCatalog) map.set(e.name, e);
     return map;
-  }, [catalog]);
+  }, [permissionCatalog]);
 
   // Any name referenced by one of the four lists but missing from the
   // catalog (renamed/removed tool, or an agent-scoped picker viewing a
@@ -171,8 +184,12 @@ export default function ToolPermissionGrid({
   }, [byName, realAllowSet, value.excludedTools, value.autoApprove, value.alwaysAsk]);
 
   const catalogRows = useMemo(
-    (): Row[] => (catalog ?? []).map((e) => ({ name: e.name, description: e.description, group: e.group })),
-    [catalog],
+    (): Row[] => permissionCatalog.map((e) => ({
+      name: e.name,
+      description: e.description,
+      group: e.group,
+    })),
+    [permissionCatalog],
   );
 
   const filtered = useMemo(() => {
@@ -431,9 +448,9 @@ export default function ToolPermissionGrid({
         </div>
       )}
 
-      {warnings.length > 0 && (
+      {permissionWarnings.length > 0 && (
         <ToolCatalogWarningPanel
-          warnings={warnings}
+          warnings={permissionWarnings}
           onRetry={retryCatalogLoad}
           retryDisabled={loading}
         />

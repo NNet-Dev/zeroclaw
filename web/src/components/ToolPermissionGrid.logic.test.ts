@@ -9,6 +9,7 @@ import {
   approvalLevelCaveat,
   effectiveApprovalState,
   effectiveAuthState,
+  filterPermissionCatalogEntries,
   isApprovalOnlyWildcard,
   isMcpAutoAdmitted,
   normalizeAutonomyLevel,
@@ -24,6 +25,16 @@ function sets(value: ToolPermissionGridValue) {
     alwaysAskSet: new Set(value.alwaysAsk),
   };
 }
+
+test('permission catalog excludes discovered CLI executables', () => {
+  const entries = [
+    { name: 'shell', group: 'agent' as const },
+    { name: 'git', group: 'cli' as const },
+    { name: 'docker', group: 'cli' as const },
+  ];
+
+  assert.deepEqual(filterPermissionCatalogEntries(entries), [entries[0]]);
+});
 
 test('strict allowlists still auto-admit MCP names unless denied', () => {
   const value: ToolPermissionGridValue = {

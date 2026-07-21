@@ -18,6 +18,16 @@ export interface ToolPermissionGridValue {
   alwaysAsk: string[];
 }
 
+/** Risk-profile permission arrays contain agent-callable tool names. The
+ * shared picker catalog also contains executables discovered on PATH for SOP
+ * and shell-oriented pickers; those names are not tools in the runtime
+ * registry and must not be offered as authorization or approval entries. */
+export function filterPermissionCatalogEntries<
+  T extends { group: 'agent' | 'cli' },
+>(entries: readonly T[]): T[] {
+  return entries.filter((entry) => entry.group === 'agent');
+}
+
 export function realAllowedTools(allowedTools: string[]): string[] {
   return allowedTools.filter((name) => name !== NONE_SENTINEL);
 }
