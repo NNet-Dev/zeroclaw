@@ -1064,6 +1064,7 @@ mod tests {
 
     fn result(step: u32, status: SopStepStatus) -> SopStepResult {
         SopStepResult {
+            effective_agent: None,
             step_number: step,
             status,
             output: String::new(),

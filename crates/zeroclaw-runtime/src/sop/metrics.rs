@@ -723,6 +723,7 @@ mod tests {
 
     fn make_step(number: u32, status: SopStepStatus) -> SopStepResult {
         SopStepResult {
+            effective_agent: None,
             step_number: number,
             status,
             output: format!("Step {number}"),
