@@ -302,7 +302,15 @@ pub(crate) fn mcp_allowed_tool_count<'a>(
         .count()
 }
 
-pub(crate) fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
+/// Append a pre-rendered pinned-MCP-resources section onto the system-prompt
+/// MCP accumulator (`deferred_section`).
+///
+/// This MUST be called *after* the `deferred_loading` branch, which reassigns
+/// `deferred_section` with `=` (via `build_deferred_tools_section_filtered`)
+/// and would otherwise clobber any earlier-pushed pinned content. Centralizing
+/// the append keeps both `run()` and `process_message()` consistent and pins
+/// the ordering invariant in one testable place. No-op for an empty section.
+pub fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
     if pinned_section.is_empty() {
         return;
     }
@@ -763,6 +771,7 @@ pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_pa
 /// alias (tests, benches).
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
+    config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
@@ -790,6 +799,7 @@ pub async fn agent_turn(
     agent_alias: Option<&str>,
 ) -> Result<String> {
     agent_turn_with_sop_reassembly(
+        config,
         model_provider,
         history,
         tools_registry,
@@ -822,6 +832,7 @@ pub async fn agent_turn(
 
 #[allow(clippy::too_many_arguments)]
 async fn agent_turn_with_sop_reassembly(
+    config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
@@ -888,6 +899,7 @@ async fn agent_turn_with_sop_reassembly(
                 silent,
                 approval,
                 multimodal_config,
+                config,
                 hooks: None,
                 activated_tools,
                 model_switch_callback,
@@ -1420,12 +1432,20 @@ pub async fn run(
             span.record("model", model_name.as_str());
         }
 
-        let provider_runtime_options = match agent_provider_resolved.as_ref() {
+        let agent_runtime_options = match agent_provider_resolved.as_ref() {
             Some((ty, alias, _)) => {
                 zeroclaw_providers::provider_runtime_options_for_alias(&config, ty, alias)
             }
             None => zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias),
         };
+        // Resolve every alias-owned option, including vision, through the shared
+        // provider-ref resolver. This keeps a --provider override isolated from
+        // the agent alias without a second capability-specific lookup.
+        let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
+            &config,
+            &provider_name,
+            &agent_runtime_options,
+        );
 
         // Resolve api_key and uri from the actual provider being constructed.
         // For dotted aliases (e.g. "openai.shartgpt"), look up the alias-specific
@@ -1871,6 +1891,7 @@ pub async fn run(
                                         silent: false,
                                         approval: approval_manager.as_ref(),
                                         multimodal_config: &config.multimodal,
+                                        config: Some(&config),
                                         hooks: None,
                                         activated_tools: activated_handle.as_ref(),
                                         model_switch_callback: Some(model_switch_callback.clone()),
@@ -1910,10 +1931,10 @@ pub async fn run(
                                     query: effective_msg.clone(),
                                     sessions: vec![memory_session_id.clone()],
                                     suppress: suppress_memory_inject,
-                                    cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                                        min_relevance_score: config.memory.min_relevance_score,
-                                        ..Default::default()
-                                    },
+                                    cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                        &config.memory,
+                                        crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                    ),
                                 }),
                                 ingress: IngressContext::from_origin(origin),
                                 agent_alias: Some(agent_alias),
@@ -2079,6 +2100,7 @@ pub async fn run(
                     .scope(
                         cost_tracking_context.clone(),
                         crate::skills::review::maybe_run_skill_review(
+                            Some(&config),
                             review_workspace,
                             review_config,
                             config.skills.allow_scripts,
@@ -2412,6 +2434,7 @@ pub async fn run(
                                             silent: true,
                                             approval: approval_manager.as_ref(),
                                             multimodal_config: &config.multimodal,
+                                            config: Some(&config),
                                             hooks: None,
                                             activated_tools: activated_handle.as_ref(),
                                             model_switch_callback: Some(
@@ -2457,10 +2480,10 @@ pub async fn run(
                                         query: effective_input.clone(),
                                         sessions: vec![memory_session_id.clone()],
                                         suppress: suppress_memory_inject,
-                                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                                            min_relevance_score: config.memory.min_relevance_score,
-                                            ..Default::default()
-                                        },
+                                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                            &config.memory,
+                                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                        ),
                                     }),
                                     ingress: IngressContext::from_origin(origin),
                                     agent_alias: Some(agent_alias),
@@ -3248,6 +3271,7 @@ pub async fn process_message(
             .scope(
                 thinking_params.native_thinking,
                 agent_turn_with_sop_reassembly(
+                    Some(&config),
                     model_provider.as_ref(),
                     &mut history,
                     &tools_registry,
@@ -3279,10 +3303,10 @@ pub async fn process_message(
                         query: effective_message.clone(),
                         sessions: vec![session_id.map(str::to_string)],
                         suppress: false,
-                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                            min_relevance_score: config.memory.min_relevance_score,
-                            ..Default::default()
-                        },
+                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                            &config.memory,
+                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                        ),
                     }),
                     Some(agent_alias),
                     Some(SopStepReassembly { config: &config }),
@@ -3303,6 +3327,7 @@ mod tests {
         make_query_summary, maybe_inject_channel_delivery_defaults,
         save_interactive_session_history, seed_channel_handles, truncate_tool_result,
     };
+
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
     use parking_lot::RwLock;
@@ -5015,6 +5040,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5091,6 +5117,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5174,6 +5201,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5262,6 +5290,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5335,6 +5364,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5411,6 +5441,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5488,6 +5519,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5552,6 +5584,7 @@ mod tests {
                     silent: true,
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
                     max_tool_iterations: 3,
                     hooks: None,
                     excluded_tools: &[],
@@ -5737,6 +5770,7 @@ mod tests {
                     silent: true,
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
                     max_tool_iterations: 3,
                     hooks: None,
                     excluded_tools: &[],
@@ -5861,6 +5895,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5937,6 +5972,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -6012,6 +6048,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -6173,6 +6210,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6313,6 +6351,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 6,
                 hooks: None,
                 excluded_tools: &[],
@@ -6473,6 +6512,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 6,
                 hooks: None,
                 excluded_tools: &[],
@@ -6590,6 +6630,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6762,6 +6803,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6870,6 +6912,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6962,6 +7005,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7046,6 +7090,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7138,6 +7183,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7233,6 +7279,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7333,6 +7380,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7430,6 +7478,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7527,6 +7576,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7629,6 +7679,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7721,6 +7772,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7817,6 +7869,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7915,6 +7968,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7999,6 +8053,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8087,6 +8142,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8170,6 +8226,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8251,6 +8308,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8335,6 +8393,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 6,
                 hooks: None,
                 excluded_tools: &[],
@@ -8416,6 +8475,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8496,6 +8556,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8568,6 +8629,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8641,6 +8703,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8714,6 +8777,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8789,6 +8853,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8869,6 +8934,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8961,6 +9027,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9036,6 +9103,7 @@ Done."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9114,6 +9182,7 @@ Done."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9190,6 +9259,7 @@ Done."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9267,6 +9337,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9401,6 +9472,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9486,6 +9558,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9575,6 +9648,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9687,6 +9761,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9804,6 +9879,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9895,6 +9971,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -9997,6 +10074,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -10879,6 +10957,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -10983,6 +11062,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -11086,6 +11166,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -11189,6 +11270,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -11347,6 +11429,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -11445,6 +11528,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11516,6 +11600,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11644,6 +11729,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let _result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11723,6 +11809,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let _result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -13665,6 +13752,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -13842,6 +13930,7 @@ Let me check the result."#;
                         silent: true,
                         approval: None,
                         multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
                         max_tool_iterations: 2,
                         hooks: None,
                         excluded_tools: &[],
@@ -13918,6 +14007,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 2,
                 hooks: None,
                 excluded_tools: &[],
@@ -14033,6 +14123,7 @@ Let me check the result."#;
                         silent: true,
                         approval: None,
                         multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
                         max_tool_iterations: 2,
                         hooks: None,
                         excluded_tools: &[],
@@ -14114,6 +14205,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 2,
                 hooks: None,
                 excluded_tools: &[],
@@ -14202,6 +14294,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 1,
                 hooks: None,
                 excluded_tools: &[],
@@ -14338,6 +14431,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 crate::skills::review::maybe_run_skill_review(
+                    None,
                     workspace.path().to_path_buf(),
                     review_config,
                     false,
@@ -14422,6 +14516,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 crate::skills::review::maybe_run_skill_review(
+                    None,
                     workspace.path().to_path_buf(),
                     review_config,
                     false,
@@ -15415,6 +15510,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 10,
                 hooks: None,
                 excluded_tools: &[],
@@ -15478,6 +15574,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = agent_turn(
+            None,
             &model_provider,
             &mut history,
             &tools_registry,
@@ -15529,6 +15626,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = agent_turn(
+            None, // config: configless test
             &model_provider,
             &mut history,
             &tools_registry,

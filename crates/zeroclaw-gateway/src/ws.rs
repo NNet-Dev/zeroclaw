@@ -125,7 +125,7 @@ pub async fn handle_ws_chat(
             None => {
                 return (
                     axum::http::StatusCode::UNAUTHORIZED,
-                    "Unauthorized — provide Authorization header, Sec-WebSocket-Protocol bearer, or ?token= query param",
+                    "Unauthorized: provide Authorization header, Sec-WebSocket-Protocol bearer, or ?token= query param",
                 )
                     .into_response();
             }

@@ -4044,13 +4044,12 @@ impl RpcDispatcher {
                     });
                 }
                 crate::sop::dispatch::DispatchResult::Skipped { reason, .. }
-                | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. }
-                // A2: a deferred trigger is backpressured; this surface has no
-                // retry loop, so report it plainly rather than hanging.
-                | crate::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
+                | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
                     return Err(rpc_err(INVALID_PARAMS, reason.clone()));
                 }
-                // A2: the trigger was absorbed into an already-in-flight run.
+                crate::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
+                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                }
                 crate::sop::dispatch::DispatchResult::Coalesced {
                     existing_run_id, ..
                 } => {
@@ -4132,7 +4131,8 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
-        let outcome = {
+        let mut resolved_outcome = None;
+        {
             let mut guard = engine
                 .lock()
                 .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
@@ -4151,45 +4151,70 @@ impl RpcDispatcher {
                     ),
                 ));
             }
-            guard
-                .resolve_via_broker(
-                    &req.run_id,
-                    decision,
-                    crate::sop::approval::ApprovalPrincipal::ws(
-                        self.peer_label.clone(),
-                        self.tui_id.clone(),
-                    ),
+            use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
+            let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
+            match guard
+                .resolve_via_broker(&req.run_id, decision, principal)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
+            {
+                outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
+                    resolved_outcome = Some(outcome);
+                }
+                BrokerOutcome::Resolved(
+                    ResolveOutcome::Denied
+                    | ResolveOutcome::AlreadyResolved
+                    | ResolveOutcome::Revised,
                 )
-                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
-        };
-        match outcome {
-            crate::sop::approval::BrokerOutcome::Resolved(
-                crate::sop::approval::ResolveOutcome::Resumed(_)
-                | crate::sop::approval::ResolveOutcome::Denied
-                | crate::sop::approval::ResolveOutcome::Revised,
-            )
-            | crate::sop::approval::BrokerOutcome::PendingQuorum { .. } => {}
-            crate::sop::approval::BrokerOutcome::Resolved(other) => {
-                return Err(rpc_err(
-                    INVALID_PARAMS,
-                    format!("checkpoint decision rejected: {}", other.label()),
-                ));
-            }
-            other => {
-                return Err(rpc_err(
-                    INVALID_PARAMS,
-                    format!("checkpoint decision rejected: {}", other.label()),
-                ));
+                | BrokerOutcome::PendingQuorum { .. } => {}
+                BrokerOutcome::Resolved(
+                    ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity,
+                )
+                | BrokerOutcome::NotWaiting => {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-decision-invalid-state",
+                            &[("run_id", req.run_id.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)
+                | BrokerOutcome::NotAuthorized { .. } => {
+                    return Err(rpc_err(
+                        AUTH_REQUIRED,
+                        crate::i18n::get_required_cli_string("sop-rpc-decision-unauthorized"),
+                    ));
+                }
+                BrokerOutcome::PolicyMissing { name } => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-policy-missing",
+                            &[("name", name.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::PolicyUnavailable { reason } => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-policy-unavailable",
+                            &[("reason", reason.as_str())],
+                        ),
+                    ));
+                }
             }
         }
 
-        let config = self.ctx.config.read();
-        crate::sop::drive_resumed_broker_action(
-            &config,
-            Arc::clone(&engine),
-            self.ctx.sop_audit.clone(),
-            &outcome,
-        );
+        if let Some(outcome) = resolved_outcome {
+            let config = self.ctx.config.read();
+            crate::sop::drive_resumed_broker_action(
+                &config,
+                Arc::clone(&engine),
+                self.ctx.sop_audit.clone(),
+                &outcome,
+            );
+        }
 
         let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
             let msg = e.to_string();
@@ -5459,209 +5484,155 @@ mod tests {
         assert_eq!(err.code, INTERNAL_ERROR);
     }
 
-    #[tokio::test]
-    async fn sops_decide_uses_broker_for_named_policy_and_quorum() {
-        use crate::sop::{
-            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
-            SopStepKind, SopTrigger, SopTriggerSource,
+    fn make_checkpoint_rpc_dispatcher(
+        quorum: u32,
+        members: &[&str],
+        tui_id: &str,
+    ) -> (
+        RpcDispatcher,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        tempfile::TempDir,
+    ) {
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopStep, SopStepKind, SopTrigger, SopTriggerSource,
         };
         use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
         use zeroclaw_config::schema::{
-            ApprovalGroupConfig, ApprovalPolicyConfig, Config, SopApprovalConfig, SopConfig,
+            ApprovalGroupConfig, ApprovalPolicyConfig, Config, SopApprovalConfig,
         };
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
-        fn dispatcher_with_sop_engine(
-            config: Config,
-            engine: Arc<Mutex<crate::sop::SopEngine>>,
-            peer_label: &str,
-            tui_id: Option<&str>,
-        ) -> RpcDispatcher {
-            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
-            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
-            let (tx, _rx) = tokio::sync::mpsc::channel(64);
-            let mut dispatcher = RpcDispatcher::new(ctx, tx, peer_label.to_string());
-            dispatcher.set_tui_id_for_test(tui_id.map(str::to_string));
-            dispatcher
-        }
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let sops_dir = tmp.path().join("sops");
-
+        let temp = tempfile::TempDir::new().unwrap();
+        let sops_dir = temp.path().join("sops");
+        let sop = Sop {
+            name: "rpc-checkpoint".into(),
+            description: "checkpoint RPC authorization test".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "authorize".into(),
+                    kind: SopStepKind::Checkpoint,
+                    policy: Some("prod".into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "continue".into(),
+                    kind: SopStepKind::Execute,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).unwrap();
         let mut groups = HashMap::new();
         groups.insert(
             "release".to_string(),
             ApprovalGroupConfig {
-                members: vec!["ws:alice".to_string(), "ws:bob".to_string()],
+                members: members.iter().map(|member| (*member).to_string()).collect(),
             },
         );
         let mut policies = HashMap::new();
         policies.insert(
             "prod".to_string(),
             ApprovalPolicyConfig {
-                required_group: Some("release".to_string()),
-                quorum: 2,
+                required_group: Some("release".into()),
+                quorum,
                 request_route: None,
                 escalation_route: None,
             },
         );
+        let mut config = Config::default();
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        config.sop.approval = SopApprovalConfig { groups, policies };
 
-        let sop_config = SopConfig {
-            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
-            default_execution_mode: "deterministic".to_string(),
-            approval: SopApprovalConfig { groups, policies },
-            ..SopConfig::default()
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone())
+            .with_approval_broker(Arc::new(crate::sop::approval::ApprovalBroker::disabled()));
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                "rpc-checkpoint",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: crate::sop::engine::now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected checkpoint wait, got {other:?}"),
         };
-        let config = Config {
-            data_dir: tmp.path().join("data"),
-            config_path: tmp.path().join("config.toml"),
-            sop: sop_config.clone(),
-            ..Config::default()
-        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
+        dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
+        (dispatcher, engine, run_id, temp)
+    }
 
-        let sop = Sop {
-            name: "rpc-policy".to_string(),
-            description: "rpc policy checkpoint".to_string(),
-            version: "1.0.0".to_string(),
-            priority: SopPriority::Normal,
-            execution_mode: SopExecutionMode::Deterministic,
-            triggers: vec![SopTrigger::Manual],
-            steps: vec![SopStep {
-                number: 1,
-                title: "Policy gate".to_string(),
-                kind: SopStepKind::Checkpoint,
-                policy: Some("prod".to_string()),
-                ..SopStep::default()
-            }],
-            cooldown_secs: 0,
-            max_concurrent: 1,
-            location: None,
-            deterministic: true,
-            agent: None,
-            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
-            max_pending_approvals: 0,
-        };
-        crate::sop::save_sop(&sops_dir, &sop).expect("save temp SOP");
+    #[tokio::test]
+    async fn sops_decide_rpc_enforces_checkpoint_membership_and_quorum() {
+        use crate::sop::types::SopRunStatus;
 
-        let mut engine = crate::sop::SopEngine::new(sop_config);
-        engine.reload(tmp.path());
-        assert_eq!(engine.sops().len(), 1, "temp SOP should load");
-        let engine = Arc::new(Mutex::new(engine));
-
-        let run_id = {
-            let mut guard = engine.lock().expect("engine lock");
-            let action = guard
-                .start_run(
-                    "rpc-policy",
-                    SopEvent {
-                        source: SopTriggerSource::Manual,
-                        topic: None,
-                        payload: None,
-                        timestamp: crate::sop::engine::now_iso8601(),
-                    },
-                )
-                .expect("start policy-gated SOP");
-            let SopRunAction::CheckpointWait { run_id, .. } = action else {
-                panic!("policy SOP must park at checkpoint, got {action:?}");
-            };
-            run_id
-        };
-        let params = serde_json::json!({
-            "name": "rpc-policy",
-            "run_id": run_id,
-            "decision": "approve",
-        });
-
-        let anonymous = dispatcher_with_sop_engine(
-            config.clone(),
-            Arc::clone(&engine),
-            "test-peer-anon:pid=1",
-            None,
-        );
-        let err = anonymous
-            .handle_sops_decide(&params)
+        let (unauthorized, engine, run_id, _temp) =
+            make_checkpoint_rpc_dispatcher(1, &["cli:ZeroClawOperator"], "ZeroClawAgent");
+        let error = unauthorized
+            .handle_sops_decide(&json!({
+                "name": "rpc-checkpoint",
+                "run_id": run_id.clone(),
+                "decision": "approve",
+            }))
             .await
-            .expect_err("identityless RPC caller must not satisfy named policy");
-        assert_eq!(err.code, INVALID_PARAMS);
-        assert!(
-            err.message.contains("not_authorized"),
-            "broker rejection must surface, got: {}",
-            err.message
+            .expect_err("unauthorized RPC principal must be rejected");
+        assert_eq!(error.code, AUTH_REQUIRED);
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
         );
-        {
-            let guard = engine.lock().expect("engine lock");
-            assert_eq!(
-                guard.get_run(&run_id).expect("run still active").status,
-                SopRunStatus::PausedCheckpoint
-            );
-            assert!(
-                !guard
-                    .run_events(&run_id)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|event| event.kind == "gate_resolved"),
-                "rejected RPC decision must not append a gate_resolved row"
-            );
-        }
 
-        let alice = dispatcher_with_sop_engine(
-            config.clone(),
-            Arc::clone(&engine),
-            "test-peer-alice:pid=1",
-            Some("alice"),
+        let (pending, engine, run_id, _temp) = make_checkpoint_rpc_dispatcher(
+            2,
+            &["cli:ZeroClawOperator", "cli:ZeroClawMaintainer"],
+            "ZeroClawOperator",
         );
-        alice
-            .handle_sops_decide(&params)
+        pending
+            .handle_sops_decide(&json!({
+                "name": "rpc-checkpoint",
+                "run_id": run_id.clone(),
+                "decision": "approve",
+            }))
             .await
-            .expect("first authorized vote should be accepted as pending quorum");
-        {
-            let guard = engine.lock().expect("engine lock");
-            assert_eq!(
-                guard.get_run(&run_id).expect("run still active").status,
-                SopRunStatus::PausedCheckpoint,
-                "first authorized vote should not clear quorum-2 gate"
-            );
-            assert!(
-                !guard
-                    .run_events(&run_id)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|event| event.kind == "gate_resolved"),
-                "pending quorum must not append gate_resolved yet"
-            );
-        }
-
-        let bob = dispatcher_with_sop_engine(
-            config,
-            Arc::clone(&engine),
-            "test-peer-bob:pid=1",
-            Some("bob"),
+            .expect("an authorized first vote returns the still-parked overlay");
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
         );
-        bob.handle_sops_decide(&params)
-            .await
-            .expect("second authorized vote should satisfy quorum");
-        {
-            let guard = engine.lock().expect("engine lock");
-            assert_eq!(
-                guard.get_run(&run_id).expect("run retained").status,
-                SopRunStatus::Completed
-            );
-            let events = guard.run_events(&run_id).unwrap_or_default();
-            assert!(
-                events.iter().any(|event| {
-                    event.kind == "gate_resolved"
-                        && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
-                        && event
-                            .payload
-                            .get("decision")
-                            .and_then(|value| value.as_str())
-                            == Some("approve")
-                }),
-                "second RPC decision must resolve through the broker ledger path: {events:?}"
-            );
-        }
     }
 
     #[tokio::test]

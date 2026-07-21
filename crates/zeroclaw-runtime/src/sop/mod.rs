@@ -31,7 +31,7 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use engine::{MaintenanceSummary, SopEngine};
+pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
 pub use executor::{drive_resumed_broker_action, spawn_headless_run_driver};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
@@ -67,21 +67,6 @@ use types::{SopManifest, SopMeta};
 use zeroclaw_config::schema::SopConfig;
 use zeroclaw_memory::traits::Memory;
 
-/// Injected side-effect adapters for [`build_sop_engine`]. Each is optional and
-/// fail-closed when absent: the route falls back to the log-only no-op adapter,
-/// and the `forge.comment` / `llm.generate` capabilities report a clear failure
-/// instead of acting. The daemon injects real implementations; CLI / standalone
-/// callers pass `SopEngineAdapters::default()`.
-#[derive(Default)]
-pub struct SopEngineAdapters {
-    /// Delivers approval request / escalation notices to a channel.
-    pub route: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
-    /// Posts a SOP step's comment to a git forge (`forge.comment`).
-    pub forge: Option<Arc<dyn capability::ForgeCommentAdapter>>,
-    /// Runs one bounded model call as a pipeline step (`llm.generate`).
-    pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
-}
-
 /// Build the tool-spec map an SOP graph projection uses to type step pins.
 /// Keys are tool names; values are the tool's declared `parameters` (input
 /// pins) and `output` (output pin) schema. Derived once from the agent's
@@ -102,6 +87,21 @@ pub fn tool_specs_from_config(
             (spec.name.clone(), spec)
         })
         .collect()
+}
+
+/// Injected side-effect adapters for [`build_sop_engine`]. Each is optional and
+/// fail-closed when absent: the route falls back to the log-only no-op adapter,
+/// and the `forge.comment` / `llm.generate` capabilities report a clear failure
+/// instead of acting. The daemon injects real implementations; CLI / standalone
+/// callers pass `SopEngineAdapters::default()`.
+#[derive(Default)]
+pub struct SopEngineAdapters {
+    /// Delivers approval request / escalation notices to a channel.
+    pub route: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
+    /// Posts a SOP step's comment to a git forge (`forge.comment`).
+    pub forge: Option<Arc<dyn capability::ForgeCommentAdapter>>,
+    /// Runs one bounded model call as a pipeline step (`llm.generate`).
+    pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
 }
 
 /// Build a single shared SopEngine + SopAuditLogger pair.
@@ -135,6 +135,7 @@ pub fn build_sop_engine(
         );
         Arc::new(store::InMemoryRunStore::new())
     });
+    let (run_tx, _run_rx) = tokio::sync::broadcast::channel(256);
     // EPIC G: the approval broker (membership + quorum) resolves policies/groups
     // from the engine's live `[sop.approval]` at use-time. The route adapter
     // delivers approval request/escalation notices to a channel; the daemon injects
@@ -151,13 +152,12 @@ pub fn build_sop_engine(
     let mut capabilities = capability::SopCapabilityRegistry::with_builtins();
     capabilities.register(capability::ForgeCommentCapability::new(forge_adapter));
     capabilities.register(capability::LlmGenerateCapability::new(llm_adapter));
-    let (run_tx, _run_rx) = tokio::sync::broadcast::channel(256);
     let mut engine = SopEngine::new(config)
         .with_store(store)
         .with_metrics(SopMetricsCollector::shared())
+        .with_run_notifier(run_tx)
         .with_approval_broker(approval_broker)
-        .with_capabilities(Arc::new(capabilities))
-        .with_run_notifier(run_tx);
+        .with_capabilities(Arc::new(capabilities));
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -187,9 +187,10 @@ fn sops_dir(workspace_dir: &Path) -> PathBuf {
 
 /// Resolve the SOPs directory from config, falling back to workspace default.
 ///
-/// A relative `config_dir` resolves against `workspace_dir`; an absolute or
-/// `~`-prefixed value is used as-is because `Path::join` replaces the base when
-/// the joined path is absolute.
+/// A relative `config_dir` (the common case in the documented
+/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
+/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
+/// the base entirely when the joined path is itself absolute).
 pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
         Some(dir) if !dir.is_empty() => {
@@ -602,14 +603,19 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 current.on_failure = parse_step_failure(val);
             } else if let Some(val) = bullet.strip_prefix("mode:") {
                 current.mode = Some(parse_execution_mode(val));
+            } else if let Some(val) = bullet.strip_prefix("agent:") {
+                let trimmed_val = val.trim();
+                current.agent = (!trimmed_val.is_empty()).then(|| trimmed_val.to_string());
+            } else if let Some(val) = bullet.strip_prefix("call:") {
+                if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
+                    current.calls.push(call);
+                }
             } else if let Some(val) = bullet.strip_prefix("prompt:") {
                 let val = val.trim();
                 if !val.is_empty() {
                     current.gate_prompt = Some(val.to_string());
                 }
             } else if let Some(val) = bullet.strip_prefix("policy:") {
-                // EPIC G: the approval-broker policy (a key in `[sop.approval].policies`)
-                // that gates this step's approval - required-group membership + quorum.
                 let val = val.trim();
                 current.policy = if val.is_empty() {
                     None
@@ -625,13 +631,6 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 } else {
                     Some(val.to_string())
                 };
-            } else if let Some(val) = bullet.strip_prefix("agent:") {
-                let trimmed_val = val.trim();
-                current.agent = (!trimmed_val.is_empty()).then(|| trimmed_val.to_string());
-            } else if let Some(val) = bullet.strip_prefix("call:") {
-                if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
-                    current.calls.push(call);
-                }
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {
@@ -672,11 +671,11 @@ struct StepParseState {
     routing: StepRouting,
     on_failure: StepFailure,
     mode: Option<SopExecutionMode>,
+    calls: Vec<PlannedToolCall>,
+    agent: Option<String>,
     policy: Option<String>,
     gate_prompt: Option<String>,
     edit: Option<String>,
-    calls: Vec<PlannedToolCall>,
-    agent: Option<String>,
 }
 
 impl StepParseState {
@@ -705,12 +704,12 @@ impl StepParseState {
             routing: std::mem::take(&mut self.routing),
             on_failure: std::mem::take(&mut self.on_failure),
             mode: self.mode.take(),
-            policy: self.policy.take(),
-            gate_prompt: self.gate_prompt.take(),
-            edit: self.edit.take(),
             calls: std::mem::take(&mut self.calls),
             pos: None,
             agent: self.agent.take(),
+            policy: self.policy.take(),
+            gate_prompt: self.gate_prompt.take(),
+            edit: self.edit.take(),
         });
         *self = Self::default();
     }
@@ -914,18 +913,6 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
     }
     if let Some(mode) = step.mode {
         bullets.push(format!("mode: {mode}"));
-    }
-    // Gate metadata (EPIC G + checkpoint edit/revise): the editor must
-    // round-trip these or a visual save silently strips a step's approval
-    // policy, its authored notice template, and its editable-field opt-in.
-    if let Some(policy) = &step.policy {
-        bullets.push(format!("policy: {policy}"));
-    }
-    if let Some(prompt) = &step.gate_prompt {
-        bullets.push(format!("prompt: {prompt}"));
-    }
-    if let Some(edit) = &step.edit {
-        bullets.push(format!("edit: {edit}"));
     }
     if let Some(agent) = &step.agent {
         bullets.push(format!("agent: {agent}"));
@@ -1484,45 +1471,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_steps_reads_policy_bullet() {
-        // EPIC G: an approval-broker policy name declared on a step in SOP.md must be
-        // carried onto the parsed step (not hard-coded to None), so the SOP.md path
-        // can express a policied gate the same way the TOML path does.
-        let steps = parse_steps(
-            r#"
-## Steps
-1. **Gate** - Requires the release group.
-   - policy: prod
-2. **Go** - Unpoliced.
-"#,
-        );
-        assert_eq!(steps[0].policy.as_deref(), Some("prod"));
-        assert_eq!(
-            steps[1].policy, None,
-            "a step with no policy bullet stays None"
-        );
-    }
-
-    #[test]
-    fn gate_metadata_roundtrips_through_render_and_parse() {
-        // A visual-editor save (render -> parse) must not strip a checkpoint's
-        // approval policy, its authored notice template, or its `- edit:` field.
-        let mut step = titled_step(1, "Review gate");
-        step.kind = SopStepKind::Checkpoint;
-        step.policy = Some("triage".into());
-        step.gate_prompt = Some("Draft for {{repo}}#{{number}}:\\n\\n{{body}}".into());
-        step.edit = Some("body".into());
-        let parsed = parse_steps(&render_steps(std::slice::from_ref(&step)));
-        assert_eq!(parsed[0].kind, SopStepKind::Checkpoint);
-        assert_eq!(parsed[0].policy.as_deref(), Some("triage"));
-        assert_eq!(
-            parsed[0].gate_prompt.as_deref(),
-            Some("Draft for {{repo}}#{{number}}:\\n\\n{{body}}")
-        );
-        assert_eq!(parsed[0].edit.as_deref(), Some("body"));
-    }
-
-    #[test]
     fn step_agent_override_roundtrips_through_render_and_parse() {
         let mut step = titled_step(1, "notify");
         step.agent = Some("pr_bot".into());
@@ -1666,6 +1614,23 @@ mod tests {
         assert_eq!(
             sop.steps[2].calls[0].args,
             json!({"command": "{{steps.1.out}} then {{steps.2.ok}}"})
+        );
+    }
+
+    #[test]
+    fn parse_steps_reads_policy_bullet() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Gate** - Requires the release group.
+   - policy: prod
+2. **Go** - Unpoliced.
+"#,
+        );
+        assert_eq!(steps[0].policy.as_deref(), Some("prod"));
+        assert_eq!(
+            steps[1].policy, None,
+            "a step with no policy bullet stays None"
         );
     }
 

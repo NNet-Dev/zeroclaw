@@ -20,8 +20,25 @@ use zeroclaw_config::schema::{ApprovalPolicyConfig, SopApprovalConfig};
 
 use super::decision::{ApprovalDecision, ResolveOutcome};
 use super::identity::{ApprovalIdentityResolver, LocalConfigApprovalIdentityResolver};
-use super::principal::ApprovalPrincipal;
+use super::principal::{ApprovalPrincipal, ApprovalSource};
 use crate::sop::engine::{GateState, SopEngine};
+
+/// Why an approval notice is being delivered. Route adapters render this so an
+/// on-call escalation cannot be mistaken for the initial request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalNoticeKind {
+    Request,
+    Escalation,
+}
+
+impl ApprovalNoticeKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Escalation => "escalation",
+        }
+    }
+}
 
 /// Deliver an approval notice to a named route (channel). The seam that lets
 /// approvals reach approvers beyond the originating channel (the cross-channel HITL
@@ -29,7 +46,12 @@ use crate::sop::engine::{GateState, SopEngine};
 /// Delivery is best-effort: a route error must never clear or block a gate (the gate
 /// state is the source of truth; the route is only a notice).
 pub trait ApprovalRouteAdapter: Send + Sync {
-    fn deliver(&self, route: &str, notice: &GateNotice<'_>) -> anyhow::Result<()>;
+    fn deliver(
+        &self,
+        kind: ApprovalNoticeKind,
+        route: &str,
+        notice: &GateNotice<'_>,
+    ) -> anyhow::Result<()>;
 }
 
 /// Everything a route adapter needs to render a MEANINGFUL gate notice — not
@@ -63,16 +85,25 @@ pub struct GateNotice<'a> {
 pub struct NoopRouteAdapter;
 
 impl ApprovalRouteAdapter for NoopRouteAdapter {
-    fn deliver(&self, route: &str, notice: &GateNotice<'_>) -> anyhow::Result<()> {
+    fn deliver(
+        &self,
+        kind: ApprovalNoticeKind,
+        route: &str,
+        notice: &GateNotice<'_>,
+    ) -> anyhow::Result<()> {
         let (run_id, sop_name, step) = (notice.run_id, notice.sop_name, notice.step);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
                 ::serde_json::json!({
-                    "route": route, "run_id": run_id, "sop_name": sop_name, "step": step
+                    "notice_kind": kind.label(), "route": route, "run_id": run_id,
+                    "sop_name": sop_name, "step": step
                 })
             ),
-            &format!("approval route delivery (noop): run {run_id} step {step} -> route '{route}'")
+            &format!(
+                "approval {} route delivery (noop): run {run_id} step {step} -> route '{route}'",
+                kind.label()
+            )
         );
         Ok(())
     }
@@ -93,6 +124,9 @@ pub enum BrokerOutcome {
     /// than treated as an unpoliced (quorum-1, no-membership) gate, so a typo can
     /// never downgrade a policied step to open approval.
     PolicyMissing { name: String },
+    /// The parked run's live SOP or current step could not be resolved. Fail
+    /// closed rather than interpreting unavailable state as intentionally unpoliced.
+    PolicyUnavailable { reason: String },
     /// The run is not a waiting gate (unknown / already-resolved / not applicable).
     NotWaiting,
 }
@@ -112,6 +146,9 @@ impl BrokerOutcome {
             BrokerOutcome::PolicyMissing { name } => {
                 format!("policy_missing ('{name}')")
             }
+            BrokerOutcome::PolicyUnavailable { reason } => {
+                format!("policy_unavailable ({reason})")
+            }
         }
     }
 }
@@ -120,11 +157,19 @@ impl BrokerOutcome {
 enum StepPolicy {
     /// The step names no policy: unpoliced, quorum-1 pass-through (old behavior).
     Unpoliced,
-    /// The step names a policy present in config.
-    Named(ApprovalPolicyConfig),
+    /// The step names a policy present in config. Carries the policy NAME (the
+    /// `[sop.approval].policies.<name>` map key) so a quorum vote can be scoped to the
+    /// policy in effect when it was cast.
+    Named {
+        name: String,
+        config: ApprovalPolicyConfig,
+    },
     /// The step names a policy ABSENT from config: fail closed, never treat as
     /// unpoliced.
     MissingNamed(String),
+    /// The live run/SOP/step cannot be resolved. This is not equivalent to an
+    /// authored step with no policy and must fail closed.
+    Unavailable(String),
 }
 
 pub(crate) fn checkpoint_decision_identity(
@@ -192,7 +237,10 @@ impl ApprovalBroker {
     /// Deliver an escalation notice to a route (best-effort).
     pub fn deliver_escalation(&self, route: &str, notice: &GateNotice<'_>) {
         let run_id = notice.run_id;
-        if let Err(e) = self.route.deliver(route, notice) {
+        if let Err(e) = self
+            .route
+            .deliver(ApprovalNoticeKind::Escalation, route, notice)
+        {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -251,7 +299,10 @@ impl ApprovalBroker {
     /// the gate (the gate is the source of truth, this is only a notice).
     pub fn deliver_request(&self, route: &str, notice: &GateNotice<'_>) {
         let run_id = notice.run_id;
-        if let Err(e) = self.route.deliver(route, notice) {
+        if let Err(e) = self
+            .route
+            .deliver(ApprovalNoticeKind::Request, route, notice)
+        {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -268,19 +319,25 @@ impl ApprovalBroker {
     /// from the engine's live config. Three-state so a NAMED-but-absent policy is
     /// distinguished from no policy at all - the caller fails closed on the former.
     fn step_policy(&self, engine: &SopEngine, run_id: &str) -> StepPolicy {
-        let Some(name) = engine.current_step_policy_name(run_id) else {
-            return StepPolicy::Unpoliced;
+        let name = match engine.current_step_policy_lookup(run_id) {
+            Ok(Some(name)) => name,
+            Ok(None) => return StepPolicy::Unpoliced,
+            Err(e) => return StepPolicy::Unavailable(e.to_string()),
         };
         match engine.approval_config().policies.get(&name) {
-            Some(p) => StepPolicy::Named(p.clone()),
+            Some(p) => StepPolicy::Named {
+                name,
+                config: p.clone(),
+            },
             None => StepPolicy::MissingNamed(name),
         }
     }
 
-    /// Authorize a deterministic checkpoint through the same named policy model as
-    /// approval gates. `None` means the caller may resolve the checkpoint now;
-    /// `Some(outcome)` is a terminal broker answer and the checkpoint must stay
-    /// parked. Positive quorum votes are scoped to the current checkpoint
+    /// Authorize a deterministic checkpoint through the same live policy,
+    /// membership, approval-mode, and quorum rules as a waiting approval gate.
+    /// `None` means the checkpoint owner may apply the decision; `Some` leaves
+    /// the checkpoint parked with the returned broker outcome. Positive quorum
+    /// votes are scoped to the current checkpoint
     /// presentation revision and a canonical decision identity, so Approve, Amend,
     /// and Revise votes for different public mutations cannot combine.
     pub(crate) fn authorize_checkpoint(
@@ -292,17 +349,17 @@ impl ApprovalBroker {
         principal: &ApprovalPrincipal,
     ) -> anyhow::Result<Option<BrokerOutcome>> {
         let policy = match self.step_policy(engine, run_id) {
+            StepPolicy::Unavailable(reason) => {
+                return Ok(Some(BrokerOutcome::PolicyUnavailable { reason }));
+            }
             StepPolicy::MissingNamed(name) => {
                 return Ok(Some(BrokerOutcome::PolicyMissing { name }));
             }
-            StepPolicy::Unpoliced => None,
-            StepPolicy::Named(p) => Some(p),
+            StepPolicy::Unpoliced => return Ok(None),
+            StepPolicy::Named { name, config } => (name, config),
         };
 
-        if let Some(group) = policy
-            .as_ref()
-            .and_then(|p| p.required_group.as_deref())
-            .filter(|g| !g.is_empty())
+        if let Some(group) = policy.1.required_group.as_deref().filter(|g| !g.is_empty())
             && !self
                 .resolver
                 .is_member(engine.approval_config(), principal, group)
@@ -329,11 +386,7 @@ impl ApprovalBroker {
             .get_run(run_id)
             .map(|run| run.revision)
             .unwrap_or_default();
-
-        let need = policy
-            .as_ref()
-            .map(|p| (p.quorum.max(1)) as usize)
-            .unwrap_or(1);
+        let need = policy.1.quorum.max(1) as usize;
         if need <= 1 {
             return Ok(None);
         }
@@ -345,22 +398,22 @@ impl ApprovalBroker {
         engine.record_checkpoint_gate_vote(
             run_id,
             step,
+            &policy.0,
             checkpoint_revision,
             decision_label,
             &decision_identity,
             principal,
         )?;
-        let have = engine.distinct_checkpoint_gate_voters(
+        let have = self.count_qualified_voters(
+            engine,
             run_id,
             step,
+            &policy.0,
+            policy.1.required_group.as_deref().filter(|g| !g.is_empty()),
             checkpoint_revision,
-            &decision_identity,
-        );
-        if have >= need {
-            Ok(None)
-        } else {
-            Ok(Some(BrokerOutcome::PendingQuorum { have, need }))
-        }
+            Some((checkpoint_revision, &decision_identity)),
+        )?;
+        Ok((have < need).then_some(BrokerOutcome::PendingQuorum { have, need }))
     }
 
     /// Resolve a gate through the broker: enforce membership + quorum, then call the
@@ -383,10 +436,14 @@ impl ApprovalBroker {
 
         // FAIL CLOSED: a step that names a policy absent from config leaves the gate
         // waiting rather than falling through to an unpoliced (quorum-1) resolution.
-        let policy = match self.step_policy(engine, run_id) {
+        let policy: Option<(String, ApprovalPolicyConfig)> = match self.step_policy(engine, run_id)
+        {
+            StepPolicy::Unavailable(reason) => {
+                return Ok(BrokerOutcome::PolicyUnavailable { reason });
+            }
             StepPolicy::MissingNamed(name) => return Ok(BrokerOutcome::PolicyMissing { name }),
             StepPolicy::Unpoliced => None,
-            StepPolicy::Named(p) => Some(p),
+            StepPolicy::Named { name, config } => Some((name, config)),
         };
 
         // Required-group membership gates BOTH approve and deny: only an authorized
@@ -396,7 +453,7 @@ impl ApprovalBroker {
         // does not lock every principal out of a policy nobody could ever satisfy.
         if let Some(group) = policy
             .as_ref()
-            .and_then(|p| p.required_group.as_deref())
+            .and_then(|(_, p)| p.required_group.as_deref())
             .filter(|g| !g.is_empty())
             && !self
                 .resolver
@@ -420,10 +477,13 @@ impl ApprovalBroker {
                  deterministic checkpoints — approve or deny instead"
             ),
             ApprovalDecision::Approve => {
-                let need = policy
-                    .as_ref()
-                    .map(|p| (p.quorum.max(1)) as usize)
-                    .unwrap_or(1);
+                // Unpoliced (no named policy) clears immediately - quorum-1 pass-through.
+                let Some((policy_name, cfg)) = policy.as_ref() else {
+                    return Ok(BrokerOutcome::Resolved(
+                        engine.resolve_gate(run_id, decision, principal)?,
+                    ));
+                };
+                let need = (cfg.quorum.max(1)) as usize;
                 if need <= 1 {
                     return Ok(BrokerOutcome::Resolved(
                         engine.resolve_gate(run_id, decision, principal)?,
@@ -462,11 +522,24 @@ impl ApprovalBroker {
                     .get_run(run_id)
                     .map(|run| run.revision)
                     .unwrap_or_default();
-                // Quorum > 1: durably record this vote, then count distinct approvers
-                // FOR THE CURRENT STEP PRESENTATION so a repeated gate cannot reuse
-                // votes from an earlier visit to the same step.
-                engine.record_gate_vote(run_id, step, gate_revision, &principal)?;
-                let have = engine.distinct_gate_voters(run_id, step, gate_revision);
+                // Quorum > 1: durably record this vote under both the CURRENT policy
+                // and CURRENT gate presentation, so neither policy reloads nor a later
+                // visit to the same step can reuse a stale vote.
+                engine.record_gate_vote(run_id, step, policy_name, gate_revision, &principal)?;
+                // Count only votes cast under the current policy whose voter is STILL a
+                // member of the current required group - so a mid-flight policy or group
+                // change cannot let a stale vote count toward the new quorum. Propagates
+                // a gate-ledger read failure (the vote above is durably recorded, so
+                // failing here leaves the gate waiting for a retry, not a bogus quorum).
+                let have = self.count_qualified_voters(
+                    engine,
+                    run_id,
+                    step,
+                    policy_name,
+                    cfg.required_group.as_deref().filter(|g| !g.is_empty()),
+                    gate_revision,
+                    None,
+                )?;
                 if have >= need {
                     Ok(BrokerOutcome::Resolved(
                         engine.resolve_gate(run_id, decision, principal)?,
@@ -477,6 +550,81 @@ impl ApprovalBroker {
             }
         }
     }
+
+    /// Count the distinct approvers whose recorded vote (a) was cast under the
+    /// `policy_name` currently enforced for this step AND (b) is STILL a member of the
+    /// current `required_group`. Scoping to the policy name means a mid-flight policy
+    /// change resets the tally (a stale vote under the old policy no longer counts);
+    /// revalidating membership against the LIVE config means a voter removed from the
+    /// group mid-flight stops counting. Dedup is by the canonical `voter_key`, so one
+    /// paired token presented over HTTP and WS still counts once. A vote with no
+    /// recorded policy (cast before this field existed) matches no named policy and is
+    /// therefore never counted - it cannot silently satisfy the new policy.
+    fn count_qualified_voters(
+        &self,
+        engine: &SopEngine,
+        run_id: &str,
+        step: u32,
+        policy_name: &str,
+        required_group: Option<&str>,
+        gate_revision: u32,
+        checkpoint_scope: Option<(u32, &str)>,
+    ) -> anyhow::Result<usize> {
+        let votes = engine.gate_votes_for_step(run_id, step)?;
+        let cfg = engine.approval_config();
+        let mut qualified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for vote in votes {
+            // Scope to the policy in effect NOW.
+            if vote.policy.as_deref() != Some(policy_name) {
+                continue;
+            }
+            if vote.gate_revision != Some(gate_revision) {
+                continue;
+            }
+            let scope_matches = match checkpoint_scope {
+                Some((revision, identity)) => {
+                    vote.checkpoint_revision == Some(revision)
+                        && vote.decision_identity.as_deref() == Some(identity)
+                }
+                None => vote.checkpoint_revision.is_none() && vote.decision_identity.is_none(),
+            };
+            if !scope_matches {
+                continue;
+            }
+            // Revalidate the recorded voter against the CURRENT required group.
+            if let Some(group) = required_group {
+                let Some(principal) = vote_principal(vote.source.as_deref(), vote.identity.clone())
+                else {
+                    continue;
+                };
+                if !self.resolver.is_member(cfg, &principal, group) {
+                    continue;
+                }
+            }
+            qualified.insert(vote.voter_key);
+        }
+        Ok(qualified.len())
+    }
+}
+
+/// Reconstruct the minimal principal needed to REVALIDATE a recorded vote against the
+/// current required group. Membership (`groups_for`) keys only on the source label and
+/// identity, so the back-channel is irrelevant and dropped. Returns `None` for an
+/// unrecognized source label (a vote we cannot re-authorize does not count).
+fn vote_principal(source: Option<&str>, identity: Option<String>) -> Option<ApprovalPrincipal> {
+    let source = match source? {
+        "agent" => ApprovalSource::Agent,
+        "cli" => ApprovalSource::Cli,
+        "ws" => ApprovalSource::Ws,
+        "http" => ApprovalSource::Http,
+        "system" => ApprovalSource::System,
+        _ => return None,
+    };
+    Some(ApprovalPrincipal {
+        source,
+        identity,
+        channel: None,
+    })
 }
 
 #[cfg(test)]
@@ -530,9 +678,42 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
-            agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    fn checkpoint_policy_sop(policy: &str) -> Sop {
+        Sop {
+            name: "checkpointed".into(),
+            description: "t".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    policy: Some(policy.into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "go".into(),
+                    kind: SopStepKind::Execute,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
         }
     }
 
@@ -605,45 +786,6 @@ mod tests {
         (e, id)
     }
 
-    /// A deterministic `capability(noop) -> checkpoint(policy) -> capability(noop)`
-    /// SOP. The post-checkpoint tail stands in for a public mutation such as
-    /// `forge.comment`: it must not run until the checkpoint policy authorizes it.
-    fn checkpoint_policy_sop(policy: &str) -> Sop {
-        let cap_step = |number: u32| SopStep {
-            number,
-            title: format!("Capability {number}"),
-            kind: SopStepKind::Capability,
-            capability: Some("noop".into()),
-            ..SopStep::default()
-        };
-        Sop {
-            name: "triage".into(),
-            description: "cap -> checkpoint -> cap".into(),
-            version: "1.0.0".into(),
-            priority: SopPriority::Normal,
-            execution_mode: SopExecutionMode::Deterministic,
-            triggers: vec![SopTrigger::Manual],
-            steps: vec![
-                cap_step(1),
-                SopStep {
-                    number: 2,
-                    title: "Review".into(),
-                    kind: SopStepKind::Checkpoint,
-                    policy: Some(policy.into()),
-                    ..SopStep::default()
-                },
-                cap_step(3),
-            ],
-            cooldown_secs: 0,
-            max_concurrent: 1,
-            location: None,
-            deterministic: true,
-            agent: None,
-            admission_policy: SopAdmissionPolicy::Parallel,
-            max_pending_approvals: 0,
-        }
-    }
-
     fn run_id_from_action(action: &SopRunAction) -> &str {
         match action {
             SopRunAction::ExecuteStep { run_id, .. }
@@ -686,19 +828,112 @@ mod tests {
             "expected checkpoint wait, got {parked:?}"
         );
         assert_eq!(
-            e.get_run(&id).map(|r| r.status),
+            e.get_run(&id).map(|run| run.status),
             Some(SopRunStatus::PausedCheckpoint)
         );
         (e, id)
     }
 
+    #[test]
+    fn checkpoint_non_member_is_not_authorized_and_stays_paused() {
+        let (mut engine, run_id) =
+            checkpoint_engine_with_broker(approval_cfg(&["ZeroClawOperator"], 1));
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("ZeroClawAgent".into())),
+            )
+            .unwrap();
+        assert!(matches!(outcome, BrokerOutcome::NotAuthorized { .. }));
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+        assert!(
+            engine
+                .run_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "gate_resolved")
+        );
+    }
+
+    #[test]
+    fn checkpoint_quorum_waits_for_distinct_members_and_audits_resolver() {
+        let (mut engine, run_id) = checkpoint_engine_with_broker(approval_cfg(
+            &["ZeroClawOperator", "ZeroClawMaintainer"],
+            2,
+        ));
+        let first = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+
+        let second = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("ZeroClawMaintainer".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            second,
+            BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
+        ));
+        let resolved = engine
+            .run_events(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "gate_resolved")
+            .expect("checkpoint decision audit");
+        assert_eq!(resolved.actor.as_deref(), Some("ZeroClawMaintainer"));
+        assert_eq!(resolved.payload["decision"], "approve");
+    }
+
+    #[test]
+    fn checkpoint_authorized_deny_audits_actor_and_decision() {
+        let (mut engine, run_id) =
+            checkpoint_engine_with_broker(approval_cfg(&["ZeroClawOperator"], 1));
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Deny {
+                    reason: Some("release blocked".into()),
+                },
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
+        ));
+        let resolved = engine
+            .run_events(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "gate_resolved")
+            .expect("checkpoint decision audit");
+        assert_eq!(resolved.actor.as_deref(), Some("ZeroClawOperator"));
+        assert_eq!(resolved.payload["decision"], "deny");
+        assert_eq!(resolved.reason.as_deref(), Some("release blocked"));
+    }
+
     fn editable_checkpoint_policy_sop(policy: &str) -> Sop {
         let mut sop = checkpoint_policy_sop(policy);
         sop.name = "editable-triage".into();
-        sop.steps.remove(0);
-        sop.steps[0].number = 1;
         sop.steps[0].edit = Some("body".into());
-        sop.steps[1].number = 2;
         sop
     }
 
@@ -750,8 +985,22 @@ mod tests {
     fn revisable_checkpoint_engine_with_broker(cfg: SopApprovalConfig) -> (SopEngine, String) {
         let mut sop = checkpoint_policy_sop("prod");
         sop.name = "revisable-triage".into();
-        sop.steps[0].capability = Some("llm.generate".into());
-        sop.steps.truncate(2);
+        sop.steps = vec![
+            SopStep {
+                number: 1,
+                title: "Draft".into(),
+                kind: SopStepKind::Capability,
+                capability: Some("llm.generate".into()),
+                ..SopStep::default()
+            },
+            SopStep {
+                number: 2,
+                title: "Review".into(),
+                kind: SopStepKind::Checkpoint,
+                policy: Some("prod".into()),
+                ..SopStep::default()
+            },
+        ];
         let broker = Arc::new(ApprovalBroker::disabled());
         let sop_config = SopConfig {
             approval: cfg,
@@ -777,12 +1026,12 @@ mod tests {
 
     #[test]
     fn non_member_is_not_authorized_and_gate_stays_open() {
-        let (mut e, id) = engine_with_broker(approval_cfg(&["alice"], 1));
+        let (mut e, id) = engine_with_broker(approval_cfg(&["ZeroClawOperator"], 1));
         let out = e
             .resolve_via_broker(
                 &id,
                 ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("mallory".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawAgent".into())),
             )
             .unwrap();
         assert!(matches!(out, BrokerOutcome::NotAuthorized { .. }));
@@ -793,67 +1042,33 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_non_member_is_not_authorized_and_stays_paused() {
-        let (mut e, id) = checkpoint_engine_with_broker(approval_cfg(&["alice"], 1));
-        let out = e
-            .resolve_via_broker(
-                &id,
-                ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("mallory".into())),
-            )
-            .unwrap();
-        assert!(matches!(out, BrokerOutcome::NotAuthorized { .. }));
-        assert_eq!(
-            e.get_run(&id).map(|r| r.status),
-            Some(SopRunStatus::PausedCheckpoint),
-            "an unauthorized checkpoint decision must leave the run parked"
-        );
-        let events = e.run_events(&id).unwrap_or_default();
-        assert!(
-            events.iter().all(|ev| ev.kind != "gate_resolved"),
-            "an unauthorized checkpoint decision must not append a resolved row: {events:?}"
-        );
-    }
-
-    #[test]
-    fn checkpoint_quorum_blocks_tail_until_second_distinct_member() {
-        let (mut e, id) = checkpoint_engine_with_broker(approval_cfg(&["alice", "bob"], 2));
-
-        let first = e
-            .resolve_via_broker(
-                &id,
-                ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("alice".into())),
-            )
-            .unwrap();
-        assert!(matches!(
-            first,
-            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
-        ));
-        assert_eq!(
-            e.get_run(&id).map(|r| r.status),
-            Some(SopRunStatus::PausedCheckpoint),
-            "one approval must not resume the checkpoint tail"
-        );
-
-        let second = e
-            .resolve_via_broker(
-                &id,
-                ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("bob".into())),
-            )
-            .unwrap();
-        assert!(matches!(
-            second,
-            BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
-        ));
-        let finished = e.last_finished_run("triage").expect("tail completed");
-        assert_eq!(finished.status, SopRunStatus::Completed);
-        assert_eq!(
-            finished.step_results.len(),
-            3,
-            "the post-checkpoint tail runs only after quorum"
-        );
+    fn unavailable_live_step_fails_closed_for_approve_and_deny() {
+        for decision in [
+            ApprovalDecision::Approve,
+            ApprovalDecision::Deny { reason: None },
+        ] {
+            let (mut engine, run_id) = engine_with_broker(approval_cfg(&["ZeroClawOperator"], 1));
+            engine.set_sops_for_test(Vec::new());
+            let outcome = engine
+                .resolve_via_broker(
+                    &run_id,
+                    decision,
+                    ApprovalPrincipal::cli(Some("ZeroClawAgent".into())),
+                )
+                .unwrap();
+            assert!(matches!(outcome, BrokerOutcome::PolicyUnavailable { .. }));
+            assert_eq!(
+                engine.get_run(&run_id).map(|run| run.status),
+                Some(SopRunStatus::WaitingApproval)
+            );
+            assert!(
+                engine
+                    .run_events(&run_id)
+                    .unwrap()
+                    .iter()
+                    .all(|event| event.kind != "gate_resolved")
+            );
+        }
     }
 
     #[test]
@@ -1011,12 +1226,12 @@ mod tests {
 
     #[test]
     fn member_single_quorum_resolves() {
-        let (mut e, id) = engine_with_broker(approval_cfg(&["alice"], 1));
+        let (mut e, id) = engine_with_broker(approval_cfg(&["ZeroClawOperator"], 1));
         let out = e
             .resolve_via_broker(
                 &id,
                 ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("alice".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             )
             .unwrap();
         assert!(matches!(
@@ -1027,13 +1242,14 @@ mod tests {
 
     #[test]
     fn quorum_of_two_needs_two_distinct_approvers() {
-        let (mut e, id) = engine_with_broker(approval_cfg(&["alice", "bob"], 2));
+        let (mut e, id) =
+            engine_with_broker(approval_cfg(&["ZeroClawOperator", "ZeroClawMaintainer"], 2));
         // First authorized approval: recorded, still pending.
         let first = e
             .resolve_via_broker(
                 &id,
                 ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("alice".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             )
             .unwrap();
         assert!(
@@ -1045,7 +1261,7 @@ mod tests {
             .resolve_via_broker(
                 &id,
                 ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("alice".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             )
             .unwrap();
         assert!(matches!(
@@ -1057,13 +1273,121 @@ mod tests {
             .resolve_via_broker(
                 &id,
                 ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("bob".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawMaintainer".into())),
             )
             .unwrap();
         assert!(matches!(
             second,
             BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
         ));
+    }
+
+    #[test]
+    fn stale_vote_under_old_policy_does_not_count_after_policy_change() {
+        // A run parks under policy `old` (quorum 2)
+        // and one `old` member votes; a SOP reload re-points the step at policy `new`
+        // (a DIFFERENT group). Before the fix the old vote shared the (run, step) key and
+        // counted toward `new`, so a SINGLE `new` approver cleared a quorum-2 gate. Votes
+        // are now scoped to the policy in effect when they were cast.
+        let mut groups = HashMap::new();
+        groups.insert(
+            "g_old".to_string(),
+            ApprovalGroupConfig {
+                members: vec!["ZeroClawOperator".into()],
+            },
+        );
+        groups.insert(
+            "g_new".to_string(),
+            ApprovalGroupConfig {
+                members: vec!["ZeroClawMaintainer".into()],
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "old".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("g_old".into()),
+                quorum: 2,
+                ..Default::default()
+            },
+        );
+        policies.insert(
+            "new".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("g_new".into()),
+                quorum: 2,
+                ..Default::default()
+            },
+        );
+        let (mut e, id) = engine_with_broker_step("old", SopApprovalConfig { groups, policies });
+
+        // ZeroClawOperator (a g_old member) votes under `old`: recorded, quorum not yet met.
+        let first = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+
+        // A SOP reload re-points the parked step at policy `new` (group g_new).
+        e.set_sops_for_test(vec![policy_sop("new")]);
+
+        // ZeroClawMaintainer (a g_new member) votes under `new`. ZeroClawOperator's stale `old` vote must NOT count.
+        let second = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("ZeroClawMaintainer".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(second, BrokerOutcome::PendingQuorum { have: 1, need: 2 }),
+            "a vote cast under the old policy must not count toward the new policy's quorum, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn revoked_member_vote_does_not_count_after_config_reload() {
+        // Membership revocation: ZeroClawOperator votes under `prod`
+        // (group `release`), then a live config reload revokes ZeroClawOperator from `release` while
+        // the gate is parked. Her earlier vote is REVALIDATED against the live group at
+        // count time, so it stops counting - the one remaining member cannot alone clear
+        // a quorum of two.
+        let (mut e, id) =
+            engine_with_broker(approval_cfg(&["ZeroClawOperator", "ZeroClawMaintainer"], 2));
+        let first = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            BrokerOutcome::PendingQuorum { have: 1, need: 2 }
+        ));
+
+        // Live config reload revokes ZeroClawOperator from the release group (ZeroClawMaintainer remains).
+        e.set_approval_config_for_test(approval_cfg(&["ZeroClawMaintainer"], 2));
+
+        // ZeroClawMaintainer votes. ZeroClawOperator's earlier vote is revalidated against the CURRENT group and
+        // dropped (she is no longer a member), so quorum is still not met.
+        let second = e
+            .resolve_via_broker(
+                &id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("ZeroClawMaintainer".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(second, BrokerOutcome::PendingQuorum { have: 1, need: 2 }),
+            "a voter revoked from the required group must stop counting toward quorum, got {second:?}"
+        );
     }
 
     #[test]
@@ -1190,15 +1514,34 @@ mod tests {
     /// persisted (mirrors `crate::sop::engine::tests::FailingSaveStore`).
     struct FailingSaveStore {
         inner: crate::sop::store::InMemoryRunStore,
+        fail_save: std::sync::atomic::AtomicBool,
+        fail_atomic: std::sync::atomic::AtomicBool,
     }
     impl crate::sop::store::SopRunStore for FailingSaveStore {
         fn save_run(
             &self,
-            _r: &crate::sop::store::PersistedRun,
+            r: &crate::sop::store::PersistedRun,
         ) -> Result<(), crate::sop::store::StoreError> {
-            Err(crate::sop::store::StoreError::Backend(
-                "injected save_run failure".into(),
-            ))
+            if self.fail_save.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::sop::store::StoreError::Backend(
+                    "injected save_run failure".into(),
+                ));
+            }
+            self.inner.save_run(r)
+        }
+        fn save_run_with_event(
+            &self,
+            r: &crate::sop::store::PersistedRun,
+            e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            if self.fail_save.load(std::sync::atomic::Ordering::SeqCst)
+                || self.fail_atomic.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::sop::store::StoreError::Backend(
+                    "injected atomic save failure".into(),
+                ));
+            }
+            self.inner.save_run_with_event(r, e)
         }
         fn finish_run(
             &self,
@@ -1207,16 +1550,29 @@ mod tests {
         ) -> Result<(), crate::sop::store::StoreError> {
             self.inner.finish_run(id, t)
         }
-        fn load_terminal_runs(
+        fn finish_run_with_event(
             &self,
-            limit: usize,
-        ) -> Result<Vec<crate::sop::store::PersistedRun>, crate::sop::store::StoreError> {
-            self.inner.load_terminal_runs(limit)
+            id: &str,
+            t: &crate::sop::store::PersistedRun,
+            e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            if self.fail_atomic.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::sop::store::StoreError::Backend(
+                    "injected atomic finish failure".into(),
+                ));
+            }
+            self.inner.finish_run_with_event(id, t, e)
         }
         fn load_active_runs(
             &self,
         ) -> Result<Vec<crate::sop::store::PersistedRun>, crate::sop::store::StoreError> {
             self.inner.load_active_runs()
+        }
+        fn load_terminal_runs(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<crate::sop::store::PersistedRun>, crate::sop::store::StoreError> {
+            self.inner.load_terminal_runs(limit)
         }
         fn load_run(
             &self,
@@ -1313,18 +1669,247 @@ mod tests {
         }
     }
 
+    fn checkpoint_engine_with_atomic_failure_store() -> (SopEngine, String, Arc<FailingSaveStore>) {
+        let store = Arc::new(FailingSaveStore {
+            inner: crate::sop::store::InMemoryRunStore::new(),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_atomic: std::sync::atomic::AtomicBool::new(false),
+        });
+        let config = SopConfig {
+            approval: approval_cfg(&["ZeroClawOperator"], 1),
+            ..SopConfig::default()
+        };
+        let mut engine = SopEngine::new(config)
+            .with_store(store.clone())
+            .with_approval_broker(Arc::new(ApprovalBroker::disabled()));
+        engine.set_sops_for_test(vec![checkpoint_policy_sop("prod")]);
+        let action = engine.start_run("checkpointed", manual()).unwrap();
+        let run_id = match action {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected CheckpointWait, got {other:?}"),
+        };
+        (engine, run_id, store)
+    }
+
     #[test]
-    fn quorum_vote_refused_while_park_persist_is_pending() {
-        // A quorum vote is recorded before `resolve_gate` runs; only the final vote
-        // that reaches quorum calls the resolver. The resolver's own pending-persist
-        // guard cannot protect the first N-1 votes, so the broker must refuse to
-        // record any vote while the parked snapshot is not yet durable.
-        let store = std::sync::Arc::new(FailingSaveStore {
+    fn checkpoint_approve_atomic_failure_keeps_state_parked_without_audit() {
+        let (mut engine, run_id, store) = checkpoint_engine_with_atomic_failure_store();
+        store
+            .fail_atomic
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+            )
+            .expect_err("combined state/audit failure must reject checkpoint approval");
+        assert!(err.to_string().contains("atomic save failure"));
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+        assert_eq!(
+            store.load_run(&run_id).unwrap().unwrap().run.status,
+            SopRunStatus::PausedCheckpoint
+        );
+        assert!(
+            store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "gate_resolved")
+        );
+    }
+
+    #[test]
+    fn checkpoint_deny_atomic_failure_keeps_state_parked_without_audit() {
+        let (mut engine, run_id, store) = checkpoint_engine_with_atomic_failure_store();
+        store
+            .fail_atomic
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Deny { reason: None },
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+            )
+            .expect_err("combined state/audit failure must reject checkpoint denial");
+        assert!(err.to_string().contains("atomic finish failure"));
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+        assert_eq!(
+            store.load_run(&run_id).unwrap().unwrap().run.status,
+            SopRunStatus::PausedCheckpoint
+        );
+        assert!(
+            store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "gate_resolved")
+        );
+    }
+
+    /// Delegates to an in-memory store but fails every `list_events`, to prove a
+    /// gate-ledger read failure during quorum counting is surfaced (the resolve
+    /// errors, the gate stays waiting) rather than swallowed into 0 votes. `save_run`
+    /// and `append_event` succeed, so the run parks durably and the vote records -
+    /// modelling the "vote appended, then the ledger read fails" case exactly.
+    struct ListEventsFailsStore {
+        inner: crate::sop::store::InMemoryRunStore,
+    }
+    impl crate::sop::store::SopRunStore for ListEventsFailsStore {
+        fn save_run(
+            &self,
+            r: &crate::sop::store::PersistedRun,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.save_run(r)
+        }
+        fn save_run_with_event(
+            &self,
+            r: &crate::sop::store::PersistedRun,
+            e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            self.inner.save_run_with_event(r, e)
+        }
+        fn finish_run(
+            &self,
+            id: &str,
+            t: &crate::sop::store::PersistedRun,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &crate::sop::store::PersistedRun,
+            e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
+        }
+        fn load_terminal_runs(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<crate::sop::store::PersistedRun>, crate::sop::store::StoreError> {
+            self.inner.load_terminal_runs(limit)
+        }
+        fn load_active_runs(
+            &self,
+        ) -> Result<Vec<crate::sop::store::PersistedRun>, crate::sop::store::StoreError> {
+            self.inner.load_active_runs()
+        }
+        fn load_run(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::sop::store::PersistedRun>, crate::sop::store::StoreError>
+        {
+            self.inner.load_run(id)
+        }
+        fn last_terminal_completed_at(
+            &self,
+            s: &str,
+        ) -> Result<Option<String>, crate::sop::store::StoreError> {
+            self.inner.last_terminal_completed_at(s)
+        }
+        fn try_claim_run(
+            &self,
+            id: &str,
+            s: &str,
+            p: usize,
+            g: usize,
+        ) -> Result<Option<crate::sop::store::ClaimToken>, crate::sop::store::StoreError> {
+            self.inner.try_claim_run(id, s, p, g)
+        }
+        fn renew_claim_for_restore(
+            &self,
+            id: &str,
+            s: &str,
+        ) -> Result<crate::sop::store::ClaimToken, crate::sop::store::StoreError> {
+            self.inner.renew_claim_for_restore(id, s)
+        }
+        fn claim_counts(&self, s: &str) -> Result<(usize, usize), crate::sop::store::StoreError> {
+            self.inner.claim_counts(s)
+        }
+        fn heartbeat_claim(
+            &self,
+            t: &crate::sop::store::ClaimToken,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.heartbeat_claim(t)
+        }
+        fn release_claim(
+            &self,
+            t: &crate::sop::store::ClaimToken,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.release_claim(t)
+        }
+        fn expired_claims(
+            &self,
+            n: &str,
+        ) -> Result<Vec<crate::sop::store::ClaimToken>, crate::sop::store::StoreError> {
+            self.inner.expired_claims(n)
+        }
+        fn append_event(
+            &self,
+            e: &crate::sop::store::SopEventRecord,
+        ) -> Result<u64, crate::sop::store::StoreError> {
+            self.inner.append_event(e)
+        }
+        fn list_events(
+            &self,
+            _id: &str,
+        ) -> Result<Vec<crate::sop::store::SopEventRecord>, crate::sop::store::StoreError> {
+            Err(crate::sop::store::StoreError::Backend(
+                "injected list_events failure".into(),
+            ))
+        }
+        fn save_proposal(
+            &self,
+            p: &crate::sop::store::ProposalRecord,
+        ) -> Result<(), crate::sop::store::StoreError> {
+            self.inner.save_proposal(p)
+        }
+        fn load_proposal(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::sop::store::ProposalRecord>, crate::sop::store::StoreError>
+        {
+            self.inner.load_proposal(id)
+        }
+        fn list_proposals(
+            &self,
+            s: Option<crate::sop::store::ProposalStatus>,
+        ) -> Result<Vec<crate::sop::store::ProposalRecord>, crate::sop::store::StoreError> {
+            self.inner.list_proposals(s)
+        }
+        fn prune(
+            &self,
+            p: &crate::sop::store::RetentionPolicy,
+        ) -> Result<usize, crate::sop::store::StoreError> {
+            self.inner.prune(p)
+        }
+        fn health_check(&self) -> bool {
+            self.inner.health_check()
+        }
+        fn backend(&self) -> &'static str {
+            "list-events-fails-test"
+        }
+    }
+
+    #[test]
+    fn quorum_vote_read_failure_is_surfaced_not_swallowed() {
+        // After a vote is durably appended,
+        // counting distinct voters reads the gate ledger. If that read fails, the
+        // broker must SURFACE the error (leaving the gate waiting for a retry), not
+        // collapse to a bogus `PendingQuorum { have: 0 }` that swallows the failure.
+        let store = std::sync::Arc::new(ListEventsFailsStore {
             inner: crate::sop::store::InMemoryRunStore::new(),
         });
         let broker = Arc::new(ApprovalBroker::disabled());
         let sop_config = SopConfig {
-            approval: approval_cfg(&["alice", "bob"], 2),
+            approval: approval_cfg(&["ZeroClawOperator", "ZeroClawMaintainer"], 2),
             ..SopConfig::default()
         };
         let mut e = SopEngine::new(sop_config)
@@ -1336,6 +1921,51 @@ mod tests {
             SopRunAction::WaitApproval { run_id, .. } => run_id,
             other => panic!("expected WaitApproval, got {other:?}"),
         };
+
+        let res = e.resolve_via_broker(
+            &id,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+        );
+        assert!(
+            res.is_err(),
+            "a gate-ledger read failure during quorum counting must surface, not report PendingQuorum(0)"
+        );
+    }
+
+    #[test]
+    fn quorum_vote_refused_while_park_persist_is_pending() {
+        // Regression: a quorum vote is recorded before `resolve_gate` runs (only
+        // the final vote that reaches quorum calls it), so `resolve_gate`'s own
+        // `is_park_persist_pending` guard cannot protect the first N-1 votes. A
+        // vote recorded while the run's parked snapshot is not yet durable would
+        // durably outlive the run if it never manages to persist and is lost across
+        // a restart, leaving an orphaned `gate_vote` row for a run that no longer
+        // exists. The broker must refuse to record a vote at all while that
+        // pending-persist state holds.
+        let store = std::sync::Arc::new(FailingSaveStore {
+            inner: crate::sop::store::InMemoryRunStore::new(),
+            fail_save: std::sync::atomic::AtomicBool::new(true),
+            fail_atomic: std::sync::atomic::AtomicBool::new(false),
+        });
+        let broker = Arc::new(ApprovalBroker::disabled());
+        let sop_config = SopConfig {
+            approval: approval_cfg(&["ZeroClawOperator", "ZeroClawMaintainer"], 2),
+            ..SopConfig::default()
+        };
+        let mut e = SopEngine::new(sop_config)
+            .with_approval_broker(broker)
+            .with_store(store.clone());
+        e.set_sops_for_test(vec![policy_sop("prod")]);
+        let action = e.start_run("deploy", manual()).unwrap();
+        let id = match action {
+            SopRunAction::Pending { run_id, reason, .. }
+                if reason.contains("park snapshot not yet durably persisted") =>
+            {
+                run_id
+            }
+            other => panic!("expected park-persist backpressure, got {other:?}"),
+        };
         assert_eq!(
             store.claim_counts("deploy").unwrap(),
             (1, 1),
@@ -1345,14 +1975,14 @@ mod tests {
         let res = e.resolve_via_broker(
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         );
         assert!(
             res.is_err(),
             "the vote must be refused while the park's snapshot is not yet durably persisted"
         );
         assert_eq!(
-            e.distinct_gate_voters(&id, 1, 0),
+            e.gate_votes_for_step(&id, 1).unwrap().len(),
             0,
             "no gate_vote row must be recorded for a refused vote attempt"
         );
@@ -1369,15 +1999,18 @@ mod tests {
 
     #[test]
     fn quorum_vote_refused_from_a_principal_approval_mode_rejects() {
-        // `resolve_gate` enforces `approval_mode`, but a quorum vote is recorded
-        // before `resolve_gate` runs; only the final vote that reaches quorum ever
-        // calls it. A principal that `approval_mode` would reject must never record
-        // even a partial vote toward a quorum it cannot clear.
+        // Regression: `resolve_gate` enforces `approval_mode` (for example,
+        // `OutOfBandRequired` rejects the agent principal), but a quorum vote is
+        // recorded before `resolve_gate` runs - only the final vote that reaches
+        // quorum ever calls it. Without this guard, an agent principal under
+        // `OutOfBandRequired` (or an out-of-band principal under `AgentTool`) could
+        // durably record a vote toward a quorum it could never actually clear, even
+        // though `approval_mode` says it must not participate at all.
         let broker = Arc::new(ApprovalBroker::disabled());
         // "bot" is a bare (any-source) group member, so membership passes; the mode
         // check must be what blocks this, not group authorization.
         let sop_config = SopConfig {
-            approval: approval_cfg(&["bot", "alice"], 2),
+            approval: approval_cfg(&["bot", "ZeroClawOperator"], 2),
             approval_mode: zeroclaw_config::schema::ApprovalMode::OutOfBandRequired,
             ..SopConfig::default()
         };
@@ -1404,7 +2037,7 @@ mod tests {
             "the agent principal must be rejected under OutOfBandRequired, got {out:?}"
         );
         assert_eq!(
-            e.distinct_gate_voters(&id, 1, 0),
+            e.gate_votes_for_step(&id, 1).unwrap().len(),
             0,
             "no gate_vote row must be recorded for a principal approval_mode rejects"
         );
@@ -1418,7 +2051,7 @@ mod tests {
             .resolve_via_broker(
                 &id,
                 ApprovalDecision::Approve,
-                ApprovalPrincipal::cli(Some("alice".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             )
             .unwrap();
         assert!(
@@ -1451,9 +2084,11 @@ mod tests {
 
     #[test]
     fn empty_required_group_is_treated_as_no_membership_gate() {
-        // The config contract says `required_group`'s `None` and empty values both
-        // mean no membership gate. A blank `required_group = ""` must not gate every
-        // principal against a group nobody could ever join.
+        // Regression: the config contract says `required_group`'s `None` and empty
+        // forms both mean no membership gate, but the broker only special-cased
+        // `None`. A blank `required_group = ""` matched `Some("")` and gated every
+        // principal against a group nobody could ever be a member of, permanently
+        // stuck. An empty string must behave exactly like `None`.
         let mut policies = HashMap::new();
         policies.insert(
             "prod".to_string(),
@@ -1497,9 +2132,11 @@ mod tests {
 
     #[test]
     fn escalation_route_empty_string_is_treated_as_none() {
-        // The config contract says `escalation_route`'s `None` and empty values both
-        // re-surface to the same route. A blank string must not produce an escalation
-        // notice to a nonsensical empty route name.
+        // Regression: the config contract says `escalation_route`'s `None` and
+        // empty forms both re-surface to the same route, but
+        // `ApprovalBroker::escalation_route` returned `Some("")` verbatim. Timeout
+        // delivery would then send an escalation notice to a nonsensical empty
+        // route name.
         let mut policies = HashMap::new();
         policies.insert(
             "prod".to_string(),
@@ -1627,12 +2264,13 @@ mod tests {
 
     #[test]
     fn member_deny_cancels_without_quorum() {
-        let (mut e, id) = engine_with_broker(approval_cfg(&["alice", "bob"], 2));
+        let (mut e, id) =
+            engine_with_broker(approval_cfg(&["ZeroClawOperator", "ZeroClawMaintainer"], 2));
         let out = e
             .resolve_via_broker(
                 &id,
                 ApprovalDecision::Deny { reason: None },
-                ApprovalPrincipal::cli(Some("alice".into())),
+                ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             )
             .unwrap();
         assert!(matches!(
@@ -1739,7 +2377,7 @@ mod tests {
         // rename cannot silently break group/policy resolution.
         let toml = r#"
 [groups.release]
-members = ["http:abc123", "cli:zeroclaw_operator"]
+members = ["http:abc123", "cli:test_user"]
 
 [policies.prod]
 required_group = "release"
@@ -1751,10 +2389,7 @@ escalation_route = "discord.oncall:444555666"
         let group = cfg.groups.get("release").expect("release group");
         assert_eq!(
             group.members,
-            vec![
-                "http:abc123".to_string(),
-                "cli:zeroclaw_operator".to_string(),
-            ]
+            vec!["http:abc123".to_string(), "cli:test_user".to_string()]
         );
         let policy = cfg.policies.get("prod").expect("prod policy");
         assert_eq!(policy.required_group.as_deref(), Some("release"));

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use zeroclaw_api::channel::{Channel, SendMessage};
 
-use super::broker::{ApprovalRouteAdapter, GateNotice};
+use super::broker::{ApprovalNoticeKind, ApprovalRouteAdapter, GateNotice};
 
 /// A route adapter that delivers approval notices to configured channels.
 ///
@@ -37,6 +37,23 @@ use super::broker::{ApprovalRouteAdapter, GateNotice};
 pub struct ChannelRouteAdapter {
     channels: HashMap<String, Arc<dyn Channel>>,
     handle: Handle,
+}
+
+/// A route configuration problem reported at daemon startup before a parked gate
+/// would otherwise discover it during delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalRouteIssue {
+    Malformed {
+        policy: String,
+        route_kind: &'static str,
+        route: String,
+    },
+    UndeliverableChannel {
+        policy: String,
+        route_kind: &'static str,
+        route: String,
+        channel_key: String,
+    },
 }
 
 impl ChannelRouteAdapter {
@@ -60,6 +77,49 @@ pub fn parse_approval_route(route: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((channel_key, recipient))
+}
+
+/// The configured approval routes (`request_route` + `escalation_route`) whose channel
+/// key is NOT among `channel_keys` - the channels the route adapter can actually deliver
+/// to (present in its map AND `supports_outbound_send`). A route names an undeliverable
+/// channel when it is absent from the map (e.g. an AMQP SOP-dispatch channel that needs
+/// runtime SOP handles the adapter lacks) OR present but inbound-only (its `send` is a
+/// no-op). The daemon logs these at STARTUP so the drift between "configured route" and
+/// "deliverable channel" surfaces at boot, not silently on the first parked gate.
+/// A route must have non-empty `channel:recipient` halves; malformed values are also
+/// surfaced at startup. Returns one [`ApprovalRouteIssue`] per invalid route.
+pub fn unresolvable_approval_routes(
+    approval: &zeroclaw_config::schema::SopApprovalConfig,
+    channel_keys: &std::collections::HashSet<String>,
+) -> Vec<ApprovalRouteIssue> {
+    let mut unresolvable = Vec::new();
+    for (policy_name, policy) in &approval.policies {
+        for (kind, route) in [
+            ("request_route", policy.request_route.as_deref()),
+            ("escalation_route", policy.escalation_route.as_deref()),
+        ] {
+            let Some(route) = route.filter(|r| !r.is_empty()) else {
+                continue;
+            };
+            let Some((channel_key, _)) = parse_approval_route(route) else {
+                unresolvable.push(ApprovalRouteIssue::Malformed {
+                    policy: policy_name.clone(),
+                    route_kind: kind,
+                    route: route.to_string(),
+                });
+                continue;
+            };
+            if !channel_keys.contains(channel_key) {
+                unresolvable.push(ApprovalRouteIssue::UndeliverableChannel {
+                    policy: policy_name.clone(),
+                    route_kind: kind,
+                    route: route.to_string(),
+                    channel_key: channel_key.to_string(),
+                });
+            }
+        }
+    }
+    unresolvable
 }
 
 /// Resolve `{{path.to.field}}` placeholders against the notice context: pure
@@ -158,7 +218,7 @@ fn reply_instructions(reference: &str, run_id: &str) -> String {
 /// context summary), WITHOUT the how-to-answer instructions. This is also what
 /// a finalized prompt keeps showing (the outcome line appended under it), so
 /// the record of what was approved survives resolution in place.
-fn render_context(notice: &GateNotice<'_>) -> String {
+fn render_context(kind: ApprovalNoticeKind, notice: &GateNotice<'_>) -> String {
     let what = match notice.gate_prompt {
         // The `- prompt:` bullet is a single line; a literal `\n` in it is the
         // author's line break.
@@ -166,13 +226,17 @@ fn render_context(notice: &GateNotice<'_>) -> String {
         None => summarize_context(notice.context),
     };
     let (run_id, sop_name, step) = (notice.run_id, notice.sop_name, notice.step);
-    let header = if notice.revision == 0 {
-        format!("SOP approval needed: '{sop_name}' run `{run_id}` (step {step}).")
-    } else {
-        format!(
+    let header = match kind {
+        ApprovalNoticeKind::Request if notice.revision == 0 => {
+            format!("SOP approval needed: '{sop_name}' run `{run_id}` (step {step}).")
+        }
+        ApprovalNoticeKind::Request => format!(
             "SOP approval needed: '{sop_name}' run `{run_id}` (step {step}, revision {}).",
             notice.revision
-        )
+        ),
+        ApprovalNoticeKind::Escalation => format!(
+            "SOP approval escalation: '{sop_name}' run `{run_id}` is still waiting at step {step}; its approval timeout elapsed."
+        ),
     };
     if what.trim().is_empty() {
         header
@@ -184,8 +248,8 @@ fn render_context(notice: &GateNotice<'_>) -> String {
 /// Render the approval-request notice body: the context plus how to answer.
 /// The `approve <reference>` text reply resolves the gate via the
 /// orchestrator's gate intercept; CLI / gateway keep working.
-fn render_notice(notice: &GateNotice<'_>) -> String {
-    let context = render_context(notice);
+fn render_notice(kind: ApprovalNoticeKind, notice: &GateNotice<'_>) -> String {
+    let context = render_context(kind, notice);
     let instructions = reply_instructions(&gate_reference(notice), notice.run_id);
     format!("{context}\n\n{instructions}")
 }
@@ -195,12 +259,15 @@ fn render_notice(notice: &GateNotice<'_>) -> String {
 /// or forward of the prompt is still actionable. Edit/Revise are input-bearing
 /// choices: channels with a native form (Discord modal) render them; channels
 /// without simply omit them, and approve/deny stay universally answerable.
-fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelGatePrompt {
+fn build_gate_prompt(
+    kind: ApprovalNoticeKind,
+    notice: &GateNotice<'_>,
+) -> zeroclaw_api::channel::ChannelGatePrompt {
     use zeroclaw_api::channel::{
         ChannelGatePrompt, GateChoice, GateChoiceEmphasis, GateChoiceInput, GateChoiceKind,
     };
     // Discord embeds cap descriptions at 4096 chars; stay comfortably under.
-    let mut description = render_notice(notice);
+    let mut description = render_notice(kind, notice);
     if description.chars().count() > 3500 {
         description = description.chars().take(3500).collect::<String>() + "\u{2026}";
     }
@@ -256,13 +323,20 @@ fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelG
     // actionable) reply instructions; the channel appends the outcome line.
     // Capped a little tighter than the live description so the appended
     // outcome still fits Discord's 4096-char embed limit.
-    let mut resolved_description = render_context(notice);
+    let mut resolved_description = render_context(kind, notice);
     if resolved_description.chars().count() > 3400 {
         resolved_description =
             resolved_description.chars().take(3400).collect::<String>() + "\u{2026}";
     }
     ChannelGatePrompt {
-        title: format!("SOP approval needed: {}", notice.sop_name),
+        title: match kind {
+            ApprovalNoticeKind::Request => {
+                format!("SOP approval needed: {}", notice.sop_name)
+            }
+            ApprovalNoticeKind::Escalation => {
+                format!("SOP approval escalation: {}", notice.sop_name)
+            }
+        },
         description,
         reference: gate_reference(notice),
         choices,
@@ -273,20 +347,29 @@ fn build_gate_prompt(notice: &GateNotice<'_>) -> zeroclaw_api::channel::ChannelG
 /// Build the (channel_key, message) delivery pair from a route + run identity, or an
 /// error describing why it can't be built. PURE (no I/O, no spawn) so the parse +
 /// message-shaping is unit-testable without a runtime.
-fn build_delivery(route: &str, notice: &GateNotice<'_>) -> anyhow::Result<(String, SendMessage)> {
+fn build_delivery(
+    kind: ApprovalNoticeKind,
+    route: &str,
+    notice: &GateNotice<'_>,
+) -> anyhow::Result<(String, SendMessage)> {
     let Some((channel_key, recipient)) = parse_approval_route(route) else {
         anyhow::bail!(
             "approval route '{route}' is not 'channel:recipient' (e.g. \
              'discord.ops:123456789') - both halves must be non-empty"
         );
     };
-    let msg = SendMessage::new(render_notice(notice), recipient).suppress_voice();
+    let msg = SendMessage::new(render_notice(kind, notice), recipient).suppress_voice();
     Ok((channel_key.to_string(), msg))
 }
 
 impl ApprovalRouteAdapter for ChannelRouteAdapter {
-    fn deliver(&self, route: &str, notice: &GateNotice<'_>) -> anyhow::Result<()> {
-        let (channel_key, msg) = build_delivery(route, notice)?;
+    fn deliver(
+        &self,
+        kind: ApprovalNoticeKind,
+        route: &str,
+        notice: &GateNotice<'_>,
+    ) -> anyhow::Result<()> {
+        let (channel_key, msg) = build_delivery(kind, route, notice)?;
         let Some(channel) = self.channels.get(&channel_key).cloned() else {
             // A misconfigured route (names a channel that isn't configured) is a real
             // operator error worth surfacing: return Err so the broker logs it. It
@@ -296,12 +379,22 @@ impl ApprovalRouteAdapter for ChannelRouteAdapter {
                  (route '{route}')"
             );
         };
+        // An inbound-only channel's `send` is a no-op that returns `Ok`, so spawning it
+        // would report success without delivering anything. Refuse and surface it (the
+        // broker logs the Err) rather than silently dropping the notice.
+        if !channel.supports_outbound_send() {
+            anyhow::bail!(
+                "approval route channel '{channel_key}' does not support outbound \
+                 delivery (it is inbound-only); its approval notice cannot be sent \
+                 (route '{route}')"
+            );
+        }
         // Fire-and-forget: hand the async send to the runtime and return. The gate is
         // never blocked on channel I/O; a send failure is logged in the task.
         // Native gate prompt first (buttons / keyboards, answered through the
         // channel's inbound path); channels without one fall back to the text
         // notice, whose `approve <run_id>` reply the orchestrator also resolves.
-        let prompt = build_gate_prompt(notice);
+        let prompt = build_gate_prompt(kind, notice);
         let recipient = msg.recipient.clone();
         let run_id = notice.run_id.to_string();
         let route = route.to_string();
@@ -372,7 +465,7 @@ mod tests {
             edit_field: None,
             can_revise: false,
         };
-        let text = render_notice(&authored);
+        let text = render_notice(ApprovalNoticeKind::Request, &authored);
         assert!(text.contains("Review o/r#9 please"));
         assert!(text.contains("approve run-9"));
 
@@ -380,7 +473,7 @@ mod tests {
             gate_prompt: None,
             ..authored
         };
-        let text = render_notice(&auto);
+        let text = render_notice(ApprovalNoticeKind::Request, &auto);
         assert!(
             text.contains("o/r#9"),
             "auto summary carries repo#number: {text}"
@@ -403,7 +496,7 @@ mod tests {
             edit_field: Some("body"),
             can_revise: true,
         };
-        let prompt = build_gate_prompt(&notice);
+        let prompt = build_gate_prompt(ApprovalNoticeKind::Request, &notice);
         assert_eq!(
             prompt.reference, "run-42",
             "revision 0 keeps a bare reference"
@@ -426,7 +519,7 @@ mod tests {
             revision: 2,
             ..notice
         };
-        let prompt = build_gate_prompt(&revised);
+        let prompt = build_gate_prompt(ApprovalNoticeKind::Request, &revised);
         assert_eq!(prompt.reference, "run-42#2");
         assert!(
             prompt.description.contains("approve run-42#2"),
@@ -451,7 +544,7 @@ mod tests {
             can_revise: false,
             ..notice
         };
-        let ids: Vec<String> = build_gate_prompt(&plain)
+        let ids: Vec<String> = build_gate_prompt(ApprovalNoticeKind::Request, &plain)
             .choices
             .iter()
             .map(|c| c.id.clone())
@@ -491,8 +584,72 @@ mod tests {
     }
 
     #[test]
+    fn unresolvable_routes_flag_malformed_and_undeliverable_routes() {
+        // Startup validation for the channel-map drift: a route naming a channel the
+        // send-only adapter lacks is surfaced; a route naming a present channel is not;
+        // a malformed route is surfaced before a gate can discover it at delivery time.
+        use std::collections::{HashMap, HashSet};
+        use zeroclaw_config::schema::{ApprovalPolicyConfig, SopApprovalConfig};
+
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                // request_route names a channel the adapter cannot construct (an AMQP
+                // SOP-dispatch channel); escalation_route names a present channel.
+                request_route: Some("amqp.sopq:runs".into()),
+                escalation_route: Some("discord.ops:123".into()),
+            },
+        );
+        // A malformed route is also reported at startup, before a gate parks.
+        policies.insert(
+            "p2".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                request_route: Some("discord.ops".into()),
+                escalation_route: None,
+            },
+        );
+        let approval = SopApprovalConfig {
+            groups: HashMap::new(),
+            policies,
+        };
+        let keys: HashSet<String> = ["discord.ops".to_string()].into_iter().collect();
+
+        let un = unresolvable_approval_routes(&approval, &keys);
+        assert_eq!(
+            un.len(),
+            2,
+            "the absent channel and malformed route are both flagged, got {un:?}"
+        );
+        assert!(un.iter().any(|issue| {
+            matches!(issue, ApprovalRouteIssue::UndeliverableChannel {
+                policy, route_kind: "request_route", route, channel_key
+            } if policy == "prod" && route == "amqp.sopq:runs" && channel_key == "amqp.sopq")
+        }));
+        assert!(un.iter().any(|issue| {
+            matches!(issue, ApprovalRouteIssue::Malformed {
+                policy, route_kind: "request_route", route
+            } if policy == "p2" && route == "discord.ops")
+        }));
+
+        // With NO channels at all, every configured route is reported. The daemon runs
+        // this before its empty-channel-map early return so the drift is surfaced at boot.
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(
+            unresolvable_approval_routes(&approval, &empty).len(),
+            3,
+            "with no deliverable channels, every configured route is flagged"
+        );
+    }
+
+    #[test]
     fn build_delivery_shapes_the_message_and_targets_the_recipient() {
         let (key, msg) = build_delivery(
+            ApprovalNoticeKind::Request,
             "discord.ops:98765",
             &GateNotice {
                 run_id: "run-7",
@@ -515,9 +672,30 @@ mod tests {
     }
 
     #[test]
+    fn render_notice_distinguishes_an_escalation_from_the_initial_request() {
+        let notice = GateNotice {
+            run_id: "run-7",
+            sop_name: "triage",
+            step: 3,
+            context: &serde_json::Value::Null,
+            gate_prompt: None,
+            revision: 0,
+            edit_field: None,
+            can_revise: false,
+        };
+        let request = render_notice(ApprovalNoticeKind::Request, &notice);
+        let escalation = render_notice(ApprovalNoticeKind::Escalation, &notice);
+        assert!(request.contains("approval needed"));
+        assert!(escalation.contains("approval escalation"));
+        assert!(escalation.contains("timeout elapsed"));
+        assert_ne!(request, escalation);
+    }
+
+    #[test]
     fn build_delivery_errors_on_a_route_without_a_recipient() {
         assert!(
             build_delivery(
+                ApprovalNoticeKind::Request,
                 "discord.ops",
                 &GateNotice {
                     run_id: "r",
@@ -567,6 +745,66 @@ mod tests {
         }
     }
 
+    /// An inbound-only channel whose `send` no-ops and returns `Ok` (like AMQP): it must
+    /// be refused as a route target, not mistaken for a successful delivery.
+    struct InboundOnlyChannel;
+    impl Attributable for InboundOnlyChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::Discord)
+        }
+        fn alias(&self) -> &str {
+            "inbound"
+        }
+    }
+    #[async_trait]
+    impl Channel for InboundOnlyChannel {
+        fn name(&self) -> &str {
+            "inbound-only"
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn supports_outbound_send(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_errors_for_an_inbound_only_channel() {
+        // A present but inbound-only channel (no-op send) must be REFUSED at deliver -
+        // returning Err so the broker logs a delivery failure - rather than spawning a
+        // send that silently succeeds without delivering the notice.
+        let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        channels.insert("amqp.q".to_string(), Arc::new(InboundOnlyChannel));
+        let adapter = ChannelRouteAdapter::new(channels, Handle::current());
+        let err = adapter
+            .deliver(
+                ApprovalNoticeKind::Request,
+                "amqp.q:runs",
+                &GateNotice {
+                    run_id: "run-1",
+                    sop_name: "triage",
+                    step: 1,
+                    context: &serde_json::Value::Null,
+                    gate_prompt: None,
+                    revision: 0,
+                    edit_field: None,
+                    can_revise: false,
+                },
+            )
+            .expect_err("an inbound-only channel cannot deliver");
+        assert!(
+            err.to_string().contains("does not support outbound"),
+            "the refusal must name the outbound-delivery gap, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn deliver_sends_the_notice_to_the_named_channel() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -577,6 +815,7 @@ mod tests {
 
         adapter
             .deliver(
+                ApprovalNoticeKind::Request,
                 "discord.ops:98765",
                 &GateNotice {
                     run_id: "run-7",
@@ -612,6 +851,7 @@ mod tests {
         let adapter = ChannelRouteAdapter::new(HashMap::new(), Handle::current());
         let err = adapter
             .deliver(
+                ApprovalNoticeKind::Request,
                 "discord.ops:98765",
                 &GateNotice {
                     run_id: "run-7",
@@ -634,6 +874,7 @@ mod tests {
         assert!(
             adapter
                 .deliver(
+                    ApprovalNoticeKind::Request,
                     "discord.ops",
                     &GateNotice {
                         run_id: "run-7",

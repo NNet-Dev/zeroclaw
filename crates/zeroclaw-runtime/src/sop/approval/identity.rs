@@ -12,9 +12,9 @@
 //! another resolver alongside the config-backed one (a junction of identity
 //! sources); it does not replace channel-provided identities. That resolver is where
 //! canonical-identity LINKING belongs: one person's several channel identities (e.g.
-//! `github:zeroclaw_user`, `discord:559...`, `email:user@example.com`) map to a single canonical
-//! user, so any of them resolves to the same groups. Until then, the config-backed
-//! resolver can grant a group to each channel identity directly.
+//! `github:octocat`, `discord:123...`, `email:user@example.invalid`) map to a
+//! single canonical user, so any of them resolves to the same groups. Until then,
+//! the config-backed resolver can grant a group to each channel identity directly.
 
 use zeroclaw_config::schema::SopApprovalConfig;
 
@@ -119,34 +119,34 @@ mod tests {
 
     #[test]
     fn bare_member_matches_any_source() {
-        let cfg = cfg_with(&[("release", &["alice"])]);
+        let cfg = cfg_with(&[("release", &["ZeroClawOperator"])]);
         let r = LocalConfigApprovalIdentityResolver;
         assert!(r.is_member(
             &cfg,
-            &ApprovalPrincipal::cli(Some("alice".into())),
+            &ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             "release"
         ));
         assert!(r.is_member(
             &cfg,
-            &ApprovalPrincipal::http(Some("alice".into())),
+            &ApprovalPrincipal::http(Some("ZeroClawOperator".into())),
             "release"
         ));
     }
 
     #[test]
     fn source_qualified_member_scopes_to_one_transport() {
-        // `http:alice` grants to the HTTP alice but NOT the CLI alice - so a channel
+        // `http:ZeroClawOperator` grants to the HTTP ZeroClawOperator but NOT the CLI ZeroClawOperator - so a channel
         // identity does not collide with a same-named identity on another source.
-        let cfg = cfg_with(&[("release", &["http:alice"])]);
+        let cfg = cfg_with(&[("release", &["http:ZeroClawOperator"])]);
         let r = LocalConfigApprovalIdentityResolver;
         assert!(r.is_member(
             &cfg,
-            &ApprovalPrincipal::http(Some("alice".into())),
+            &ApprovalPrincipal::http(Some("ZeroClawOperator".into())),
             "release"
         ));
         assert!(!r.is_member(
             &cfg,
-            &ApprovalPrincipal::cli(Some("alice".into())),
+            &ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             "release"
         ));
     }
@@ -179,19 +179,25 @@ mod tests {
 
     #[test]
     fn resolves_multiple_groups() {
-        let cfg = cfg_with(&[("release", &["alice"]), ("sre", &["alice"])]);
+        let cfg = cfg_with(&[
+            ("release", &["ZeroClawOperator"]),
+            ("sre", &["ZeroClawOperator"]),
+        ]);
         let r = LocalConfigApprovalIdentityResolver;
-        let mut groups = r.groups_for(&cfg, &ApprovalPrincipal::cli(Some("alice".into())));
+        let mut groups = r.groups_for(
+            &cfg,
+            &ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+        );
         groups.sort();
         assert_eq!(groups, vec!["release".to_string(), "sre".to_string()]);
     }
 
     #[test]
     fn unknown_or_identityless_principal_has_no_groups() {
-        let cfg = cfg_with(&[("release", &["alice"])]);
+        let cfg = cfg_with(&[("release", &["ZeroClawOperator"])]);
         let r = LocalConfigApprovalIdentityResolver;
         assert!(
-            r.groups_for(&cfg, &ApprovalPrincipal::cli(Some("mallory".into())))
+            r.groups_for(&cfg, &ApprovalPrincipal::cli(Some("ZeroClawAgent".into())))
                 .is_empty()
         );
         assert!(r.groups_for(&cfg, &ApprovalPrincipal::system()).is_empty());

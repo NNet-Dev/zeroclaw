@@ -163,8 +163,15 @@ impl Tool for SopApproveTool {
                     "Approval failed: run {run_id} is not waiting for approval."
                 )),
             }),
-            // EPIC G broker outcomes: quorum not yet met, or the agent is not an
-            // authorized member of the policy's required group.
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::DeferredAtCapacity)) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Approval could not resume run {run_id}: execution slots are full. \
+                     The gate stays waiting and re-resolvable; retry once a slot frees."
+                )),
+            }),
+            // A quorum can record a valid vote without clearing the gate yet.
             Ok(BrokerOutcome::PendingQuorum { have, need }) => Ok(ToolResult {
                 success: true,
                 output: format!(
@@ -176,7 +183,7 @@ impl Tool for SopApproveTool {
             }),
             Ok(BrokerOutcome::NotAuthorized { required_group }) => Ok(ToolResult {
                 success: false,
-                output: String::new().into(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Not authorized: approving this step requires membership in the \
                      '{required_group}' group."
@@ -186,10 +193,18 @@ impl Tool for SopApproveTool {
             // the gate is left waiting rather than cleared.
             Ok(BrokerOutcome::PolicyMissing { name }) => Ok(ToolResult {
                 success: false,
-                output: String::new().into(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Approval failed: step names approval policy '{name}', which is not \
                      defined in [sop.approval].policies; the gate is left waiting."
+                )),
+            }),
+            Ok(BrokerOutcome::PolicyUnavailable { reason }) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "sop-approval-policy-unavailable",
+                    &[("reason", reason.as_str())],
                 )),
             }),
             Err(e) => Ok(ToolResult {

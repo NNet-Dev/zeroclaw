@@ -21,9 +21,10 @@ pub mod resolve;
 pub mod timeout;
 
 pub use broker::{
-    ApprovalBroker, ApprovalRouteAdapter, BrokerOutcome, GateNotice, NoopRouteAdapter,
+    ApprovalBroker, ApprovalNoticeKind, ApprovalRouteAdapter, BrokerOutcome, GateNotice,
+    NoopRouteAdapter,
 };
-pub use channel_route::ChannelRouteAdapter;
+pub use channel_route::{ApprovalRouteIssue, ChannelRouteAdapter, unresolvable_approval_routes};
 pub use decision::{ApprovalDecision, ResolveOutcome};
 pub use identity::{ApprovalIdentityResolver, LocalConfigApprovalIdentityResolver};
 pub use ledger::{GateEventKind, GateLedgerEntry};

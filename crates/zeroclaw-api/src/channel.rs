@@ -86,6 +86,19 @@ pub enum ChannelApprovalResponse {
     DenyWithEdit { replacement: String },
 }
 
+/// An approval response together with the back-channel that produced it.
+///
+/// When a channel fans one approval request out to several back-channels,
+/// `decided_by` names the back-channel that actually answered, so the audit
+/// trail attributes the decision to the deciding surface. The attribution
+/// travels with the returned decision, so concurrent approvals on the same
+/// channel instance cannot cross-wire it. Single channels leave it `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributedApprovalResponse {
+    pub response: ChannelApprovalResponse,
+    pub decided_by: Option<String>,
+}
+
 /// A long-lived, channel-agnostic gate prompt (e.g. a parked SOP approval):
 /// rendered natively per channel (Discord embed + buttons, Telegram inline
 /// keyboard, ...), answered through the channel's normal inbound path — a
@@ -198,19 +211,6 @@ pub enum GateChoiceEmphasis {
     Negative,
     /// No particular emphasis.
     Neutral,
-}
-
-/// An approval response together with the back-channel that produced it.
-///
-/// When a channel fans one approval request out to several back-channels,
-/// `decided_by` names the back-channel that actually answered, so the audit
-/// trail attributes the decision to the deciding surface. The attribution
-/// travels with the returned decision, so concurrent approvals on the same
-/// channel instance cannot cross-wire it. Single channels leave it `None`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttributedApprovalResponse {
-    pub response: ChannelApprovalResponse,
-    pub decided_by: Option<String>,
 }
 
 /// Conversation history scope for an inbound channel message.
@@ -761,6 +761,24 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Like [`Channel::request_approval`], but also reports which
+    /// back-channel produced the decision when this channel fans the request
+    /// out. Default delegates to [`Channel::request_approval`] with
+    /// `decided_by: None`; only a fan-out bridge needs to override.
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        Ok(self
+            .request_approval(recipient, request)
+            .await?
+            .map(|response| AttributedApprovalResponse {
+                response,
+                decided_by: None,
+            }))
+    }
+
     /// Present a long-lived, out-of-band gate prompt (e.g. a parked SOP
     /// approval) on this channel, rendered natively — an embed with one button
     /// per choice on Discord, an inline keyboard on Telegram, and so on.
@@ -794,43 +812,19 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(false)
     }
 
-    /// The name of the back-channel that produced the most recent
-    /// [`Channel::request_approval`] decision, when this channel fans a single
-    /// request out to several registered back-channels (the agent's approval
-    /// bridge does this so an ACP editor and a WebSocket dashboard can both
-    /// answer). Ordinary single channels return `None` — their own
-    /// [`Channel::name`] already identifies the deciding surface — so the
-    /// approval audit trail can record the channel that actually decided
-    /// instead of the turn loop's static channel name.
-    fn last_decision_channel(&self) -> Option<String> {
-        None
-    }
-
-    /// Like [`Channel::request_approval`], but also reports which back-channel
-    /// produced the decision when this channel fans the request out to several
-    /// registered back-channels (the agent's approval bridge does this so an
-    /// ACP editor and a WebSocket dashboard can both answer). The attribution
-    /// travels with the returned decision, so concurrent approvals on the same
-    /// channel instance cannot cross-wire it.
+    /// Ask the user a multiple-choice question and return the chosen option's text.
     ///
-    /// The default implementation delegates to [`Channel::request_approval`]
-    /// and reports no specific back-channel (`decided_by: None`), which keeps
-    /// the deciding surface as the channel's own [`Channel::name`]. Only a
-    /// fan-out bridge needs to override this.
-    async fn request_approval_attributed(
-        &self,
-        recipient: &str,
-        request: &ChannelApprovalRequest,
-    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
-        Ok(self
-            .request_approval(recipient, request)
-            .await?
-            .map(|response| AttributedApprovalResponse {
-                response,
-                decided_by: None,
-            }))
-    }
-
+    /// Returns `Ok(Some(answer))` if the channel handled the question natively
+    /// (e.g. ACP `elicitation/create` with a single-select enum schema, or
+    /// the legacy `session/request_permission` fallback for older ACP clients;
+    /// Telegram inline keyboard; etc.). Returns `Ok(None)` to signal the
+    /// caller should fall back to the generic `send` + `listen` flow.
+    /// Default impl returns `None`.
+    ///
+    /// Free-form (no-choices) questions are not modeled by this method.
+    /// Multiple-choice support landed via ACP `elicitation/create` (see
+    /// the ACP elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>);
+    /// free-form text is tracked under that spec's Phase 2.
     async fn request_choice(
         &self,
         _question: &str,

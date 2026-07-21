@@ -2804,8 +2804,8 @@ impl Channel for DiscordChannel {
                                         // after the fail-closed gate above, so an
                                         // unauthorized click never drains an
                                         // entry. Absent/expired/replayed (incl. a
-                                        // forged-but-zc1 id we never registered)
-                                        // → refuse, don't act.
+                                         // forged-but-zc1 id we never registered)
+                                         // → refuse, don't act.
                                         let intent = pending_components.lock().take(&custom_id_raw);
                                         let prompt = match intent {
                                             Some(ComponentIntent::Approval { token, decision }) => {

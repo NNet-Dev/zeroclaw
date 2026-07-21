@@ -1,13 +1,4 @@
 //! Fail-closed SOP approval-timeout behavior (EPIC C, C2). [SEC-FLIP]
-//!
-//! The default `Escalate` re-surfaces a timed-out gate to the out-of-band approver
-//! and NEVER self-approves. `Cancel` terminates the run (fail-safe). `AutoApprove`
-//! is the ONLY path to the legacy fail-open behavior and is opt-in.
-//!
-//! NOTE: this behavior is correct but DORMANT until something drives
-//! `check_approval_timeouts` on a tick (EPIC A's `sop_tick`, not yet in master);
-//! today only tests call it. Landing the fail-closed default now means the tick
-//! is safe to turn on the moment it exists.
 
 use super::decision::{ApprovalDecision, ResolveOutcome};
 use super::ledger::{GateEventKind, GateLedgerEntry};
@@ -31,12 +22,11 @@ pub fn apply_timeout_action(
         // Audit-first: don't re-surface unless the escalation row is durably
         // recorded; on a store failure skip this run (it retries next tick).
         ApprovalTimeoutAction::Escalate => {
-            let entry = system_entry(engine, run_id, GateEventKind::Escalated);
-            if let Err(e) = engine.record_gate_event(entry) {
+            let event = system_entry(engine, run_id, GateEventKind::Escalated).into_event_record();
+            if let Err(e) = engine.restamp_waiting_with_gate_event(run_id, &event) {
                 log_audit_skip(run_id, "escalate", &e);
                 return None;
             }
-            engine.restamp_waiting(run_id);
             // EPIC G (Phase 10): if this step's approval policy names a distinct
             // second route, deliver an escalation notice to it (best-effort; the gate
             // stays open regardless). With no policy/route this is a no-op, so the
@@ -47,19 +37,25 @@ pub fn apply_timeout_action(
         // Fail-safe terminal: cancel the run. Audit-first: do not cancel unless
         // the timeout row is durably recorded; on a store failure skip (retries).
         ApprovalTimeoutAction::Cancel => {
-            let entry = system_entry(engine, run_id, GateEventKind::TimedOut);
-            if let Err(e) = engine.record_gate_event(entry) {
-                log_audit_skip(run_id, "cancel", &e);
-                return None;
-            }
-            match engine.finish_run_checked(
+            let event = system_entry(engine, run_id, GateEventKind::TimedOut).into_event_record();
+            match engine.finish_run_with_gate_event(
                 run_id,
                 SopRunStatus::Cancelled,
                 Some("approval timeout (fail-closed cancel)".to_string()),
+                &event,
             ) {
                 Ok(action) => Some(action),
                 Err(e) => {
-                    log_terminal_skip(run_id, "cancel", &e);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
+                        "SOP timeout: terminal persistence failed; gate left for retry"
+                    );
                     None
                 }
             }
@@ -101,18 +97,6 @@ fn log_audit_skip(run_id: &str, action: &str, e: &impl std::fmt::Display) {
     );
 }
 
-fn log_terminal_skip(run_id: &str, action: &str, e: &impl std::fmt::Display) {
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "run_id": run_id, "action": action, "error": e.to_string()
-            })),
-        "SOP timeout: skipped, terminal persistence failed; gate left for retry"
-    );
-}
-
 /// EPIC G (Phase 10): deliver a timeout escalation notice to the policy's explicit
 /// escalation route, or re-surface it to the request route when no distinct route
 /// is configured. Best-effort - a missing policy, missing route, or delivery error
@@ -128,6 +112,13 @@ fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
     };
     let broker = engine.approval_broker();
     if let Some(route) = broker.escalation_delivery_route(engine.approval_config(), &policy_name) {
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %run_id,
+            sop_name = %sop_name,
+        );
+        let _guard = span.enter();
         broker.deliver_escalation(
             &route,
             &super::GateNotice {
