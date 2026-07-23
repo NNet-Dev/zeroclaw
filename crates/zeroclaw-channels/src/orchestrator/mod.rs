@@ -451,7 +451,7 @@ struct ChannelRuntimeContext {
     prompt_config: Arc<zeroclaw_config::schema::Config>,
     memory: Arc<dyn Memory>,
     memory_strategy: Arc<dyn MemoryStrategy>,
-    tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry>,
     observer: Arc<dyn Observer>,
     system_prompt: Arc<String>,
     model: Arc<String>,
@@ -10164,7 +10164,7 @@ fn build_owner_by_channel_key(
 /// The per-agent tool registry, prompt sections, and channel/deferred-MCP handles
 /// `start_channels` needs from [`assemble_channel_agent_tools`].
 struct ChannelAssembledTools {
-    tools: Vec<Box<dyn Tool>>,
+    tools: zeroclaw_runtime::tools::scoped::ScopedToolRegistry,
     deferred_section: String,
     pinned_section: String,
     ask_user_handle: Option<tools::PerToolChannelHandle>,
@@ -10278,7 +10278,10 @@ async fn assemble_channel_agent_tools(
         ..
     } = assembled;
     ChannelAssembledTools {
-        tools: registry.into_inner(),
+        // Keep the registry SEALED out to `start_channels` (no `into_inner()`):
+        // it flows into `ChannelRuntimeContext.tools_registry` and then the
+        // engine carrier as `&ScopedToolRegistry`.
+        tools: registry,
         deferred_section,
         pinned_section,
         ask_user_handle,
@@ -11475,7 +11478,7 @@ fn concurrent_persist_lock_serialization() {
                 std::path::PathBuf::new(),
             ),
         ),
-        tools_registry: Arc::new(vec![]),
+        tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
         observer: Arc::new(NoopObserver),
         system_prompt: Arc::new(String::new()),
         model: Arc::new("test".into()),
@@ -11982,7 +11985,7 @@ temperature = 0.3
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(String::new()),
             model: Arc::new("test-model".to_string()),
@@ -12043,6 +12046,98 @@ temperature = 0.3
             sop_engine: None,
             sop_audit: None,
         })
+    }
+
+    #[test]
+    fn stamp_session_routing_context_persists_message_metadata() {
+        struct Case {
+            history_key: &'static str,
+            channel: &'static str,
+            alias: Option<&'static str>,
+            thread: Option<&'static str>,
+            reply_target: &'static str,
+            sender: &'static str,
+            expected_channel: Option<&'static str>,
+            expected_room: Option<&'static str>,
+            expected_sender: Option<&'static str>,
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let ctx = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            ..(*router_test_ctx()).clone()
+        };
+        let cases = [
+            Case {
+                history_key: "threaded",
+                channel: "discord",
+                alias: Some("primary"),
+                thread: Some("thread-987654"),
+                reply_target: "channel-123",
+                sender: "thread-user",
+                expected_channel: Some("discord.primary"),
+                expected_room: Some("thread-987654"),
+                expected_sender: Some("thread-user"),
+            },
+            Case {
+                history_key: "reply-target",
+                channel: "discord",
+                alias: Some("secondary"),
+                thread: None,
+                reply_target: "dm-channel-555",
+                sender: "user42",
+                expected_channel: Some("discord.secondary"),
+                expected_room: Some("dm-channel-555"),
+                expected_sender: Some("user42"),
+            },
+            Case {
+                history_key: "no-alias",
+                channel: "cli",
+                alias: None,
+                thread: None,
+                reply_target: "stdin",
+                sender: "cli-user",
+                expected_channel: None,
+                expected_room: Some("stdin"),
+                expected_sender: Some("cli-user"),
+            },
+            Case {
+                history_key: "empty-sender",
+                channel: "matrix",
+                alias: Some("default"),
+                thread: None,
+                reply_target: "!room:matrix.org",
+                sender: "",
+                expected_channel: Some("matrix.default"),
+                expected_room: Some("!room:matrix.org"),
+                expected_sender: None,
+            },
+        ];
+
+        for case in cases {
+            let msg = ChannelMessage {
+                id: "msg-1".into(),
+                sender: case.sender.into(),
+                reply_target: case.reply_target.into(),
+                content: "hi".into(),
+                channel: case.channel.into(),
+                channel_alias: case.alias.map(String::from),
+                timestamp: 0,
+                thread_ts: case.thread.map(String::from),
+                ..Default::default()
+            };
+
+            stamp_session_routing_context(&ctx, &msg, case.history_key);
+
+            let metadata = session_store
+                .get_session_metadata(case.history_key)
+                .unwrap();
+            assert_eq!(metadata.channel_id.as_deref(), case.expected_channel);
+            assert_eq!(metadata.room_id.as_deref(), case.expected_room);
+            assert_eq!(metadata.sender_id.as_deref(), case.expected_sender);
+        }
     }
 
     #[tokio::test]
@@ -12514,7 +12609,7 @@ temperature = 0.3
                     zeroclaw_dir.to_path_buf(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new(model.to_string()),
@@ -12991,7 +13086,7 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -13086,7 +13181,7 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -13203,7 +13298,7 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -13322,7 +13417,7 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -13895,7 +13990,7 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer,
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -15717,7 +15812,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name: HashMap<String, Arc<dyn Channel>>,
         provider_impl: Arc<HistoryCaptureModelProvider>,
         prompt_config: Arc<Config>,
-        tools_registry: Arc<Vec<Box<dyn Tool>>>,
+        tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry>,
     ) -> Arc<ChannelRuntimeContext> {
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -15818,7 +15913,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(MockPriceTool)])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -15935,9 +16030,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
                 zeroclaw_runtime::tools::SessionsCurrentTool::new(Arc::clone(&session_store)),
-            )]),
+            )])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -16051,7 +16146,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(MockPriceTool)])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -16202,7 +16297,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(MockPriceTool)])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -16325,7 +16420,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(MockPriceTool)])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -16470,7 +16565,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(MockPriceTool)])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -16598,7 +16693,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(MockPriceTool)])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -16711,7 +16806,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(MockPriceTool)])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -16844,7 +16939,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -17001,7 +17096,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -17187,7 +17282,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: observer.clone(),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -17669,7 +17764,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -17777,7 +17872,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(MockPriceTool)])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -17895,7 +17990,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(MockPriceTool)])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -18263,7 +18358,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -18407,7 +18502,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -18566,7 +18661,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -18735,7 +18830,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -18880,7 +18975,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -19014,7 +19109,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -19127,7 +19222,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -19255,7 +19350,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -19430,7 +19525,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -21649,7 +21744,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -21824,7 +21919,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(initial_system_prompt),
             model: Arc::new("test-model".to_string()),
@@ -22078,12 +22173,12 @@ BTC is currently around $65,000 based on latest tool output."#
             },
         );
         let prompt_config = Arc::new(prompt_config);
-        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(
+        let tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry> = Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
             zeroclaw_runtime::tools::SendMessageToPeerTool::new(
                 Arc::clone(&prompt_config),
                 "test-agent",
             ),
-        )]);
+        )]));
         let runtime_ctx = peer_prompt_test_context(
             channels_by_name,
             provider_impl.clone(),
@@ -22212,7 +22307,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(Vec::new()),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new())),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -22636,7 +22731,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name,
             provider_impl.clone(),
             Arc::new(prompt_config),
-            Arc::new(vec![]),
+            Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            )),
         );
 
         process_channel_message(
@@ -22702,7 +22799,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -22857,7 +22954,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -24498,7 +24595,9 @@ This is an example JSON object for profile settings."#;
             channels_by_name,
             provider_impl.clone(),
             Arc::new(zeroclaw_config::schema::Config::default()),
-            Arc::new(vec![]),
+            Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            )),
         );
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             multimodal: zeroclaw_config::schema::MultimodalConfig {
@@ -24605,7 +24704,7 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -24725,7 +24824,7 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -24887,7 +24986,7 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -25122,7 +25221,7 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -25275,7 +25374,7 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -25420,7 +25519,7 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -25585,7 +25684,7 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -26150,7 +26249,7 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![])),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
